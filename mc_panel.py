@@ -261,14 +261,8 @@ def write_server_config():
 
 
 def get_jvm_args():
-    ram = MC_RAM
-    num = int("".join(filter(str.isdigit, ram)))
-    unit = "".join(filter(str.isalpha, ram)).upper()
-    xms = f"{max(512, num // 2)}{unit}"
-
     return [
         "java",
-        f"-Xms{xms}", f"-Xmx{ram}",
         "-XX:+UseG1GC",
         "-XX:+ParallelRefProcEnabled",
         "-XX:MaxGCPauseMillis=200",
@@ -289,10 +283,9 @@ def get_jvm_args():
         "-XX:MaxTenuringThreshold=1",
         "-XX:+UseStringDeduplication",
         "-XX:+OptimizeStringConcat",
-        "-XX:ReservedCodeCacheSize=512m",
+        "-XX:ReservedCodeCacheSize=256m",
         "-XX:+UseCodeCacheFlushing",
-        "-XX:+UseLargePages",
-        "-XX:LargePageSizeInBytes=2m",
+        # UseLargePages kaldırıldı — Render ortamı desteklemiyor
         "-Djava.net.preferIPv4Stack=true",
         "-Dfile.encoding=UTF-8",
         "-Duser.timezone=Europe/Istanbul",
