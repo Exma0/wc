@@ -415,25 +415,56 @@ def get_jvm_args():
                     container_ram_mb = mb; break
         except: pass
 
-    swp    = _ps.swap_memory()
-    sw_mb  = int(swp.total / 1024 / 1024)
-    xmx_mb = min(384, container_ram_mb - 128)
-    xmx_mb = max(256, xmx_mb)
-    if sw_mb > 512:
-        xmx_mb = min(xmx_mb + min(sw_mb // 4, 512), 2048)
-    xms_mb = 32
-    log(f"[Panel] 🧠 Container RAM={container_ram_mb}MB Swap={sw_mb}MB → Xms={xms_mb}M Xmx={xmx_mb}M")
+    swp   = _ps.swap_memory()
+    sw_mb = int(swp.total / 1024 / 1024)
+
+    # Render free: 512MB toplam. Python/Flask/SocketIO/OS ~160-180MB kullanır.
+    # Bu yüzden JVM'e MAX 300MB verebiliriz (güvenli sınır 280MB).
+    # Swap varsa biraz daha ekle ama 512MB'yi geçme (swap ile birlikte).
+    PYTHON_OVERHEAD_MB = 180   # Flask + eventlet + psutil + OS
+    safe_xmx = container_ram_mb - PYTHON_OVERHEAD_MB   # 512-180 = 332 → swap olmadan 280 kapat
+    safe_xmx = min(safe_xmx, 300)                       # Hard üst sınır: 300MB
+    safe_xmx = max(safe_xmx, 160)                       # Hard alt sınır: 160MB
+
+    # Swap varsa JVM biraz büyüyebilir ama Render OOM'a dikkat et
+    if sw_mb >= 512:
+        bonus = min(sw_mb // 8, 128)   # swap'ın 1/8'i, max +128MB
+        safe_xmx = min(safe_xmx + bonus, 512)
+
+    xmx_mb = safe_xmx
+    xms_mb = 32   # Düşük başla, ihtiyaç oldukça büyüsün
+
+    # Agent pool varsa view-distance düşür → daha az chunk → daha az JVM
+    with _agents_lock:
+        agent_count = len([a for a in _agents.values() if a["healthy"]])
+    if agent_count >= 2:
+        log(f"[Panel] 🔗 {agent_count} agent mevcut → Xmx artırılabilir")
+        xmx_mb = min(xmx_mb + 32, 340)   # Agent varsa +32MB
+
+    log(f"[Panel] 🧠 Container={container_ram_mb}MB Swap={sw_mb}MB Agents={agent_count} → Xms={xms_mb}M Xmx={xmx_mb}M")
     return [
         "java", f"-Xms{xms_mb}M", f"-Xmx{xmx_mb}M",
-        "-XX:CompressedClassSpaceSize=64m", "-XX:MaxMetaspaceSize=128m",
-        "-XX:+UseG1GC", "-XX:+ParallelRefProcEnabled", "-XX:MaxGCPauseMillis=200",
+        "-XX:CompressedClassSpaceSize=32m", "-XX:MaxMetaspaceSize=96m",
+        "-XX:ReservedCodeCacheSize=48m",
+        # G1GC — küçük heap için ayarlandı
+        "-XX:+UseG1GC", "-XX:+ParallelRefProcEnabled",
+        "-XX:MaxGCPauseMillis=150",
         "-XX:+UnlockExperimentalVMOptions", "-XX:+DisableExplicitGC",
-        "-XX:G1PeriodicGCInterval=15000", "-XX:+G1PeriodicGCInvokesConcurrent",
-        "-XX:G1NewSizePercent=20", "-XX:G1MaxNewSizePercent=30",
-        "-XX:G1HeapRegionSize=4m", "-XX:G1ReservePercent=20",
-        "-XX:InitiatingHeapOccupancyPercent=15", "-XX:SoftRefLRUPolicyMSPerMB=0",
-        "-XX:+UseStringDeduplication", "-Djava.net.preferIPv4Stack=true",
+        "-XX:G1PeriodicGCInterval=10000", "-XX:+G1PeriodicGCInvokesConcurrent",
+        "-XX:G1NewSizePercent=15", "-XX:G1MaxNewSizePercent=25",
+        "-XX:G1HeapRegionSize=2m",   # Küçük heap → küçük region
+        "-XX:G1ReservePercent=15",
+        "-XX:InitiatingHeapOccupancyPercent=20",
+        "-XX:SoftRefLRUPolicyMSPerMB=0",
+        # Bellek baskısı azaltma
+        "-XX:+UseStringDeduplication",
+        "-XX:+UseCompressedOops",
+        "-XX:+OptimizeStringConcat",
+        "-XX:+TieredCompilation", "-XX:TieredStopAtLevel=1",  # JIT hızlı, az kod önbelleği
+        "-Djava.net.preferIPv4Stack=true",
         "-Dfile.encoding=UTF-8", "-Dcom.mojang.eula.agree=true",
+        # GC log sessiz
+        "-Xlog:disable",
         "-jar", str(MC_JAR), "--nogui",
     ]
 
@@ -496,18 +527,42 @@ def send_command(cmd: str) -> bool:
 
 def _ram_watchdog():
     import psutil
+    _pressure_count = 0
     while True:
-        eventlet.sleep(5)
+        eventlet.sleep(8)
         try:
             mem = psutil.virtual_memory()
             swp = psutil.swap_memory()
-            avail_mb = int((mem.available + swp.free) / 1024 / 1024)
-            if avail_mb < 512:
+            used_mb  = int(mem.used  / 1024 / 1024)
+            total_mb = int(mem.total / 1024 / 1024)
+            swap_pct = swp.percent if swp.total > 0 else 0
+
+            # Render free = 512MB. Python ~150MB kullanıyor.
+            # MC 280MB kullanıyorsa toplam ~430MB → %84 → uyar
+            pressure = used_mb > (total_mb * 0.85) or swap_pct > 80
+
+            if pressure:
+                _pressure_count += 1
                 try: open("/proc/sys/vm/drop_caches","w").write("3")
                 except: pass
-                send_command("kill @e[type=item]")
-                send_command("kill @e[type=experience_orb]")
-                send_command("save-all")
+
+                if _pressure_count >= 2:
+                    # Hafif MC temizliği
+                    send_command("kill @e[type=item]")
+                    send_command("kill @e[type=experience_orb]")
+
+                if _pressure_count >= 3:
+                    # Ağır baskı: kaydet + agent'a region offload tetikle
+                    send_command("save-all")
+                    log(f"[Panel] ⚠️  RAM Baskısı! Kullanılan={used_mb}MB/{total_mb}MB Swap=%{swap_pct:.0f}")
+                    # Agent'a eski region'ları taşı
+                    threading.Thread(
+                        target=lambda: _auto_archive_old_regions(older_than_days=2),
+                        daemon=True
+                    ).start()
+                    _pressure_count = 0
+            else:
+                _pressure_count = max(0, _pressure_count - 1)
         except: pass
 
 
@@ -972,29 +1027,86 @@ def api_backups():
 def api_performance():
     try:
         import psutil
-        cpu=psutil.cpu_percent(0.2); vm=psutil.virtual_memory(); swp=psutil.swap_memory(); dk=psutil.disk_usage("/")
-        procs=[]
+        cpu  = psutil.cpu_percent(0.2)
+        vm   = psutil.virtual_memory()
+        swp  = psutil.swap_memory()
+        dk   = psutil.disk_usage("/")
+        mc_info = {}
         if mc_process and mc_process.poll() is None:
             try:
-                proc=psutil.Process(mc_process.pid)
-                procs=[{"cpu":round(proc.cpu_percent(),1),"ram":int(proc.memory_info().rss/1024/1024),"threads":proc.num_threads()}]
+                proc = psutil.Process(mc_process.pid)
+                mc_info = {
+                    "cpu":     round(proc.cpu_percent(), 1),
+                    "ram":     int(proc.memory_info().rss / 1024 / 1024),
+                    "threads": proc.num_threads(),
+                }
             except: pass
-        pool=_pool_summary()
+
+        pool = _pool_summary()
+        res  = pool.get("resources", {})
+
+        # ── Birleşik (ana + tüm agentlar) hesaplama ─────────────
+        main_ram_free_mb  = int(vm.available / 1024 / 1024)
+        main_disk_free_gb = round(dk.free / 1e9, 1)
+        agent_ram_mb      = res.get("ram_free_mb",  0)
+        agent_disk_gb     = res.get("disk_free_gb", 0)
+        combined_ram_mb   = main_ram_free_mb  + agent_ram_mb
+        combined_disk_gb  = round(main_disk_free_gb + agent_disk_gb, 1)
+
+        # Agent başına detay
+        agents_detail = []
+        with _agents_lock:
+            for a in _agents.values():
+                r   = a["info"].get("ram",  {})
+                d_  = a["info"].get("disk", {})
+                c   = a["info"].get("cpu",  {})
+                agents_detail.append({
+                    "node_id":    a["node_id"],
+                    "healthy":    a["healthy"],
+                    "ram_free":   r.get("free_mb",  0),
+                    "ram_cache":  r.get("cache_mb", 0),
+                    "disk_free":  round(d_.get("free_gb",  0), 1),
+                    "disk_store": round(d_.get("store_gb", 0), 1),
+                    "cpu_load":   c.get("load1", 0),
+                    "cpu_cores":  c.get("cores", 0),
+                    "last_ping":  int(time.time() - a["last_ping"]),
+                })
+
         return jsonify({
-            "cpu":round(cpu,1),"ram_pct":round(vm.percent,1),
-            "ram_used_mb":int(vm.used/1024/1024),"ram_total_mb":int(vm.total/1024/1024),
-            "ram_free_mb":int(vm.available/1024/1024),
-            "swap_total_mb":int(swp.total/1024/1024),"swap_free_mb":int(swp.free/1024/1024),
-            "disk_pct":round(dk.percent,1),"disk_used_gb":round(dk.used/1e9,1),"disk_total_gb":round(dk.total/1e9,1),
-            "cpu_count":psutil.cpu_count(),"mc":procs[0] if procs else {},
-            "tps":server_state["tps"],"tps5":server_state["tps5"],"tps15":server_state["tps15"],
-            "pool_agents":pool["healthy"],
-            "pool_ram_mb":pool["resources"]["ram_free_mb"],
-            "pool_disk_gb":pool["resources"]["disk_free_gb"],
-            "pool_cache_mb":pool["resources"]["cache_used_mb"],
+            # Ana sunucu
+            "cpu":           round(cpu, 1),
+            "ram_pct":       round(vm.percent, 1),
+            "ram_used_mb":   int(vm.used    / 1024 / 1024),
+            "ram_total_mb":  int(vm.total   / 1024 / 1024),
+            "ram_free_mb":   main_ram_free_mb,
+            "swap_total_mb": int(swp.total  / 1024 / 1024),
+            "swap_used_mb":  int(swp.used   / 1024 / 1024),
+            "swap_free_mb":  int(swp.free   / 1024 / 1024),
+            "swap_pct":      round(swp.percent, 1),
+            "disk_pct":      round(dk.percent, 1),
+            "disk_used_gb":  round(dk.used  / 1e9, 1),
+            "disk_total_gb": round(dk.total / 1e9, 1),
+            "disk_free_gb":  main_disk_free_gb,
+            "cpu_count":     psutil.cpu_count(),
+            "mc":            mc_info,
+            # MC server
+            "tps":           server_state["tps"],
+            "tps5":          server_state["tps5"],
+            "tps15":         server_state["tps15"],
+            # Pool (agentlar)
+            "pool_agents":   pool["healthy"],
+            "pool_ram_mb":   agent_ram_mb,
+            "pool_disk_gb":  agent_disk_gb,
+            "pool_cache_mb": res.get("cache_used_mb", 0),
+            "pool_cpu":      res.get("cpu_cores", 0),
+            # Birleşik
+            "combined_ram_free_mb":  combined_ram_mb,
+            "combined_disk_free_gb": combined_disk_gb,
+            # Agent detayları
+            "agents": agents_detail,
         })
     except Exception as e:
-        return jsonify({"error":str(e)})
+        return jsonify({"error": str(e)})
 
 
 # ── SocketIO ──────────────────────────────────────────────────
@@ -1449,32 +1561,87 @@ select.set-inp option{background:#1e1e1e}
 
   <!-- PERFORMANS -->
   <div class="page" id="page-perf">
+    <!-- Birleşik özet kartlar -->
+    <div class="g4" style="margin-bottom:14px">
+      <div class="sc">
+        <div class="sc-val" id="p-comb-ram">—</div>
+        <div class="sc-lbl">🧠 Toplam Boş RAM</div>
+        <div style="font-size:9px;color:var(--t3);margin-top:3px">Ana + Agentlar</div>
+      </div>
+      <div class="sc">
+        <div class="sc-val" id="p-comb-disk">—</div>
+        <div class="sc-lbl">💾 Toplam Boş Disk</div>
+        <div style="font-size:9px;color:var(--t3);margin-top:3px">Ana + Agentlar</div>
+      </div>
+      <div class="sc">
+        <div class="sc-val" id="p-tps-big">20.0</div>
+        <div class="sc-lbl">⚡ TPS</div>
+        <div style="font-size:9px;color:var(--t3);margin-top:3px">1m / 5m / 15m</div>
+      </div>
+      <div class="sc">
+        <div class="sc-val" id="p-mcram-big">—</div>
+        <div class="sc-lbl">☕ MC JVM RAM</div>
+        <div style="font-size:9px;color:var(--t3);margin-top:3px">Heap kullanımı</div>
+      </div>
+    </div>
+
     <div class="g2" style="margin-bottom:14px">
+      <!-- Ana sunucu -->
       <div class="card">
-        <div class="card-hd">💻 Sistem</div>
+        <div class="card-hd">💻 Ana Sunucu (Render Free)</div>
         <div style="margin-bottom:10px">
-          <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--t2);margin-bottom:3px"><span>CPU</span><span id="p-cpu">—</span></div>
+          <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--t2);margin-bottom:3px">
+            <span>CPU</span><span id="p-cpu">—</span>
+          </div>
           <div class="prog"><div class="prog-f pf-cpu" id="pb-cpu" style="width:0%"></div></div>
         </div>
         <div style="margin-bottom:10px">
-          <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--t2);margin-bottom:3px"><span>RAM</span><span id="p-ram">—</span></div>
+          <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--t2);margin-bottom:3px">
+            <span>RAM <span style="font-size:9px;color:var(--red)">(512MB limit!)</span></span>
+            <span id="p-ram">—</span>
+          </div>
           <div class="prog"><div class="prog-f pf-ram" id="pb-ram" style="width:0%"></div></div>
         </div>
-        <div>
-          <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--t2);margin-bottom:3px"><span>Disk</span><span id="p-disk">—</span></div>
+        <div style="margin-bottom:10px">
+          <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--t2);margin-bottom:3px">
+            <span>Disk <span style="font-size:9px">(18GB limit)</span></span>
+            <span id="p-disk">—</span>
+          </div>
           <div class="prog"><div class="prog-f pf-disk" id="pb-disk" style="width:0%"></div></div>
         </div>
+        <div>
+          <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--t2);margin-bottom:3px">
+            <span>Swap</span><span id="p-swap-bar-lbl">—</span>
+          </div>
+          <div class="prog"><div class="prog-f" id="pb-swap" style="width:0%;background:linear-gradient(90deg,var(--yellow),var(--a4))"></div></div>
+        </div>
       </div>
+
+      <!-- MC + Pool özet -->
       <div class="card">
-        <div class="card-hd">⛏️ MC + Pool</div>
+        <div class="card-hd">⛏️ MC + Pool Özeti</div>
         <table class="tbl">
-          <tr><td style="color:var(--t2)">MC RAM</td><td id="p-mcram">—</td></tr>
-          <tr><td style="color:var(--t2)">TPS (1m/5m/15m)</td><td id="p-tps1">—</td></tr>
-          <tr><td style="color:var(--t2)">Swap</td><td id="p-swap">—</td></tr>
-          <tr><td style="color:var(--t2)">Pool Agentlar</td><td id="p-agents">—</td></tr>
-          <tr><td style="color:var(--t2)">Pool RAM Cache</td><td id="p-pcache">—</td></tr>
-          <tr><td style="color:var(--t2)">Pool Disk Deposu</td><td id="p-pdisk">—</td></tr>
+          <tr><td style="color:var(--t2)">MC JVM RAM</td><td id="p-mcram" style="font-family:var(--mono);color:var(--a1)">—</td></tr>
+          <tr><td style="color:var(--t2)">TPS (1m/5m/15m)</td><td id="p-tps1" style="font-family:var(--mono)">—</td></tr>
+          <tr><td style="color:var(--t2)">Swap (Ana)</td><td id="p-swap" style="font-family:var(--mono)">—</td></tr>
+          <tr><td style="color:var(--t2)">Agent Sayısı</td><td id="p-agents" style="font-family:var(--mono);color:var(--a2)">—</td></tr>
+          <tr><td style="color:var(--t2)">Pool RAM Cache</td><td id="p-pcache" style="font-family:var(--mono);color:var(--a3)">—</td></tr>
+          <tr><td style="color:var(--t2)">Pool Disk Deposu</td><td id="p-pdisk" style="font-family:var(--mono);color:var(--a3)">—</td></tr>
+          <tr><td style="color:var(--t2)">Pool CPU Core</td><td id="p-pcpu" style="font-family:var(--mono)">—</td></tr>
         </table>
+      </div>
+    </div>
+
+    <!-- Destek Düğümleri detay tablosu -->
+    <div class="card" id="perf-agents-card">
+      <div class="card-hd" style="justify-content:space-between">
+        <span>🔗 Destek Düğümleri — Birleşik Kapasite</span>
+        <button class="btn btn-sm b-ghost" onclick="loadPerf()">↺ Yenile</button>
+      </div>
+      <div id="perf-agents-table">
+        <div style="text-align:center;padding:20px;color:var(--t2);font-size:12px">
+          Bağlı agent yok — diğer Render hesabına agent.Dockerfile yükleyin
+        </div>
       </div>
     </div>
   </div>
@@ -1727,7 +1894,97 @@ const SET_LABELS={'server-port':'Port','max-players':'Max Oyuncu','online-mode':
 async function loadSettings(){const d=await fetch('/api/settings').then(r=>r.json());const el=document.getElementById('settings-grid');el.innerHTML=Object.entries(d).map(([k,v])=>`<div class="set-item"><div class="set-lbl">${SET_LABELS[k]||k}</div>${v==='true'||v==='false'?`<select class="set-inp" id="s-${k}"><option value="true" ${v==='true'?'selected':''}>true</option><option value="false" ${v==='false'?'selected':''}>false</option></select>`:`<input class="set-inp" id="s-${k}" value="${v.replace(/</g,'&lt;')}">`}</div>`).join('');}
 async function saveSettings(){const d=await fetch('/api/settings').then(r=>r.json());const u={};for(const k of Object.keys(d)){const el=document.getElementById('s-'+k);if(el)u[k]=el.value;}const r=await api('/api/settings',u);notify(r.msg||'Kaydedildi','ok');setTimeout(()=>srvAction('restart'),1500);}
 
-async function loadPerf(){const d=await fetch('/api/performance').then(r=>r.json());if(d.cpu!==undefined){document.getElementById('p-cpu').textContent=d.cpu+'%';document.getElementById('pb-cpu').style.width=d.cpu+'%';}if(d.ram_pct!==undefined){document.getElementById('p-ram').textContent=`${d.ram_used_mb}/${d.ram_total_mb}MB`;document.getElementById('pb-ram').style.width=d.ram_pct+'%';}if(d.disk_pct!==undefined){document.getElementById('p-disk').textContent=`${d.disk_used_gb}/${d.disk_total_gb}GB`;document.getElementById('pb-disk').style.width=d.disk_pct+'%';}if(d.mc&&d.mc.ram)document.getElementById('p-mcram').textContent=d.mc.ram+' MB';document.getElementById('p-tps1').textContent=`${d.tps||'—'} / ${d.tps5||'—'} / ${d.tps15||'—'}`;document.getElementById('p-swap').textContent=`${d.swap_total_mb||0}MB / ${d.swap_free_mb||0}MB boş`;document.getElementById('p-agents').textContent=`${d.pool_agents||0} agent`;document.getElementById('p-pcache').textContent=`${d.pool_cache_mb||0}MB`;document.getElementById('p-pdisk').textContent=`${d.pool_disk_gb||0}GB`;}
+async function loadPerf(){
+  const d=await fetch('/api/performance').then(r=>r.json()).catch(()=>({}));
+  if(d.cpu!==undefined){
+    document.getElementById('p-cpu').textContent=d.cpu+'%';
+    document.getElementById('pb-cpu').style.width=d.cpu+'%';
+  }
+  if(d.ram_pct!==undefined){
+    const pct=d.ram_pct;
+    document.getElementById('p-ram').textContent=`${d.ram_used_mb}/${d.ram_total_mb}MB`;
+    document.getElementById('pb-ram').style.width=pct+'%';
+    document.getElementById('pb-ram').style.background=pct>85?'linear-gradient(90deg,#ff4757,#ff6b35)':pct>70?'linear-gradient(90deg,#ffa502,var(--a1))':'linear-gradient(90deg,var(--a3),var(--a1))';
+  }
+  if(d.disk_pct!==undefined){
+    document.getElementById('p-disk').textContent=`${d.disk_used_gb}/${d.disk_total_gb}GB`;
+    document.getElementById('pb-disk').style.width=d.disk_pct+'%';
+  }
+  if(d.swap_pct!==undefined){
+    document.getElementById('p-swap-bar-lbl').textContent=`${d.swap_used_mb||0}/${d.swap_total_mb||0}MB (%${d.swap_pct||0})`;
+    document.getElementById('pb-swap').style.width=(d.swap_pct||0)+'%';
+    document.getElementById('p-swap').textContent=`${d.swap_total_mb||0}MB / ${d.swap_free_mb||0}MB boş`;
+  }
+  // MC
+  if(d.mc&&d.mc.ram){
+    document.getElementById('p-mcram').textContent=d.mc.ram+' MB';
+    document.getElementById('p-mcram-big').textContent=d.mc.ram+'MB';
+  }
+  // TPS
+  const tpsVal=d.tps||'—';
+  document.getElementById('p-tps1').textContent=`${d.tps||'—'} / ${d.tps5||'—'} / ${d.tps15||'—'}`;
+  document.getElementById('p-tps-big').textContent=tpsVal;
+  // Pool
+  document.getElementById('p-agents').textContent=`${d.pool_agents||0} aktif`;
+  document.getElementById('p-pcache').textContent=`${d.pool_cache_mb||0} MB`;
+  document.getElementById('p-pdisk').textContent=`${d.pool_disk_gb||0} GB`;
+  document.getElementById('p-pcpu').textContent=`${d.pool_cpu||0} core`;
+  // Birleşik
+  document.getElementById('p-comb-ram').textContent=(d.combined_ram_free_mb||0)+'MB';
+  document.getElementById('p-comb-disk').textContent=(d.combined_disk_free_gb||0)+'GB';
+  // Agent tablosu
+  const agents=d.agents||[];
+  const tbl=document.getElementById('perf-agents-table');
+  if(!agents.length){
+    tbl.innerHTML='<div style="text-align:center;padding:20px;color:var(--t2);font-size:12px">Bağlı agent yok — diğer Render hesabına agent.Dockerfile yükleyin</div>';
+  } else {
+    // Toplam satırı
+    const totRamFree=agents.reduce((s,a)=>s+(a.ram_free||0),0);
+    const totRamCache=agents.reduce((s,a)=>s+(a.ram_cache||0),0);
+    const totDiskFree=agents.reduce((s,a)=>s+(a.disk_free||0),0).toFixed(1);
+    const totDiskStore=agents.reduce((s,a)=>s+(a.disk_store||0),0).toFixed(1);
+    const totCores=agents.reduce((s,a)=>s+(a.cpu_cores||0),0);
+    tbl.innerHTML=`
+    <table class="tbl">
+      <thead>
+        <tr>
+          <th>Düğüm</th><th>Durum</th>
+          <th>RAM Boş</th><th>RAM Cache</th>
+          <th>Disk Boş</th><th>Disk Depo</th>
+          <th>CPU</th><th>Son Ping</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${agents.map(a=>`
+        <tr>
+          <td><strong style="font-family:var(--mono);font-size:11px">${a.node_id}</strong></td>
+          <td><span class="badge ${a.healthy?'bg':'br'}">${a.healthy?'✅ Sağlıklı':'❌ Erişilemiyor'}</span></td>
+          <td style="font-family:var(--mono);color:var(--a1)">${a.ram_free}MB</td>
+          <td style="font-family:var(--mono);color:var(--a3)">${a.ram_cache}MB</td>
+          <td style="font-family:var(--mono);color:var(--a2)">${a.disk_free}GB</td>
+          <td style="font-family:var(--mono)">${a.disk_store}GB</td>
+          <td style="font-family:var(--mono)">${a.cpu_cores}c / ${a.cpu_load}</td>
+          <td style="font-size:10px;color:var(--t3)">${a.last_ping}s</td>
+        </tr>`).join('')}
+        <tr style="background:rgba(124,106,255,.06);font-weight:700">
+          <td colspan="2" style="color:var(--a2)">📊 TOPLAM (${agents.length} agent)</td>
+          <td style="font-family:var(--mono);color:var(--a1)">${totRamFree}MB</td>
+          <td style="font-family:var(--mono);color:var(--a3)">${totRamCache}MB</td>
+          <td style="font-family:var(--mono);color:var(--a2)">${totDiskFree}GB</td>
+          <td style="font-family:var(--mono)">${totDiskStore}GB</td>
+          <td style="font-family:var(--mono)">${totCores} core</td>
+          <td></td>
+        </tr>
+        <tr style="background:rgba(0,229,255,.04)">
+          <td colspan="2" style="color:var(--a1);font-weight:700">🌐 BİRLEŞİK (Ana+Agentlar)</td>
+          <td colspan="2" style="font-family:var(--mono);color:var(--a1);font-weight:700">${d.combined_ram_free_mb}MB boş RAM</td>
+          <td colspan="2" style="font-family:var(--mono);color:var(--a2);font-weight:700">${d.combined_disk_free_gb}GB boş Disk</td>
+          <td colspan="2"></td>
+        </tr>
+      </tbody>
+    </table>`;
+  }
+}
 setInterval(()=>{if(curPage==='perf')loadPerf();},5000);
 
 function cmd(c){socket.emit('send_command',{cmd:c});notify('→ '+c,'info');}
