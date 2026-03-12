@@ -399,25 +399,8 @@ class ResourcePool:
             self._expand_swap()
 
     def _expand_swap(self):
-        """Açılan disk alanını değerlendirip swap dosyasını büyüt."""
-        import shutil, subprocess as sp
-        disk_free_gb = shutil.disk_usage("/").free / 1e9
-        target_swap_gb = min(6.0, disk_free_gb * 0.6)
-        target_mb = int(target_swap_gb * 1024)
-
-        sf = "/swapfile2"
-        sp.run(f"swapoff {sf} 2>/dev/null", shell=True)
-        try:
-            if os.path.exists(sf): os.remove(sf)
-        except: pass
-
-        r = sp.run(f"fallocate -l {target_mb}M {sf}", shell=True, capture_output=True)
-        if r.returncode != 0:
-            sp.run(f"dd if=/dev/zero of={sf} bs=64M count={max(1,target_mb//64)} status=none",
-                   shell=True)
-        sp.run(f"chmod 600 {sf} && mkswap -f {sf} && swapon -p 1 {sf}",
-               shell=True, capture_output=True)
-        self._log(f"[Pool] ✅ Swap genişletildi: {target_mb}MB ({sf})")
+        """Render.com'da swapon izni yok — bu fonksiyon devre dışı."""
+        self._log("[Pool] ℹ️  Swap genişletme atlandı (Render EPERM)")
 
     # ── Sağlık izleme ────────────────────────────────────────
 

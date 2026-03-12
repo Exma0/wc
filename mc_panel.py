@@ -230,12 +230,12 @@ def _auto_archive_old_regions(older_than_days: int = 0):
         new_free_gb = _sh.disk_usage("/").free / 1e9
         sw_mb = min(6144, int(new_free_gb * 0.7 * 1024))
         sf2   = "/swapfile2"
-        subprocess.run(f"swapoff {sf2} 2>/dev/null", shell=True)
+        # swapoff atlandı — Render'da swapon zaten çalışmadı
         try:
             if Path(sf2).exists(): Path(sf2).unlink()
         except: pass
-        _loop_swap_panel(sf2, sw_mb, priority=1, tag="Pool")
-        log(f"[Pool] 💾 {archived} region arşivlendi ({freed_mb:.0f}MB) → swap: {sw_mb}MB")
+        # swap genişletme atlandı (Render EPERM)
+        log(f"[Pool] 💾 {archived} region arşivlendi ({freed_mb:.0f}MB) → disk açıldı")
 
     return archived, freed_mb
 
@@ -253,15 +253,8 @@ def _pool_auto_optimize():
             break
         time.sleep(1)
 
-    import psutil as _psu2
-    if _psu2.swap_memory().total < 512 * 1024 * 1024:
-        log("[Pool] 🔄 Swap yok → kurulum başlıyor (3GB)...")
-        ok = _loop_swap_panel("/swapfile2", 3072, priority=1, tag="Pool-Boot")
-        if not ok:
-            # Fallback: daha küçük
-            for sz in [1024, 512]:
-                if _loop_swap_panel("/swapfile2", sz, priority=1, tag="Pool-Boot"):
-                    break
+    # Render.com'da swapon çalışmaz (EPERM) — swap denemesi atlandı
+    log("[Pool] ℹ️  Render: swapon izin verilmiyor → swap yok, overcommit aktif")
 
     try:
         result = _auto_archive_old_regions(older_than_days=0)
@@ -346,62 +339,7 @@ def write_server_config():
     )
 
 
-def _loop_swap_panel(sf: str, sw_mb: int, priority: int = 0, tag: str = "Swap") -> bool:
-    """
-    mc_panel.py içinden swap kurma.
-    main.py'deki _loop_swap ile aynı mantık:
-    modprobe loop → mknod → losetup --find --show → mkswap → swapon
-    """
-    subprocess.run(f"swapoff {sf} 2>/dev/null", shell=True)
-    for i in range(8):
-        subprocess.run(f"swapoff /dev/loop{i} 2>/dev/null", shell=True)
-    try:
-        p = Path(sf)
-        if p.exists(): p.unlink()
-    except: pass
-
-    r = subprocess.run(f"fallocate -l {sw_mb}M {sf}", shell=True, capture_output=True)
-    if r.returncode != 0:
-        subprocess.run(f"dd if=/dev/zero of={sf} bs=64M count={max(1,sw_mb//64)} status=none",
-                       shell=True, capture_output=True)
-
-    p = Path(sf)
-    if not p.exists() or p.stat().st_size < sw_mb * 1024 * 700:
-        log(f"[{tag}] ⚠️  Dosya oluşturulamadı ({sw_mb}MB)")
-        return False
-    subprocess.run(f"chmod 600 {sf}", shell=True)
-
-    # Kernel modülü + node'lar
-    subprocess.run("modprobe loop 2>/dev/null", shell=True)
-    for i in range(8):
-        dev = f"/dev/loop{i}"
-        if not Path(dev).exists():
-            subprocess.run(f"mknod {dev} b 7 {i} 2>/dev/null", shell=True)
-
-    # Atomik bul+bağla
-    r = subprocess.run(f"losetup --find --show {sf} 2>/dev/null",
-                       shell=True, capture_output=True)
-    loop_dev = r.stdout.decode().strip() if r.returncode == 0 else ""
-
-    if not loop_dev:
-        subprocess.run("losetup -d /dev/loop0 2>/dev/null", shell=True)
-        r2 = subprocess.run(f"losetup /dev/loop0 {sf} 2>/dev/null",
-                            shell=True, capture_output=True)
-        loop_dev = "/dev/loop0" if r2.returncode == 0 else ""
-
-    target = loop_dev if loop_dev else sf
-    subprocess.run(f"mkswap -f {target}", shell=True, capture_output=True)
-    r = subprocess.run(f"swapon -p {priority} {target}", shell=True, capture_output=True)
-    if r.returncode == 0:
-        import psutil
-        sw = psutil.swap_memory()
-        log(f"[{tag}] ✅ Swap aktif: {sw_mb}MB ({target}) | Toplam: {sw.total//1024//1024}MB")
-        return True
-    err = r.stderr.decode()[:80]
-    log(f"[{tag}] ⚠️  swapon başarısız ({target}): {err}")
-    if loop_dev:
-        subprocess.run(f"losetup -d {loop_dev} 2>/dev/null", shell=True)
-    return False
+# _loop_swap_panel KALDIRILDI: Render.com'da swapon izni yok (EPERM)
 
 
 def get_jvm_args():
@@ -417,43 +355,49 @@ def get_jvm_args():
                     container_ram_mb = mb; break
         except: pass
 
-    swp         = _ps.swap_memory()
-    sw_mb       = int(swp.total / 1024 / 1024)
     agent_count = _pool.agent_count()
 
-    # Paper MC 1.21 class-loading minimum: ~380MB heap.
-    # Swap varsa JVM agresif büyüyebilir; yoksa overcommit ile 400MB ver.
-    if sw_mb >= 2048:
-        xmx_mb = 600
-    elif sw_mb >= 512:
-        xmx_mb = 480
-    else:
-        xmx_mb = 400   # overcommit açık → OOM olmadan çalışır
-
+    # Render.com free tier: 512MB container, swapon yok.
+    # JVM toplam footprint = Xmx + Metaspace(128) + CodeCache(32) + Class(32)
+    #                      + Thread stacks(~50) + JVM overhead(~50) ≈ Xmx + 290MB
+    # 512MB - 290MB = 222MB → güvenli Xmx = 200-220MB
+    # overcommit_memory=1 aktifken JVM 256MB heap ile stabil çalışıyor.
+    xmx_mb = 220   # sabit — swapon yok, 512MB container kesin sınırı
     xms_mb = 32
 
-    log(f"[Panel] 🧠 Container={container_ram_mb}MB Swap={sw_mb}MB Agents={agent_count} → Xms={xms_mb}M Xmx={xmx_mb}M")
+    log(f"[Panel] 🧠 Container={container_ram_mb}MB Swap=0MB Agents={agent_count} → Xms={xms_mb}M Xmx={xmx_mb}M")
     return [
         "java", f"-Xms{xms_mb}M", f"-Xmx{xmx_mb}M",
-        "-XX:MaxMetaspaceSize=128m",
-        "-XX:CompressedClassSpaceSize=32m",
-        "-XX:ReservedCodeCacheSize=32m",
-        "-Xss320k",
-        "-XX:+UseG1GC", "-XX:+ParallelRefProcEnabled",
-        "-XX:MaxGCPauseMillis=200",
-        "-XX:ConcGCThreads=1", "-XX:ParallelGCThreads=2",
-        "-XX:+UnlockExperimentalVMOptions", "-XX:+DisableExplicitGC",
-        "-XX:G1PeriodicGCInterval=10000", "-XX:+G1PeriodicGCInvokesConcurrent",
-        "-XX:G1NewSizePercent=15", "-XX:G1MaxNewSizePercent=25",
+        # ── Bellek alanları — tümü küçük tutuldu (512MB kota) ──
+        "-XX:MaxMetaspaceSize=96m",       # default 512MB → 96MB yeter
+        "-XX:CompressedClassSpaceSize=24m",
+        "-XX:ReservedCodeCacheSize=28m",
+        "-Xss256k",                        # thread stack — Paper 256k'da sorunsuz
+        # ── GC: G1 + küçük heap için ayarlar ──
+        "-XX:+UseG1GC",
+        "-XX:+ParallelRefProcEnabled",
+        "-XX:MaxGCPauseMillis=100",        # daha sık ama kısa GC pause
+        "-XX:ConcGCThreads=1",
+        "-XX:ParallelGCThreads=1",         # tek vCPU'ya göre
+        "-XX:+UnlockExperimentalVMOptions",
+        "-XX:+DisableExplicitGC",
+        "-XX:G1NewSizePercent=20",
+        "-XX:G1MaxNewSizePercent=40",
         "-XX:G1HeapRegionSize=2m",
-        "-XX:G1ReservePercent=15",
-        "-XX:InitiatingHeapOccupancyPercent=20",
-        "-XX:SoftRefLRUPolicyMSPerMB=0",
+        "-XX:G1ReservePercent=10",
+        "-XX:InitiatingHeapOccupancyPercent=15",  # GC'yi erken başlat
+        "-XX:SoftRefLRUPolicyMSPerMB=0",           # soft ref → hemen sil
         "-XX:+UseStringDeduplication",
         "-XX:+UseCompressedOops",
         "-XX:+OptimizeStringConcat",
+        # ── Overcommit + agresif bellek iade ──
+        "-XX:+AlwaysPreTouch",             # heap'i önceden fiziksel belleğe map et
+        "-XX:+UseTransparentHugePages",    # THP — büyük sayfa desteği
+        "-XX:MaxDirectMemorySize=32m",     # NIO direct buffer sınırı
+        # ── Diğer ──
         "-Djava.net.preferIPv4Stack=true",
-        "-Dfile.encoding=UTF-8", "-Dcom.mojang.eula.agree=true",
+        "-Dfile.encoding=UTF-8",
+        "-Dcom.mojang.eula.agree=true",
         "-Xlog:disable",
         "-jar", str(MC_JAR), "--nogui",
     ]

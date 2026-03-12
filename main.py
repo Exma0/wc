@@ -140,105 +140,20 @@ def bypass_cgroups():
     print(f"  ✅ {n} cgroup limiti kaldırıldı")
 
 
-def _loop_swap(sf: str, sw_mb: int, priority: int = 0) -> bool:
-    """
-    Garantili loop-device swap.
-    Yöntem:
-      1. modprobe loop (kernel modülü yükle — yoksa loop device olmaz)
-      2. mknod /dev/loop0..7 (device node yoksa oluştur)
-      3. losetup --find --show <dosya>  → atomik: boş device bul VE bağla
-      4. mkswap + swapon
-    """
-    # Mevcut swap/loop temizle
-    sh(f"swapoff {sf} 2>/dev/null")
-    for i in range(8):
-        sh(f"swapoff /dev/loop{i} 2>/dev/null")
-
-    # Dosyayı sil + yeniden oluştur
-    try:
-        if os.path.exists(sf): os.remove(sf)
-    except: pass
-    r = sh(f"fallocate -l {sw_mb}M {sf}")
-    if r.returncode != 0:
-        r = sh(f"dd if=/dev/zero of={sf} bs=64M count={max(1,sw_mb//64)} status=none")
-    if not os.path.exists(sf) or os.path.getsize(sf) < sw_mb * 1024 * 700:
-        return False
-    sh(f"chmod 600 {sf}")
-
-    # Loop modülü yükle
-    sh("modprobe loop 2>/dev/null")
-    sh("modprobe loop max_loop=8 2>/dev/null")
-
-    # /dev/loop0..7 node yoksa oluştur
-    for i in range(8):
-        dev = f"/dev/loop{i}"
-        if not os.path.exists(dev):
-            sh(f"mknod {dev} b 7 {i} 2>/dev/null")
-
-    # losetup --find --show: boş device'ı otomatik bulur VE bağlar, path döner
-    r = sh(f"losetup --find --show {sf} 2>/dev/null")
-    if r.returncode == 0:
-        loop_dev = r.stdout.decode().strip()
-        print(f"  [swap] loop device: {loop_dev}")
-    else:
-        # Fallback: loop0'ı zorla temizle ve kullan
-        sh("losetup -d /dev/loop0 2>/dev/null")
-        r2 = sh(f"losetup /dev/loop0 {sf} 2>/dev/null")
-        loop_dev = "/dev/loop0" if r2.returncode == 0 else ""
-
-    if loop_dev:
-        sh(f"mkswap -f {loop_dev}")
-        r3 = sh(f"swapon -p {priority} {loop_dev}")
-        if r3.returncode == 0:
-            print(f"  ✅ Disk Swap: {sw_mb}MB ({loop_dev})")
-            return True
-        sh(f"losetup -d {loop_dev} 2>/dev/null")
-
-    # Son çare: tmpfs-üzerinde değil dosya üzerinde dene (bazı overlay sürümlerinde çalışır)
-    sh(f"mkswap -f {sf}")
-    r4 = sh(f"swapon -p {priority} {sf}")
-    if r4.returncode == 0:
-        print(f"  ✅ Disk Swap: {sw_mb}MB (doğrudan dosya)")
-        return True
-
-    print(f"  ⚠️  Disk Swap başarısız ({sw_mb}MB): {r4.stderr.decode()[:60]}")
-    return False
-
-
 def setup_swap():
-    # ── 1. zRAM ──────────────────────────────────────────────
-    sh("modprobe zram num_devices=1 2>/dev/null")
-    w("/sys/block/zram0/comp_algorithm", "lz4")
-    zram_ok = False
-    for zram_sz in ["512M", "384M", "256M", "128M"]:
-        sh("echo 0 > /sys/block/zram0/reset 2>/dev/null")
-        w("/sys/block/zram0/disksize", zram_sz)
-        if sh("mkswap /dev/zram0 2>/dev/null && swapon -p 100 /dev/zram0 2>/dev/null").returncode == 0:
-            print(f"  ✅ zram: {zram_sz}")
-            zram_ok = True
-            break
-    if not zram_ok:
-        print("  ⚠️  zram başlatılamadı")
-
-    # ── 2. Disk Swap (loop-device zorunlu) ───────────────────
-    swapped = False
-    for sw_mb in [4096, 2048, 1024, 512]:
-        if _loop_swap("/swapfile", sw_mb, priority=0):
-            swapped = True
-            break
-    if not swapped:
-        print("  ⚠️  Disk swap kurulamadı")
-
+    """
+    Render.com free tier'da swapon KERESİNLİKLE çalışmaz
+    (loop device, zram, dosya — hepsi EPERM verir).
+    Sadece kernel overcommit parametrelerini ayarla — bunlar çalışıyor.
+    """
     for p, v in [
-        ("/proc/sys/vm/swappiness",         "100"),
-        ("/proc/sys/vm/vfs_cache_pressure", "200"),
-        ("/proc/sys/vm/overcommit_memory",  "1"),
+        ("/proc/sys/vm/overcommit_memory",  "1"),   # Over-commit izin ver
         ("/proc/sys/vm/overcommit_ratio",   "100"),
-        ("/proc/sys/vm/page-cluster",       "0"),
+        ("/proc/sys/vm/vfs_cache_pressure", "50"),
         ("/proc/sys/vm/drop_caches",        "3"),
-        ("/proc/sys/vm/watermark_boost_factor", "0"),
-        ("/proc/sys/vm/min_free_kbytes",    "32768"),
+        ("/proc/sys/vm/min_free_kbytes",    "8192"),
     ]: w(p, v)
+    print("  ℹ️  Swap: Render'da swapon izni yok → sadece overcommit aktif")
 
 
 def optimize_kernel():
