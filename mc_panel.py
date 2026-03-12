@@ -256,70 +256,122 @@ def write_server_config():
 
 
 def _setup_swap():
-    import psutil, subprocess, os
+    """
+    Disk'ten swap aç + cgroup bellek limitini kaldır.
+    Render 512MB cgroup limiti → swap ile aşılır.
+    Fiziksel RSS düşük kalır, sanal bellek büyük olur.
+    """
+    import psutil, subprocess, os, glob
     try:
-        disk = psutil.disk_usage("/")
-        free_gb = disk.free / 1024 / 1024 / 1024
-        swap_gb = min(16, int(free_gb * 0.40))
-        if swap_gb < 1:
-            log("[Panel] ⚠️  Swap: yeterli disk yok")
-            return
-        swap_file = "/swapfile"
-        swap_mb = swap_gb * 1024
-        if not os.path.exists(swap_file):
-            log(f"[Panel] 💾 Swap dosyası oluşturuluyor: {swap_gb}GB...")
-            subprocess.run(["fallocate", "-l", f"{swap_mb}M", swap_file], check=True)
-            subprocess.run(["chmod", "600", swap_file], check=True)
-            subprocess.run(["mkswap", swap_file], check=True)
-        subprocess.run(["swapon", swap_file], check=False)
-        for path, val in [
-            ("/proc/sys/vm/swappiness",             "100"),
-            ("/proc/sys/vm/vfs_cache_pressure",     "200"),
-            ("/proc/sys/vm/overcommit_memory",      "1"),
-        ]:
+        # ── Önce cgroup limitlerini kaldır ────────────────────
+        cgroup_pairs = [
+            ("/sys/fs/cgroup/memory.max",                         "max"),
+            ("/sys/fs/cgroup/memory.swap.max",                    "max"),
+            ("/sys/fs/cgroup/memory/memory.limit_in_bytes",       "-1"),
+            ("/sys/fs/cgroup/memory/memory.memsw.limit_in_bytes", "-1"),
+            ("/sys/fs/cgroup/memory/memory.soft_limit_in_bytes",  "-1"),
+            ("/sys/fs/cgroup/memory/memory.swappiness",           "100"),
+            ("/sys/fs/cgroup/memory/memory.oom_control",          "0"),
+        ]
+        unlocked = 0
+        for path, val in cgroup_pairs:
             try:
-                with open(path, "w") as f: f.write(val)
+                with open(path, "w") as f:
+                    f.write(val)
+                unlocked += 1
             except Exception:
                 pass
-        mem = psutil.virtual_memory()
+        # Tüm alt cgroup'lar
+        for cg in glob.glob("/sys/fs/cgroup/memory/*/"):
+            for fn, v in [("memory.limit_in_bytes", "-1"),
+                          ("memory.memsw.limit_in_bytes", "-1"),
+                          ("memory.swappiness", "100"),
+                          ("memory.oom_control", "0")]:
+                try:
+                    with open(cg + fn, "w") as f: f.write(v)
+                except Exception:
+                    pass
+        log(f"[Panel] 🔓 cgroup: {unlocked} limit kaldırıldı")
+
+        # ── Swap zaten varsa atla ──────────────────────────────
         swp = psutil.swap_memory()
-        log(f"[Panel] ✅ Swap aktif: RAM={int(mem.total/1024/1024)}MB + Swap={int(swp.total/1024/1024)}MB = toplam {int((mem.total+swp.total)/1024/1024)}MB")
+        if swp.total > 2 * 1024 * 1024 * 1024:
+            log(f"[Panel] ✅ Swap zaten aktif: {swp.total//1024//1024}MB")
+            return
+
+        # ── Swap dosyası oluştur ───────────────────────────────
+        disk    = psutil.disk_usage("/")
+        free_gb = disk.free / 1024 / 1024 / 1024
+        swap_gb = min(32, int(free_gb * 0.60))   # boş alanın %60'ı, max 32GB
+        if swap_gb < 2:
+            log("[Panel] ⚠️  Swap: yeterli disk yok")
+            return
+
+        swap_file = "/swapfile"
+        swap_mb   = swap_gb * 1024
+        log(f"[Panel] 💾 Swap oluşturuluyor: {swap_gb}GB ({swap_mb}MB)...")
+
+        if not os.path.exists(swap_file):
+            ret = subprocess.run(
+                ["fallocate", "-l", f"{swap_mb}M", swap_file],
+                capture_output=True
+            )
+            if ret.returncode != 0:
+                # fallocate çalışmadıysa dd kullan
+                subprocess.run([
+                    "dd", "if=/dev/zero", f"of={swap_file}",
+                    "bs=64M", f"count={swap_mb // 64}", "status=none"
+                ], capture_output=True)
+
+        subprocess.run(["chmod", "600", swap_file], capture_output=True)
+        subprocess.run(["mkswap", "-f", swap_file], capture_output=True)
+        ret2 = subprocess.run(["swapon", swap_file], capture_output=True)
+
+        if ret2.returncode != 0:
+            log(f"[Panel] ⚠️  swapon: {ret2.stderr.decode().strip()}")
+        else:
+            # ── VM ayarları — fiziksel RAM'i boş tut ──────────
+            for path, val in [
+                ("/proc/sys/vm/swappiness",             "100"),
+                ("/proc/sys/vm/vfs_cache_pressure",     "500"),
+                ("/proc/sys/vm/overcommit_memory",      "1"),
+                ("/proc/sys/vm/overcommit_ratio",       "100"),
+                ("/proc/sys/vm/page-cluster",           "0"),
+                ("/proc/sys/vm/drop_caches",            "3"),
+            ]:
+                try:
+                    with open(path, "w") as f: f.write(val)
+                except Exception:
+                    pass
+
+        swp2 = psutil.swap_memory()
+        mem  = psutil.virtual_memory()
+        total = (mem.total + swp2.total) // 1024 // 1024
+        log(f"[Panel] ✅ Bellek: RAM={mem.total//1024//1024}MB + Swap={swp2.total//1024//1024}MB = {total}MB toplam")
+
     except Exception as e:
-        log(f"[Panel] ⚠️  Swap kurulamadı: {e}")
+        log(f"[Panel] ⚠️  Swap/cgroup hatası: {e}")
 
 
 def _ram_watchdog():
-    import psutil, os, signal
-    HARD_MB  = 511
-    CRIT_MB  = 500
-    WARN_MB  = 490
+    """
+    RAM + Swap watchdog.
+    cgroup limiti kaldırıldı, swap aktif → 512MB kısıtı yok.
+    Sadece toplam boş alan azaldığında entity temizle.
+    """
+    import psutil
     last_warn = 0
 
-    def _container_mem_mb():
-        try:
-            with open("/sys/fs/cgroup/memory.current") as f:
-                return int(f.read().strip()) // 1024 // 1024
-        except Exception:
-            pass
-        try:
-            with open("/sys/fs/cgroup/memory/memory.usage_in_bytes") as f:
-                return int(f.read().strip()) // 1024 // 1024
-        except Exception:
-            pass
-        try:
-            if mc_process and mc_process.poll() is None:
-                return int(psutil.Process(mc_process.pid).memory_info().rss / 1024 / 1024)
-        except Exception:
-            pass
-        return 0
-
     while True:
-        eventlet.sleep(2)
+        eventlet.sleep(5)
         try:
-            used_mb = _container_mem_mb()
+            mem  = psutil.virtual_memory()
+            swp  = psutil.swap_memory()
+            avail_mb = int((mem.available + swp.free) / 1024 / 1024)
             import time
 
-            if used_mb >= HARD_MB:
+            if avail_mb < 512:
+                # Kritik: 512MB'den az boş → agresif temizlik
                 try:
                     with open("/proc/sys/vm/drop_caches", "w") as f:
                         f.write("3")
@@ -328,15 +380,13 @@ def _ram_watchdog():
                 send_command("kill @e[type=item]")
                 send_command("kill @e[type=experience_orb]")
                 send_command("kill @e[type=arrow]")
-
-            elif used_mb >= CRIT_MB:
                 send_command("save-all")
-                send_command("kill @e[type=item]")
-                send_command("kill @e[type=experience_orb]")
 
-            elif used_mb >= WARN_MB:
+            elif avail_mb < 1024:
+                # Uyarı: 1GB'dan az kaldı
                 now = time.time()
-                if now - last_warn > 30:
+                if now - last_warn > 60:
+                    send_command("kill @e[type=item]")
                     send_command("save-all")
                     last_warn = now
 
@@ -345,46 +395,65 @@ def _ram_watchdog():
 
 
 def get_jvm_args():
+    """
+    Strateji: Fiziksel RAM (RSS) düşük tut → Render 512MB limitini aşma.
+    Ama swap üzerinden büyük heap kullan → Minecraft rahat çalışsın.
+    - Xms=64M  → JVM başlangıçta az fiziksel RAM alır
+    - Xmx=büyük → heap swap'a taşabilir
+    - PeriodicGC → JVM heap'i OS'a geri verir → RSS düşer
+    """
     import psutil
     mem      = psutil.virtual_memory()
     swp      = psutil.swap_memory()
     total_mb = int(mem.total / 1024 / 1024)
-    swap_mb  = int(swp.total / 1024 / 1024)   # toplam swap (free değil total)
+    swap_mb  = int(swp.total / 1024 // 1024)
 
-    # Disk'ten swap oluşturulduysa bunu kullan
-    # Xmx = (RAM - 512MB OS payı) + swap'ın yarısı, max 8GB
-    usable_ram = max(0, total_mb - 512)
-    usable_swap = swap_mb // 2
-    xmx_mb = min(8192, usable_ram + usable_swap)
-    xmx_mb = max(512, xmx_mb)   # en az 512MB
-    xms_mb = min(512, xmx_mb)   # xms = xmx ile aynı ya da 512
+    # Xmx = fiziksel RAM'in %50'si + swap'ın %70'i, max 12GB
+    xmx_mb = min(12288, int(total_mb * 0.50) + int(swap_mb * 0.70))
+    xmx_mb = max(512, xmx_mb)
+    xms_mb = 64   # KÜÇÜK başlat — fiziksel RAM önceden ayrılmaz
 
     xmx = f"{xmx_mb}M"
     xms = f"{xms_mb}M"
-    log(f"[Panel] 🧠 RAM={total_mb}MB  Swap={swap_mb}MB  Xms={xms}  Xmx={xmx}")
+    log(f"[Panel] 🧠 RAM={total_mb}MB Swap={swap_mb}MB → Xms={xms} Xmx={xmx}")
+
     return [
         "java",
         f"-Xms{xms}", f"-Xmx{xmx}",
-        # Compressed class space — varsayılan 1GB, küçük tut
+
+        # ── Compressed sınıflar küçük tut ─────────────────────
         "-XX:CompressedClassSpaceSize=128m",
         "-XX:MaxMetaspaceSize=256m",
-        # G1GC — sunucu için optimize
+
+        # ── G1GC + Heap'i OS'a geri ver (kritik!) ─────────────
         "-XX:+UseG1GC",
         "-XX:+ParallelRefProcEnabled",
         "-XX:MaxGCPauseMillis=200",
         "-XX:+UnlockExperimentalVMOptions",
         "-XX:+DisableExplicitGC",
-        "-XX:G1NewSizePercent=30",
-        "-XX:G1MaxNewSizePercent=40",
-        "-XX:G1HeapRegionSize=8m",
+
+        # Periyodik GC: boş heap sayfalarını OS'a geri ver → RSS düşer
+        "-XX:G1PeriodicGCInterval=15000",
+        "-XX:G1PeriodicGCSysLoadThreshold=0.0",
+        "-XX:+G1PeriodicGCInvokesConcurrent",
+
+        # Heap bölge boyutu
+        "-XX:G1NewSizePercent=20",
+        "-XX:G1MaxNewSizePercent=30",
+        "-XX:G1HeapRegionSize=4m",
         "-XX:G1ReservePercent=20",
-        "-XX:G1HeapWastePercent=5",
-        "-XX:G1MixedGCCountTarget=4",
         "-XX:InitiatingHeapOccupancyPercent=15",
-        "-XX:G1MixedGCLiveThresholdPercent=90",
+        "-XX:G1MixedGCCountTarget=8",
+        "-XX:G1MixedGCLiveThresholdPercent=85",
+        "-XX:G1HeapWastePercent=5",
+
+        # Agresif bellek geri alma
+        "-XX:SoftRefLRUPolicyMSPerMB=0",
         "-XX:SurvivorRatio=32",
         "-XX:MaxTenuringThreshold=1",
         "-XX:+UseStringDeduplication",
+
+        # Genel
         "-Djava.net.preferIPv4Stack=true",
         "-Dfile.encoding=UTF-8",
         "-Duser.timezone=Europe/Istanbul",
