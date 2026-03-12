@@ -114,61 +114,104 @@ def read_disk_used_gb():
 # ─────────────────────────────────────────────
 
 def bypass_cgroups():
+    """
+    Render cgroup limitlerini kaldır.
+    ÖNEMLİ: memory.max'a "max" yazmak işe yaramıyor çünkü
+    Render parent cgroup'u koruyor. Asıl çözüm:
+      1) Swap oluştur (kernel cgroup'u bypass eder)
+      2) overcommit_memory=1 (kernel RAM'i "var" sayar)
+      3) Java OOM score'unu düşür (kernel onu öldürmesin)
+    """
     n = 0
+    # Cgroup yazmaları — başarısız olsa sorun değil
     for path, val in [
-        ("/sys/fs/cgroup/memory.max", "max"),
-        ("/sys/fs/cgroup/memory.swap.max", "max"),
-        ("/sys/fs/cgroup/memory.high", "max"),
-        ("/sys/fs/cgroup/cpu.max", "max"),
-        ("/sys/fs/cgroup/pids.max", "max"),
-        ("/sys/fs/cgroup/memory/memory.limit_in_bytes", "-1"),
+        ("/sys/fs/cgroup/memory.max",                     "max"),
+        ("/sys/fs/cgroup/memory.swap.max",                "max"),
+        ("/sys/fs/cgroup/memory.high",                    "max"),
+        ("/sys/fs/cgroup/memory.oom.group",               "0"),
+        ("/sys/fs/cgroup/cpu.max",                        "max"),
+        ("/sys/fs/cgroup/pids.max",                       "max"),
+        ("/sys/fs/cgroup/memory/memory.limit_in_bytes",   "-1"),
         ("/sys/fs/cgroup/memory/memory.memsw.limit_in_bytes", "-1"),
-        ("/sys/fs/cgroup/memory/memory.swappiness", "100"),
-        ("/sys/fs/cgroup/memory/memory.oom_control", "0"),
-        ("/sys/fs/cgroup/cpu/cpu.cfs_quota_us", "-1"),
+        ("/sys/fs/cgroup/memory/memory.swappiness",       "100"),
+        ("/sys/fs/cgroup/memory/memory.oom_control",      "0"),
+        ("/sys/fs/cgroup/cpu/cpu.cfs_quota_us",           "-1"),
     ]:
         if w(path, val): n += 1
     for cg in glob.glob("/sys/fs/cgroup/*/") + glob.glob("/sys/fs/cgroup/*/*/"):
         for fn, v in [("memory.max","max"),("memory.swap.max","max"),
                       ("memory.high","max"),("memory.oom_control","0"),
-                      ("cpu.max","max"),("pids.max","max")]:
+                      ("memory.oom.group","0"),("cpu.max","max"),("pids.max","max")]:
             w(cg + fn, v)
+    # Kernel OOM / overcommit ayarları
     w("/proc/sys/vm/oom_kill_allocating_task", "0")
-    w("/proc/sys/vm/panic_on_oom", "0")
-    try: w(f"/proc/{os.getpid()}/oom_score_adj", "-1000")
+    w("/proc/sys/vm/panic_on_oom",             "0")
+    w("/proc/sys/vm/overcommit_memory",        "1")   # ← kernel RAM'i "var" sayar
+    w("/proc/sys/vm/overcommit_ratio",         "100")
+    # Bu process OOM'dan korunsun
+    try: w(f"/proc/{os.getpid()}/oom_score_adj", "-999")
     except: pass
-    print(f"  ✅ {n} cgroup limiti kaldırıldı")
+    print(f"  ✅ {n} cgroup yazımı + overcommit=1 aktif")
 
 
 def setup_swap():
+    """
+    MC başlamadan ÖNCE çalışır.
+    Mümkün olan maksimum swap'ı kurar.
+    Swap = cgroup limiti bypass'ının tek güvenilir yolu.
+    """
+    total_swap = 0
+
+    # 1) zram (RAM'i sıkıştırılmış swap olarak kullan — çok hızlı)
     sh("modprobe zram num_devices=1 2>/dev/null")
-    w("/sys/block/zram0/comp_algorithm", "lz4")
-    if w("/sys/block/zram0/disksize", "128M"):
-        if sh("mkswap /dev/zram0 && swapon -p 100 /dev/zram0").returncode == 0:
-            print("  ✅ zram: 128MB")
-    used  = read_disk_used_gb()
-    sw_mb = int(min(3.0, max(0.0, RENDER_DISK_LIMIT_GB - used - 7.0)) * 1024)
+    for algo in ["lz4", "zstd", "lzo"]:
+        if w("/sys/block/zram0/comp_algorithm", algo): break
+    # zram boyutu: fiziksel RAM'in %80'i (sıkıştırılmış, gerçek kullanım daha düşük)
+    zram_mb = max(256, CONTAINER_RAM_MB * 4 // 5)
+    if w(f"/sys/block/zram0/disksize", f"{zram_mb}M"):
+        if sh(f"mkswap /dev/zram0 2>/dev/null && swapon -p 200 /dev/zram0").returncode == 0:
+            total_swap += zram_mb
+            print(f"  ✅ zram: {zram_mb}MB (prio:200)")
+
+    # 2) Disk swap dosyası — mümkün olan maksimum
+    used   = read_disk_used_gb()
+    avail  = RENDER_DISK_LIMIT_GB - used - 4.0   # 4GB güvenlik payı
+    sw_mb  = int(min(8.0, max(0.0, avail)) * 1024)
     if sw_mb >= 256:
         sf = "/swapfile"
         if os.path.exists(sf): sh(f"swapoff {sf} 2>/dev/null")
         try: os.remove(sf)
         except: pass
-        r = sh(f"fallocate -l {sw_mb}M {sf}")
-        if r.returncode != 0:
-            sh(f"dd if=/dev/zero of={sf} bs=64M count={max(1,sw_mb//64)} status=none")
-        sh(f"chmod 600 {sf} && mkswap -f {sf}")
-        if sh(f"swapon -p 0 {sf}").returncode == 0:
-            print(f"  ✅ Swap: {sw_mb}MB")
+        # fallocate dene, başarısız olursa dd
+        r = sh(f"fallocate -l {sw_mb}M {sf} 2>/dev/null")
+        if r.returncode != 0 or not os.path.exists(sf):
+            blk = 64; cnt = max(1, sw_mb // blk)
+            sh(f"dd if=/dev/zero of={sf} bs={blk}M count={cnt} status=none 2>/dev/null")
+        if os.path.exists(sf) and os.path.getsize(sf) > 0:
+            sh(f"chmod 600 {sf} && mkswap -f {sf} 2>/dev/null")
+            if sh(f"swapon -p 100 {sf} 2>/dev/null").returncode == 0:
+                actual = os.path.getsize(sf) // 1024 // 1024
+                total_swap += actual
+                print(f"  ✅ Swap dosyası: {actual}MB (prio:100)")
+
+    # 3) Kernel sanal bellek ayarları
     for p, v in [
-        ("/proc/sys/vm/swappiness",         "100"),
-        ("/proc/sys/vm/vfs_cache_pressure", "200"),
-        ("/proc/sys/vm/overcommit_memory",  "1"),
-        ("/proc/sys/vm/overcommit_ratio",   "100"),
-        ("/proc/sys/vm/page-cluster",       "0"),
-        ("/proc/sys/vm/drop_caches",        "3"),
+        ("/proc/sys/vm/swappiness",             "200"),  # agresif swap kullanımı
+        ("/proc/sys/vm/vfs_cache_pressure",     "500"),  # cache'i hızlı boşalt
+        ("/proc/sys/vm/overcommit_memory",      "1"),    # her zaman "evet" de
+        ("/proc/sys/vm/overcommit_ratio",       "100"),
+        ("/proc/sys/vm/page-cluster",           "0"),    # tek sayfa swap (latency düşük)
+        ("/proc/sys/vm/drop_caches",            "3"),    # şimdi temizle
         ("/proc/sys/vm/watermark_boost_factor", "0"),
-        ("/proc/sys/vm/min_free_kbytes",    "32768"),
+        ("/proc/sys/vm/min_free_kbytes",        "16384"),
+        ("/proc/sys/vm/dirty_ratio",            "80"),
+        ("/proc/sys/vm/dirty_background_ratio", "50"),
     ]: w(p, v)
+
+    import psutil as _ps
+    swp = _ps.swap_memory()
+    print(f"  ✅ Toplam swap: {swp.total//1024//1024}MB (built: {total_swap}MB)")
+    return swp.total // 1024 // 1024
 
 
 def optimize_kernel():
@@ -202,9 +245,52 @@ def start_panel():
     return proc
 
 
+def _wait_for_swap(min_swap_mb: int = 512, timeout: int = 120) -> int:
+    """
+    MC başlamadan önce yeterli swap olduğundan emin ol.
+    Agent swap'ları veya yerel swap hazır olana kadar bekle.
+    min_swap_mb MB swap hazır olunca (veya timeout'ta) döner.
+    """
+    import psutil as _ps
+    deadline = time.time() + timeout
+    last_reported = 0
+    while time.time() < deadline:
+        swp = _ps.swap_memory()
+        sw_mb = swp.total // 1024 // 1024
+        if sw_mb != last_reported:
+            print(f"  [Swap] Mevcut: {sw_mb}MB / hedef: {min_swap_mb}MB")
+            last_reported = sw_mb
+        if sw_mb >= min_swap_mb:
+            return sw_mb
+        time.sleep(5)
+    # Timeout — ne kadar varsa onunla devam et
+    swp = _ps.swap_memory()
+    return swp.total // 1024 // 1024
+
+
 def auto_start_sequence():
-    time.sleep(4)
-    _panel_log("[Sistem] 🟢 v10.0 başladı — MC başlatılıyor...")
+    """
+    MC başlatma sırası:
+      1. Panel hazır olana kadar bekle
+      2. Yeterli swap olana kadar bekle (agent'lar bağlansın)
+      3. MC'yi başlat — swap hazır olduğu için Xmx daha yüksek hesaplanır
+    """
+    # Panel hazır olsun
+    _panel_log("[Sistem] 🟢 v12.0 başladı")
+
+    # Yeterli swap bekle — min 512MB (yerel swap zaten kuruldu, agent'lar daha fazla ekler)
+    import psutil as _ps
+    swp = _ps.swap_memory()
+    sw_now = swp.total // 1024 // 1024
+    _panel_log(f"[Sistem] 💾 Mevcut swap: {sw_now}MB")
+
+    if sw_now < 512:
+        _panel_log("[Sistem] ⏳ Agent swap bekleniyor (max 90sn)...")
+        sw_now = _wait_for_swap(min_swap_mb=512, timeout=90)
+        _panel_log(f"[Sistem] 💾 Swap hazır: {sw_now}MB — MC başlatılıyor")
+    else:
+        _panel_log(f"[Sistem] 💾 Swap yeterli: {sw_now}MB — MC başlatılıyor")
+
     try:
         _ur.urlopen(_ur.Request(
             f"http://localhost:{PORT}/api/start",

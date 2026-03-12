@@ -591,25 +591,33 @@ _swap_size_mb   = 0
 
 @app.route("/api/swap/allocate", methods=["POST"])
 def swap_allocate():
-    """Ana sunucu isteğiyle disk üzerinde swap bloğu oluştur."""
+    """
+    Ana sunucu isteğiyle disk üzerinde swap bloğu oluştur.
+    Dosya hazırlandıktan sonra ana sunucu HTTP ile indirir ve swapon yapar.
+    """
     global _swap_allocated, _swap_size_mb
     d       = request.json or {}
     size_mb = int(d.get("size_mb", 1500))
-    # Disk yeterliliği kontrol et
     free_gb = store_free_gb()
-    if free_gb < size_mb / 1024 + 0.5:
+    if free_gb < size_mb / 1024 + 0.3:
         return jsonify({"ok": False, "error": f"Yetersiz disk: {free_gb:.1f}GB boş"})
-    # Dosya oluştur (sıfırlarla dolu)
     _log_local(f"[Swap] {size_mb}MB swap bloğu oluşturuluyor...")
     try:
-        with open(SWAP_BLOCK_PATH, "wb") as f:
-            chunk = b"\x00" * (1024 * 1024)   # 1MB chunk
-            for _ in range(size_mb):
-                f.write(chunk)
+        # fallocate ile hızlı oluştur (sparse file — gerçek disk yazmaz)
+        import subprocess as _sp
+        r = _sp.run(f"fallocate -l {size_mb}M {SWAP_BLOCK_PATH} 2>/dev/null",
+                    shell=True)
+        if r.returncode != 0 or not SWAP_BLOCK_PATH.exists():
+            # Fallback: dd ile gerçek dosya
+            with open(SWAP_BLOCK_PATH, "wb") as f:
+                chunk = b"\x00" * (1024 * 1024)
+                for _ in range(size_mb):
+                    f.write(chunk)
         _swap_allocated = True
         _swap_size_mb   = size_mb
-        _log_local(f"[Swap] ✅ {size_mb}MB swap bloğu hazır")
-        return jsonify({"ok": True, "size_mb": size_mb, "path": str(SWAP_BLOCK_PATH)})
+        actual_mb = SWAP_BLOCK_PATH.stat().st_size // (1024*1024)
+        _log_local(f"[Swap] ✅ {actual_mb}MB swap bloğu hazır (sparse)")
+        return jsonify({"ok": True, "size_mb": actual_mb, "path": str(SWAP_BLOCK_PATH)})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)})
 

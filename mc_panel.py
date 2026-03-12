@@ -373,37 +373,102 @@ def write_server_config():
 
 
 def get_jvm_args():
+    """
+    JVM heap hesabı:
+    ─────────────────────────────────────────────────────
+    Render container'da fiziksel RAM 512MB (cgroup limit).
+    Bu limit bypass edilemiyor — yazılan değerler yok sayılıyor.
+    
+    Güvenli bütçe (512MB container):
+      Python/Flask/Panel   : ~90MB
+      JVM overhead         : ~60MB  (JIT, compiler threads, GC)
+      Java metaspace       : 96MB   (Paper MC için yeterli)
+      Java heap (Xmx)      : 256MB  ← bu değeri ASLA aşma
+      Toplam               : ~502MB ✓
+    
+    Swap varsa (agent'lar veya yerel swap):
+      Swap her 512MB için Xmx'i +128MB artırabilirsin
+      Max Xmx: 1024MB (swap > 2GB ise)
+    ─────────────────────────────────────────────────────
+    """
     import psutil as _ps
-    container_ram_mb = int(os.environ.get("CONTAINER_RAM_MB", "512"))
+
+    # Gerçek fiziksel RAM'i oku (cgroup'tan)
+    phys_mb = 512   # Render default
     for path in ["/sys/fs/cgroup/memory.max",
                  "/sys/fs/cgroup/memory/memory.limit_in_bytes"]:
         try:
             val = open(path).read().strip()
-            if val not in ("max", "-1"):
+            if val not in ("max", "-1", "9223372036854771712"):
                 mb = int(val) // 1024 // 1024
-                if 64 < mb < 65536:
-                    container_ram_mb = mb; break
+                if 128 < mb < 65536:
+                    phys_mb = mb
+                    break
         except: pass
 
-    swp    = _ps.swap_memory()
-    sw_mb  = int(swp.total / 1024 / 1024)
-    xmx_mb = min(384, container_ram_mb - 128)
-    xmx_mb = max(256, xmx_mb)
-    if sw_mb > 512:
-        xmx_mb = min(xmx_mb + min(sw_mb // 4, 512), 2048)
-    xms_mb = 32
-    log(f"[Panel] 🧠 Container RAM={container_ram_mb}MB Swap={sw_mb}MB → Xms={xms_mb}M Xmx={xmx_mb}M")
+    # Gerçek swap'ı oku
+    swp   = _ps.swap_memory()
+    sw_mb = swp.total // 1024 // 1024
+
+    # ── Heap hesabı ───────────────────────────────────────
+    # Python+panel overhead: 90MB
+    # JVM iç overhead: 60MB
+    # Metaspace: 96MB
+    # → fiziksel RAM'den kullanılabilir heap:
+    heap_from_phys = max(100, phys_mb - 90 - 60 - 96)   # = 266MB (512MB için)
+
+    # Swap'tan ek heap (swap daha yavaş ama kullanılabilir)
+    # Her 512MB swap için +128MB heap
+    heap_from_swap = min(768, (sw_mb // 512) * 128)
+
+    xmx_mb = heap_from_phys + heap_from_swap
+    xmx_mb = max(180, min(xmx_mb, 1536))   # mutlak alt/üst sınır
+
+    xms_mb = 32   # düşük başlat, JVM ihtiyaca göre büyütsün
+
+    log(f"[Panel] 🧠 RAM={phys_mb}MB Swap={sw_mb}MB → "
+        f"heap_phys={heap_from_phys}MB heap_swap={heap_from_swap}MB "
+        f"→ Xms={xms_mb}M Xmx={xmx_mb}M")
+
     return [
-        "java", f"-Xms{xms_mb}M", f"-Xmx{xmx_mb}M",
-        "-XX:CompressedClassSpaceSize=64m", "-XX:MaxMetaspaceSize=128m",
-        "-XX:+UseG1GC", "-XX:+ParallelRefProcEnabled", "-XX:MaxGCPauseMillis=200",
-        "-XX:+UnlockExperimentalVMOptions", "-XX:+DisableExplicitGC",
-        "-XX:G1PeriodicGCInterval=15000", "-XX:+G1PeriodicGCInvokesConcurrent",
-        "-XX:G1NewSizePercent=20", "-XX:G1MaxNewSizePercent=30",
-        "-XX:G1HeapRegionSize=4m", "-XX:G1ReservePercent=20",
-        "-XX:InitiatingHeapOccupancyPercent=15", "-XX:SoftRefLRUPolicyMSPerMB=0",
-        "-XX:+UseStringDeduplication", "-Djava.net.preferIPv4Stack=true",
-        "-Dfile.encoding=UTF-8", "-Dcom.mojang.eula.agree=true",
+        "java",
+        f"-Xms{xms_mb}M", f"-Xmx{xmx_mb}M",
+
+        # Metaspace — Paper için 96MB yeterli, sabit tut
+        "-XX:CompressedClassSpaceSize=48m",
+        "-XX:MaxMetaspaceSize=96m",
+
+        # G1GC — düşük RAM için optimize
+        "-XX:+UseG1GC",
+        "-XX:+ParallelRefProcEnabled",
+        "-XX:MaxGCPauseMillis=100",          # daha sık ama kısa GC
+        "-XX:+UnlockExperimentalVMOptions",
+        "-XX:+DisableExplicitGC",
+        "-XX:G1NewSizePercent=15",
+        "-XX:G1MaxNewSizePercent=25",
+        "-XX:G1HeapRegionSize=2m",           # küçük heap → küçük region
+        "-XX:G1ReservePercent=15",
+        "-XX:InitiatingHeapOccupancyPercent=20",
+        "-XX:SoftRefLRUPolicyMSPerMB=0",
+        "-XX:+UseStringDeduplication",
+
+        # Bellek baskısı azaltma
+        "-XX:+UseCompressedOops",
+        "-XX:+UseCompressedClassPointers",
+        "-XX:NativeMemoryTracking=off",      # tracking overhead yok
+        "-XX:+ExplicitGCInvokesConcurrent",  # GC bloklamayı azalt
+        "-XX:-OmitStackTraceInFastThrow",
+
+        # OOM yerine swap kullan (JVM kendi OOM'unu geciktir)
+        "-XX:+HeapDumpOnOutOfMemoryError",
+        f"-XX:HeapDumpPath=/tmp/java_oom.hprof",
+
+        # Genel
+        "-Djava.net.preferIPv4Stack=true",
+        "-Dfile.encoding=UTF-8",
+        "-Dcom.mojang.eula.agree=true",
+        "-Djava.awt.headless=true",
+
         "-jar", str(MC_JAR), "--nogui",
     ]
 
@@ -438,6 +503,17 @@ def start_server():
         socketio.emit("server_status", server_state)
         return False, str(e)
     threading.Thread(target=_stdout_reader, daemon=True).start()
+
+    # Java process'i OOM killer'dan koru
+    if mc_process.pid:
+        try:
+            # -900: kernel başka şeyleri öldürür, Java'ya dokunmaz
+            with open(f"/proc/{mc_process.pid}/oom_score_adj", "w") as f:
+                f.write("-900")
+            log(f"[Panel] 🛡️  Java PID={mc_process.pid} OOM koruması aktif")
+        except Exception as e:
+            log(f"[Panel] ⚠️  OOM adj başarısız: {e}")
+
     return True, "Başlatılıyor..."
 
 
@@ -465,19 +541,52 @@ def send_command(cmd: str) -> bool:
 
 
 def _ram_watchdog():
+    """
+    Bellek baskısını sürekli izle.
+    512MB fiziksel limit aşılmadan swap'a geçilmesini sağla.
+    """
     import psutil
+    _consecutive_low = 0
     while True:
-        eventlet.sleep(5)
+        eventlet.sleep(4)
         try:
-            mem = psutil.virtual_memory()
-            swp = psutil.swap_memory()
-            avail_mb = int((mem.available + swp.free) / 1024 / 1024)
-            if avail_mb < 512:
-                try: open("/proc/sys/vm/drop_caches","w").write("3")
+            mem  = psutil.virtual_memory()
+            swp  = psutil.swap_memory()
+            # Gerçek kullanılabilir = fiziksel boş + swap boş
+            phys_avail_mb = mem.available  // 1024 // 1024
+            swap_free_mb  = swp.free       // 1024 // 1024
+
+            # Fiziksel RAM kritik eşikte (<80MB) — agresif temizlik
+            if phys_avail_mb < 80:
+                _consecutive_low += 1
+                # Kernel sayfa cache'ini boşalt
+                try: open("/proc/sys/vm/drop_caches","w").write("1")
                 except: pass
-                send_command("kill @e[type=item]")
-                send_command("kill @e[type=experience_orb]")
-                send_command("save-all")
+                # swappiness'i maksimuma çek (kernel swap'ı tercih etsin)
+                try: open("/proc/sys/vm/swappiness","w").write("200")
+                except: pass
+
+                if _consecutive_low >= 3:
+                    # MC'ye temizlik komutları
+                    send_command("kill @e[type=item]")
+                    send_command("kill @e[type=experience_orb]")
+                if _consecutive_low >= 6:
+                    send_command("save-all")
+                    # View distance'ı geçici düşür
+                    send_command("minecraft:view-distance 4")
+                log(f"[Panel] ⚠️  RAM kritik: phys={phys_avail_mb}MB swap_free={swap_free_mb}MB")
+
+            elif phys_avail_mb < 150:
+                _consecutive_low = max(0, _consecutive_low - 1)
+                try: open("/proc/sys/vm/drop_caches","w").write("1")
+                except: pass
+
+            else:
+                _consecutive_low = 0
+                # Yeterli swap varsa view distance'ı geri getir
+                if swap_free_mb > 1000:
+                    send_command("minecraft:view-distance 8")
+
         except: pass
 
 
