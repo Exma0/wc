@@ -146,8 +146,9 @@ class AgentClient:
 
     # ── Genel ────────────────────────────────────────────────
 
-    def get_status(self) -> dict:
-        return self._json("GET", "/api/status") or {}
+    def get_status(self) -> Optional[dict]:
+        """Agent'ın /api/status endpoint'ini sorgula. Başarısız → None."""
+        return self._json("GET", "/api/status")  # None → başarısız, dict → başarılı
 
 
 # ─────────────────────────────────────────────────────────────
@@ -463,7 +464,11 @@ class ResourcePool:
             time.sleep(interval)
             for agent in list(self.agents.values()):
                 status = agent.get_status()
-                if status:
+                # DÜZELTİLDİ: `or {}` → None check.
+                # get_status() başarısız olunca None döner (exception).
+                # Başarılı olunca {'node_id':..., 'ram':...} döner — truthy olsa da olmasa da
+                # None/not-None farkı belirleyici olmalı, {} falsy yanılgısı değil.
+                if status is not None:
                     agent.info    = status
                     agent.healthy = True
                     agent.last_ok = time.time()

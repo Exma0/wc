@@ -348,7 +348,7 @@ def _pool_summary() -> dict:
                 "url":          a["url"],
                 "healthy":      a["healthy"],
                 "connected_at": a.get("last_ok", 0),
-                "last_ping":    a.get("last_ok", 0),
+                "last_ping":    int(time.time() - a.get("last_ok", time.time())),
                 "ram":          a.get("ram",   {}),
                 "disk":         a.get("disk",  {}),
                 "cpu":          a.get("cpu",   {}),
@@ -1032,6 +1032,17 @@ def _ram_watchdog():
 # ══════════════════════════════════════════════════════════════
 #  FLASK ROUTES — MC Yönetimi
 # ══════════════════════════════════════════════════════════════
+
+@app.route("/api/ping")
+@app.route("/health")
+def api_ping():
+    """
+    Render healthCheckPath: /api/ping
+    Bu endpoint olmadan Render 404 alır → servisi degraded sayar → restart döngüsü.
+    """
+    return jsonify({"ok": True, "status": server_state.get("status", "unknown"),
+                    "agents": _pool.agent_count()})
+
 
 @app.route("/api/start", methods=["POST"])
 def api_start():
