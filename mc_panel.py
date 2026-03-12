@@ -467,11 +467,9 @@ def _warm_single_agent(agent_client, log_fn=None, fill_regions: bool = True):
         except:
             return False
 
-    # 1. Server JAR (tüm agentlara — sık erişilen)
-    if MC_JAR.exists():
-        try:
-            _send("mc/server.jar", MC_JAR.read_bytes())
-        except: pass
+    # 1. Server JAR — ATLA: 47MB × N_agent = OOM (ana sunucu 512MB limit)
+    # JAR agentlarda cache'lenmez, MC sadece lokal diskten okur.
+    # (server.jar gönderilmiyor)
 
     # 2. Config dosyaları
     for cfg in ["paper.yml", "spigot.yml", "bukkit.yml", "server.properties",
@@ -485,7 +483,9 @@ def _warm_single_agent(agent_client, log_fn=None, fill_regions: bool = True):
     plugins_dir = MC_DIR / "plugins"
     if plugins_dir.exists():
         for pjar in sorted(plugins_dir.glob("*.jar"))[:20]:
-            try: _send(f"mc/plugins/{pjar.name}", pjar.read_bytes())
+            try:
+                if pjar.stat().st_size <= 5 * 1024 * 1024:  # 5MB altı
+                    _send(f"mc/plugins/{pjar.name}", pjar.read_bytes())
             except: pass
 
     # 4. World region dosyaları — ASIL DOLDURMA ─────────────────────────────
@@ -522,6 +522,8 @@ def _warm_single_agent(agent_client, log_fn=None, fill_regions: bool = True):
                     continue  # Başka agent'ın payı
                 key = f"mc/region/{dim_name}/{rf.name}"
                 try:
+                    if rf.stat().st_size > 8 * 1024 * 1024:
+                        continue  # 8MB üstü .mca dosyaları atla
                     _send(key, rf.read_bytes())
                 except: pass
 
@@ -552,21 +554,17 @@ def _ram_cache_warm_loop():
         agents = _pool.get_agents()
         if not agents:
             return 0
-        threads, results = [], []
-
-        def _t(a):
-            n = _warm_single_agent(a, log_fn=log, fill_regions=True)
-            results.append(n)
-
+        total = 0
+        # SERİ işle — paralel değil! Paralel: N×47MB = OOM → restart
         for a in agents:
-            t = threading.Thread(target=_t, args=(a,), daemon=True)
-            threads.append(t)
-            t.start()
-        for t in threads:
-            t.join(timeout=180)
-        total = sum(results)
+            try:
+                n = _warm_single_agent(a, log_fn=log, fill_regions=True)
+                total += n
+                time.sleep(2)  # GC nefes al
+            except Exception as _e:
+                log(f"[Pool] ⚠️  Cache warm {a.node_id}: {_e}")
         if total:
-            log(f"[Pool] 🧠 Cache tamamlandı: {len(agents)} agent, toplam {total} dosya gönderildi")
+            log(f"[Pool] 🧠 Cache tamamlandı: {len(agents)} agent, toplam {total} dosya")
             socketio.emit("pool_update", _pool_summary())
         return total
 
@@ -588,10 +586,11 @@ def _ram_cache_warm_loop():
                 for nid in new_ids:
                     a = _pool.agents.get(nid)
                     if a:
-                        threading.Thread(
-                            target=_warm_single_agent,
-                            args=(a, log, True), daemon=True
-                        ).start()
+                        try:
+                            _warm_single_agent(a, log_fn=log, fill_regions=True)
+                            time.sleep(2)
+                        except Exception as _ew:
+                            log(f"[Pool] ⚠️  Yeni agent warm {nid}: {_ew}")
                 _warmed_agents.update(current)
 
             # World yeni region'ları çıktıysa tazele (oyun genişledi)
@@ -995,13 +994,6 @@ def api_internal_tunnel():
     return jsonify({"ok": True})
 
 
-@app.route("/api/ping")
-@app.route("/api/ping", methods=["POST"])
-def api_ping():
-    """Agent'lar ve dış izleme araçları için hafif keep-alive endpoint."""
-    return jsonify({"ok": True, "t": int(__import__("time").time()), "status": server_state.get("status","?")}), 200
-
-
 @app.route("/api/internal/status_msg", methods=["POST"])
 def api_internal_status_msg():
     msg = (request.json or {}).get("msg", "")
@@ -1066,7 +1058,8 @@ def api_agent_register():
         mc_host = tunnel_info.get("host", "")
         if mc_host and mc_process and mc_process.poll() is None:
             def _new_agent_proxy():
-                time.sleep(3)
+                # Cache warm (~30-60sn) bitene kadar bekle
+                time.sleep(60)
                 ok = agent_client.proxy_start(mc_host, 25565, 25565)
                 if ok:
                     log(f"[Pool] 🔀 Yeni agent proxy: {node_id} → {mc_host}:25565")
@@ -2415,31 +2408,6 @@ init();
 threading.Thread(target=_ram_monitor,        daemon=True).start()
 threading.Thread(target=_ram_watchdog,       daemon=True).start()
 # _pool_health_watchdog KALDIRILDI: resource_pool.health_monitor() zaten arka planda çalışıyor
-
-def _keepalive_loop():
-    """
-    Render free tier 15 dakika inaktivite sonrası servisleri uyutur.
-    Ana sunucu her 10 dakikada bir:
-      1. Kendini ping'ler (Render bu servisi ayakta tutar)
-      2. Tüm bağlı agent'ları ping'ler (onları da ayakta tutar)
-    """
-    import urllib.request as _ka
-    while True:
-        time.sleep(600)  # 10 dakika
-        # 1. Self-ping (bu servisi ayakta tut)
-        try:
-            _ka.urlopen("http://localhost:5000/api/ping", timeout=5)
-        except: pass
-        # 2. Tüm agent'ları ping'le (onları uyutma)
-        agents = _pool.get_agents()
-        for ag in agents:
-            try:
-                _ka.urlopen(f"{ag.url}/ping", timeout=8)
-            except: pass
-        if agents:
-            log(f"[Keepalive] 💓 {len(agents)} agent ayakta tutuldu")
-
-threading.Thread(target=_keepalive_loop, daemon=True).start()
 threading.Thread(target=_pool_auto_optimize,  daemon=True).start()
 threading.Thread(target=_world_backup_loop,   daemon=True).start()  # Agent disk doldur
 threading.Thread(target=_ram_cache_warm_loop, daemon=True).start()  # Agent RAM doldur
