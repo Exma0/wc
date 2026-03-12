@@ -304,38 +304,56 @@ def _ram_watchdog():
     WARN_MB  = 490   # uyarı + save-all
     last_warn = 0
 
+    def _container_mem_mb():
+        """Container'ın gerçek bellek kullanımı — cgroup'tan oku"""
+        # cgroup v2
+        try:
+            with open("/sys/fs/cgroup/memory.current") as f:
+                return int(f.read().strip()) // 1024 // 1024
+        except Exception:
+            pass
+        # cgroup v1
+        try:
+            with open("/sys/fs/cgroup/memory/memory.usage_in_bytes") as f:
+                return int(f.read().strip()) // 1024 // 1024
+        except Exception:
+            pass
+        # Fallback: sadece MC process RSS
+        try:
+            if mc_process and mc_process.poll() is None:
+                return int(psutil.Process(mc_process.pid).memory_info().rss / 1024 / 1024)
+        except Exception:
+            pass
+        return 0
+
     while True:
         eventlet.sleep(2)
         try:
-            mem = psutil.virtual_memory()
-            used_mb = int(mem.used / 1024 / 1024)
+            used_mb = _container_mem_mb()
+            import time
 
             if used_mb >= HARD_MB:
-                # Fiziksel RAM'i anında boşalt:
-                # 1) Kernel cache'i temizle
                 try:
                     with open("/proc/sys/vm/drop_caches", "w") as f:
                         f.write("3")
                 except Exception:
                     pass
-                # 2) MC'ye agresif GC + entity temizle
                 send_command("kill @e[type=item]")
                 send_command("kill @e[type=experience_orb]")
                 send_command("kill @e[type=arrow]")
-                log(f"[RAM🚨] {used_mb}MB → HARD LİMİT! Cache+entity temizlendi")
+                log(f"[RAM🚨] Container: {used_mb}MB → HARD LİMİT! Cache+entity temizlendi")
 
             elif used_mb >= CRIT_MB:
                 send_command("save-all")
                 send_command("kill @e[type=item]")
                 send_command("kill @e[type=experience_orb]")
-                log(f"[RAM⚠️] {used_mb}MB → GC + entity temizlendi")
+                log(f"[RAM⚠️] Container: {used_mb}MB → entity temizlendi")
 
             elif used_mb >= WARN_MB:
-                import time
                 now = time.time()
                 if now - last_warn > 30:
                     send_command("save-all")
-                    log(f"[RAM💛] {used_mb}MB → save-all")
+                    log(f"[RAM💛] Container: {used_mb}MB → save-all")
                     last_warn = now
 
         except Exception:
