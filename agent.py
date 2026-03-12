@@ -604,42 +604,174 @@ def _get_resource_info() -> dict:
 _start_time = time.time()
 
 
+# ══════════════════════════════════════════════════════════════
+#  CLOUDFLARE TÜNELİ  (yeniden deneme döngüsü)
+# ══════════════════════════════════════════════════════════════
+
+# cloudflared çıktısında URL'i bulmak için birden fazla pattern dene.
+# Farklı cloudflared sürümleri farklı format kullanır.
+_CF_URL_PATTERNS = [
+    r"https://[a-z0-9][a-z0-9\-]+\.trycloudflare\.com",  # standart
+    r"https://[a-zA-Z0-9\-]+\.trycloudflare\.com",        # büyük harf toleranslı
+    r"(https?://[^\s]+trycloudflare\.com[^\s]*)",          # geniş eşleşme
+]
+
+_cf_proc = None  # global cloudflared process referansı
+
+
+def _extract_tunnel_url(log_path: str):
+    """Log dosyasından cloudflare tunnel URL'ini çıkar."""
+    try:
+        content = open(log_path, errors="replace").read()
+        for pattern in _CF_URL_PATTERNS:
+            found = re.findall(pattern, content)
+            if found:
+                url = found[0].strip().rstrip("/")
+                if "trycloudflare.com" in url:
+                    return url
+    except Exception:
+        pass
+    return ""
+
+
+def _start_tunnel():
+    """
+    Cloudflare HTTP tüneli başlat.
+    120sn içinde URL gelmezse cloudflared'i yeniden başlat (sonsuz döngü).
+    """
+    global _cf_proc
+    log = "/tmp/cf_agent.log"
+    attempt = 0
+
+    while True:
+        attempt += 1
+        print(f"  [agent] 🌐 Cloudflare tünel girişimi #{attempt}...")
+
+        # Önceki process varsa öldür
+        if _cf_proc and _cf_proc.poll() is None:
+            try:
+                _cf_proc.terminate()
+                time.sleep(1)
+            except Exception:
+                pass
+
+        # Log dosyasını sıfırla (önceki girişim kalıntısı olmasın)
+        try:
+            open(log, "w").close()
+        except Exception:
+            pass
+
+        try:
+            _cf_proc = subprocess.Popen(
+                ["cloudflared", "tunnel",
+                 "--url", f"http://localhost:{PORT}",
+                 "--no-autoupdate",
+                 "--loglevel", "info"],
+                stdout=open(log, "w"),
+                stderr=subprocess.STDOUT,
+            )
+        except FileNotFoundError:
+            print("  [agent] ❌ cloudflared bulunamadı!")
+            time.sleep(30)
+            continue
+        except Exception as e:
+            print(f"  [agent] ❌ cloudflared başlatma hatası: {e}")
+            time.sleep(15)
+            continue
+
+        # 150 saniye URL'i bekle (0.5sn aralıkla = 300 deneme)
+        found = False
+        for tick in range(300):
+            url = _extract_tunnel_url(log)
+            if url:
+                host = url.replace("https://", "").replace("http://", "")
+                state["tunnel"] = url
+                print(f"\n  [agent] ✅ Tünel #{attempt}: {host}\n")
+                found = True
+                break
+
+            # Process çöktüyse erken çık
+            if _cf_proc.poll() is not None:
+                print(f"  [agent] ⚠️  cloudflared {tick*0.5:.0f}sn'de çıktı "
+                      f"(kod={_cf_proc.returncode}) — yeniden başlatılıyor...")
+                break
+
+            time.sleep(0.5)
+
+        if found:
+            # Tünel aktifken izle — kesilirse yeniden başlat
+            while True:
+                time.sleep(10)
+                if _cf_proc.poll() is not None:
+                    print("  [agent] ⚠️  Tünel kesildi → yeniden başlatılıyor...")
+                    state["tunnel"] = ""
+                    break
+                # Hâlâ URL var mı kontrol et (cloudflared bazen sessizce URL değiştirir)
+                new_url = _extract_tunnel_url(log)
+                if new_url and new_url != state["tunnel"]:
+                    state["tunnel"] = new_url
+                    print(f"  [agent] 🔄 Tünel URL güncellendi: {new_url}")
+        else:
+            print(f"  [agent] ⚠️  #{attempt} URL alınamadı (150sn) → 5sn sonra tekrar...")
+            time.sleep(5)
+
+
 def _register_loop():
-    """Ana sunucuya kayıt ol, heartbeat gönder."""
-    # Tünel hazır olana kadar bekle
-    while not state["tunnel"]:
+    """
+    Ana sunucuya kayıt ol + heartbeat gönder.
+    Tünel hazır olmadan MAX 60 saniye bekle, sonra RENDER_EXTERNAL_URL ile dene.
+    """
+    # Tünel için max 60 saniye bekle — sonra Render URL ile fallback yap
+    for _ in range(30):
+        if state["tunnel"]:
+            break
         time.sleep(2)
 
-    print(f"  [agent] ✅ Tünel hazır, ana sunucuya kayıt başlıyor...")
+    # Fallback: tünel hâlâ yoksa Render'ın kendi external URL'ini kullan
+    # (cloudflared proxy yerine Render HTTPS doğrudan erişim — bazı durumlarda çalışır)
+    if not state["tunnel"] and _render_url:
+        print(f"  [agent] ⚠️  Tünel yok → Render URL ile fallback: {_render_url}")
+        state["tunnel"] = _render_url
+
+    if not state["tunnel"]:
+        print("  [agent] ⚠️  Tünel ve Render URL yok — kayıt için bekleniyor...")
+        while not state["tunnel"]:
+            time.sleep(5)
+
+    print(f"  [agent] ✅ Tünel hazır: {state['tunnel']} → kayıt başlıyor...")
+
+    # İlk kayıt — başarana kadar dene
     attempt = 0
     while True:
         attempt += 1
         try:
             info = _get_resource_info()
-            data = json.dumps(info).encode()
             _ur.urlopen(
                 _ur.Request(
                     f"{MAIN_URL.rstrip('/')}/api/agent/register",
-                    data=data,
+                    data=json.dumps(info).encode(),
                     headers={"Content-Type": "application/json"},
                     method="POST",
                 ),
                 timeout=15,
             )
-            print(f"  [agent] ✅ Kayıt başarılı #{attempt} | RAM:{info['ram']['free_mb']}MB boş | Disk:{info['disk']['free_gb']}GB boş")
+            print(f"  [agent] ✅ Kayıt #{attempt} OK | "
+                  f"RAM:{info['ram']['free_mb']}MB | Disk:{info['disk']['free_gb']}GB")
             break
         except Exception as e:
-            print(f"  [agent] ⚠️  Kayıt #{attempt}: {e} — 30sn sonra...")
-            time.sleep(30)
+            wait = min(30 * attempt, 120)  # backoff: 30s, 60s, 90s, max 120s
+            print(f"  [agent] ⚠️  Kayıt #{attempt}: {e} — {wait}sn sonra...")
+            time.sleep(wait)
 
-    # Heartbeat döngüsü
+    # Heartbeat döngüsü — her 20 saniyede bir
+    fail_streak = 0
     while True:
         time.sleep(20)
         try:
-            info = _get_resource_info()
-            # DÜZELTİLDİ: Tünel boşsa heartbeat gönderme (ana sunucu URL'yi güncelleyemez)
-            if not info.get("tunnel"):
+            # Tünel kaybolmuşsa bekle
+            if not state["tunnel"]:
                 continue
+            info = _get_resource_info()
             _ur.urlopen(
                 _ur.Request(
                     f"{MAIN_URL.rstrip('/')}/api/agent/heartbeat",
@@ -649,38 +781,27 @@ def _register_loop():
                 ),
                 timeout=10,
             )
-        except Exception:
-            pass
-
-
-# ══════════════════════════════════════════════════════════════
-#  CLOUDFLARE TÜNELİ
-# ══════════════════════════════════════════════════════════════
-
-def _start_tunnel():
-    log = "/tmp/cf_agent.log"
-    print("  [agent] 🌐 Cloudflare HTTP tüneli başlatılıyor...")
-    subprocess.Popen(
-        ["cloudflared", "tunnel",
-         "--url", f"http://localhost:{PORT}",
-         "--no-autoupdate", "--loglevel", "info"],
-        stdout=open(log, "w"), stderr=subprocess.STDOUT,
-    )
-    for _ in range(240):
-        try:
-            content = open(log).read()
-            urls = re.findall(r"https://[a-z0-9-]+\.trycloudflare\.com", content)
-            if urls:
-                url  = urls[0]
-                host = url.replace("https://", "")
-                state["tunnel"] = url
-                print(f"\n  [agent] ✅ Tünel: {host}\n")
-                return url
-        except:
-            pass
-        time.sleep(0.5)
-    print("  [agent] ⚠️  Tünel URL alınamadı (120sn)")
-    return ""
+            fail_streak = 0
+        except Exception as e:
+            fail_streak += 1
+            # 5 ardışık başarısızlık → yeniden kayıt dene
+            if fail_streak >= 5:
+                print(f"  [agent] ⚠️  {fail_streak} heartbeat başarısız → yeniden kayıt...")
+                fail_streak = 0
+                try:
+                    info = _get_resource_info()
+                    _ur.urlopen(
+                        _ur.Request(
+                            f"{MAIN_URL.rstrip('/')}/api/agent/register",
+                            data=json.dumps(info).encode(),
+                            headers={"Content-Type": "application/json"},
+                            method="POST",
+                        ),
+                        timeout=15,
+                    )
+                    print("  [agent] ✅ Yeniden kayıt OK")
+                except Exception:
+                    pass
 
 
 # ══════════════════════════════════════════════════════════════
@@ -778,8 +899,8 @@ print("━"*54)
 print(f"  Servisler: RAM Cache | File Store | TCP Proxy | CPU Worker")
 print("━"*54 + "\n")
 
-threading.Thread(target=_start_tunnel,   daemon=True).start()
-threading.Thread(target=_register_loop,  daemon=True).start()
+threading.Thread(target=_start_tunnel,  daemon=True).start()
+threading.Thread(target=_register_loop, daemon=True).start()
 
 print(f"[Agent] Flask :{PORT} başlatılıyor...")
 app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
