@@ -26,12 +26,16 @@ eventlet.monkey_patch()
 # ── Render.com 512MB limiti — Python panel adres alanını sınırla ─────────────
 # Panel (Python) + JVM birlikte 512MB paylaşır.
 # Bu limit sadece Python process'e uygulanır (JVM ayrı subprocess).
+# ÖNEMLİ: Hard limit RLIM_INFINITY bırakılır — JVM subprocess kendi limitini
+# preexec_fn ile sıfırlayabilsin. Hard limit düşürülürse JVM heap rezervasyonu
+# "Could not reserve enough space for object heap" hatası verir.
 import resource as _resource
 try:
     _PANEL_LIMIT = 480 * 1024 * 1024   # 480MB — 32MB buffer
     _s, _h = _resource.getrlimit(_resource.RLIMIT_AS)
     if _h == _resource.RLIM_INFINITY or _h > _PANEL_LIMIT:
-        _resource.setrlimit(_resource.RLIMIT_AS, (_PANEL_LIMIT, _PANEL_LIMIT))
+        # Sadece soft limit kısıtlanır; hard limit korunur → JVM raise edebilir
+        _resource.setrlimit(_resource.RLIMIT_AS, (_PANEL_LIMIT, _h))
 except Exception:
     pass  # Bazı ortamlarda izin yok — devam et
 
@@ -854,10 +858,26 @@ def start_server():
     socketio.emit("players_update", [])
     jvm = get_jvm_args()
     log(f"[Panel] 🚀 Server başlatılıyor...")
+
+    def _preexec_jvm():
+        """
+        JVM subprocess fork sonrası, exec öncesi çalışır.
+        Panel'in RLIMIT_AS soft limitini sıfırlar → JVM heap rezervasyonu başarılı olur.
+        Hard limit RLIM_INFINITY olduğundan yükseltmek mümkündür.
+        (Düzeltme: Eskiden hard limit de 480MB yapılıyordu → JVM başlatılamıyordu)
+        """
+        try:
+            import resource as _r
+            _s, _h = _r.getrlimit(_r.RLIMIT_AS)
+            _r.setrlimit(_r.RLIMIT_AS, (_h, _h))  # Soft → Hard (∞) yükselt
+        except Exception:
+            pass
+
     try:
         mc_process = subprocess.Popen(
             jvm, cwd=str(MC_DIR),
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            preexec_fn=_preexec_jvm,
         )
     except Exception as e:
         log(f"[Panel] ❌ Başlatma hatası: {e}")
