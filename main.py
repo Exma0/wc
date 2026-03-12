@@ -284,8 +284,12 @@ def connect_worker_nbd(host: str, tunnel_port: int = 10810):
         try:
             import urllib.request as _ur, json as _j
             data = _j.dumps({"nbd_connected": True, "host": host}).encode()
-            _ur.Request(f"http://localhost:{PORT}/api/internal/nbd_status",
-                        data=data, headers={"Content-Type": "application/json"}, method="POST")
+            _ur.urlopen(
+                _ur.Request(f"http://localhost:{PORT}/api/internal/nbd_status",
+                            data=data, headers={"Content-Type": "application/json"},
+                            method="POST"),
+                timeout=3
+            )
         except: pass
     return connected
 
@@ -306,12 +310,16 @@ def try_connect_worker():
             break
         except: time.sleep(1)
 
-    # Env'den direkt host
+    # Env'den direkt host — başarılı olana kadar retry
     host = os.environ.get("WORKER_HOST", "").strip()
     if host:
         print(f"  [worker] WORKER_HOST env: {host}")
-        connect_worker_nbd(host)
-        return
+        for attempt in range(1, 11):
+            if connect_worker_nbd(host):
+                return
+            print(f"  [worker] NBD başarısız (deneme {attempt}/10), 15sn bekle...")
+            time.sleep(15)
+        print("  [worker] ⚠️  WORKER_HOST ile NBD bağlanamadı, polling'e geçiliyor")
 
     print("  [worker] Destek sunucusu bekleniyor (sonsuz döngü)...")
     attempt = 0
@@ -327,8 +335,10 @@ def try_connect_worker():
                 host = nodes[0].get("host", "")
                 if host:
                     print(f"  [worker] ✅ Destek bulundu (deneme {attempt}): {host}")
-                    connect_worker_nbd(host)
-                    return
+                    if connect_worker_nbd(host):
+                        return
+                    # NBD bağlantısı başarısız — bir sonraki döngüde tekrar dene
+                    print(f"  [worker] NBD bağlantısı başarısız, 30sn sonra tekrar...")
         except Exception as e:
             pass
 

@@ -299,8 +299,9 @@ def _setup_swap():
         swp = psutil.swap_memory()
         disk = psutil.disk_usage("/")
         free_gb = disk.free / 1024 / 1024 / 1024
-        swap_gb = min(8, int(free_gb * 0.50))
-        swap_gb = max(2, swap_gb)
+        # Render 18GB disk limiti: max 3GB swap bırak, kalan disk için alan bırak
+        swap_gb = min(3, int(free_gb * 0.25))
+        swap_gb = max(1, swap_gb)
         swap_mb = swap_gb * 1024
 
         if swp.total >= swap_mb * 1024 * 1024 * 0.9:
@@ -576,6 +577,21 @@ def api_internal_tunnel():
     tunnel_info["url"]  = d.get("url", "")
     tunnel_info["host"] = d.get("host", "")
     socketio.emit("tunnel_update", tunnel_info)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/internal/nbd_status", methods=["POST"])
+def api_internal_nbd_status():
+    """main.py NBD bağlantısı kurulunca buraya bildirir."""
+    d = request.json or {}
+    if d.get("nbd_connected"):
+        host = d.get("host", "")
+        log(f"[Panel] 🔗 NBD bağlantısı kuruldu: {host}")
+        node_id = host.replace("https://", "").replace(".trycloudflare.com", "")
+        for nid, node in support_nodes.items():
+            if node.get("host", "") == host or nid == node_id:
+                support_nodes[nid]["status"] = "nbd_connected"
+        socketio.emit("support_nodes_update", list(support_nodes.values()))
     return jsonify({"ok": True})
 
 
