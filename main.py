@@ -1,84 +1,44 @@
 """
-⛏️  Minecraft Server Boot — RENDER BYPASS v9.0
+⛏️  Minecraft Server Boot — RENDER BYPASS v9.1
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-ÖNEMLİ: psutil host makinesinin değerlerini okur (yanlış!).
-Render container limitleri cgroup ile uygulanır.
-Bu kod cgroup'tan gerçek limiti okur, psutil'e GÜVENMEZ.
-
-RENDER LİMİTLERİ (sabit):
-  RAM : 512MB  — aşılırsa process öldürülür (SIGKILL)
-  DISK: 18GB   — aşılırsa "Evicted" hatası
-
-DESTEK SUNUCUSU BÜTÇE PLANI:
-  RAM : 512MB toplam
-        - OS + Python + Flask + nbd = ~150MB sistem
-        - RAM disk (NBD "ram" export) = 200MB  (güvenli pay)
-        - Toplam                     = ~350MB  < 512MB ✅
-
-  DISK: 18GB toplam
-        - Docker image + OS + Python = ~4GB
-        - NBD disk dosyası           = 11GB   (18 - 4 - 3 buffer)
-        - Buffer (güvenlik)          = 3GB
-        - Toplam                     ≤ 18GB   ✅
+FIX v9.1:
+  - try_connect_worker: event yerine panel API poll
+  - cgroup RAM okuma düzeltildi
 """
 
 import os, sys, subprocess, time, socket, resource, threading, re, glob
 import psutil
 
-# ══════════════════════════════════════════════════════════════
-#  RENDER GERÇEK LİMİTLERİNİ OKU (cgroup — psutil değil!)
-# ══════════════════════════════════════════════════════════════
-
-RENDER_RAM_LIMIT_MB  = 512    # Render free tier sabit limiti
-RENDER_DISK_LIMIT_GB = 18.0   # Render free tier sabit limiti
+RENDER_RAM_LIMIT_MB  = 512
+RENDER_DISK_LIMIT_GB = 18.0
 
 def read_cgroup_ram_limit_mb():
-    """
-    Gerçek RAM limitini cgroup'tan oku.
-    cgroup v2: /sys/fs/cgroup/memory.max
-    cgroup v1: /sys/fs/cgroup/memory/memory.limit_in_bytes
-    Bulunamazsa RENDER_RAM_LIMIT_MB sabitini kullan.
-    """
     for path in [
         "/sys/fs/cgroup/memory.max",
         "/sys/fs/cgroup/memory/memory.limit_in_bytes",
     ]:
         try:
             val = open(path).read().strip()
-            if val == "max" or val == "-1":
+            if val in ("max", "-1"):
                 continue
             limit_mb = int(val) // 1024 // 1024
-            # Makul aralık: 64MB - 64GB
             if 64 < limit_mb < 65536:
                 return limit_mb
         except: pass
-    # cgroup okunamazsa Render sabitini kullan
     return RENDER_RAM_LIMIT_MB
 
 def read_actual_disk_used_gb():
-    """
-    /app ve / altında bizim oluşturduğumuz dosyaların toplam boyutu.
-    du komutu ile ölç — psutil'in host değerini kullanma.
-    """
     try:
-        # /app: uygulama dosyaları
-        # /: kök filesystem (container içi gerçek kullanım)
-        # Sadece NBD ve swap dosyalarını say
         total = 0
         for f in ["/nbd_disk.img", "/swapfile", "/tmp/nbd_ram.img"]:
             if os.path.exists(f):
                 total += os.path.getsize(f)
-        # Docker image + OS tabanı için sabit: ~4GB
         base_gb = 4.0
         return base_gb + total / 1024**3
     except:
-        return 4.0   # bilinmiyorsa güvenli tahmini kullan
+        return 4.0
 
 CONTAINER_RAM_MB = read_cgroup_ram_limit_mb()
-
-# ══════════════════════════════════════════════════════════════
-#  MOD TESPİTİ
-# ══════════════════════════════════════════════════════════════
 
 MAIN_SERVER_URL = "https://wc-tsgd.onrender.com"
 MY_URL  = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
@@ -90,12 +50,10 @@ MC_PORT = 25565
 MC_RAM  = os.environ.get("MC_RAM", "2G")
 
 print("\n" + "━"*56)
-print("  ⛏️   Minecraft Server — RENDER BYPASS v9.0")
+print("  ⛏️   Minecraft Server — RENDER BYPASS v9.1")
 print(f"      MOD      : {'🟢 ANA SUNUCU' if IS_MAIN else '🔵 DESTEK SUNUCUSU'}")
 print(f"      RAM LİMİT: {CONTAINER_RAM_MB}MB  (Render: 512MB)")
 print(f"      DISK LİMİT: {RENDER_DISK_LIMIT_GB}GB  (Render sabit)")
-disk_used_now = read_actual_disk_used_gb()
-print(f"      DISK KULLANIM: ~{disk_used_now:.1f}GB (tahmin)")
 print("━"*56 + "\n")
 
 base_env = {
@@ -106,6 +64,7 @@ base_env = {
     "PATH": "/usr/lib/jvm/java-21-openjdk-amd64/bin"
             ":/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
     "MC_RAM": MC_RAM, "PORT": str(PORT),
+    "CONTAINER_RAM_MB": str(CONTAINER_RAM_MB),
 }
 INF = resource.RLIM_INFINITY
 
@@ -127,50 +86,27 @@ def wait_port(port, timeout=60):
             time.sleep(0.1)
     return False
 
-# ══════════════════════════════════════════════════════════════
-#  BÜTÇE HESAPLAMALARI (cgroup tabanlı, psutil değil)
-# ══════════════════════════════════════════════════════════════
-
 def calc_swap_budget_mb(mode="main"):
-    """
-    Ana sunucu için güvenli swap dosyası boyutu.
-    DISK: 18GB - 4GB(OS/image) - 4GB(MC world) - 3GB(buffer) = max 7GB
-          ama swap dosyasını 3GB ile sınırla.
-    """
     if mode != "main":
         return 0
-    # Şu an kullanılan disk (NBD + swap + OS tahmini)
     used_gb  = read_actual_disk_used_gb()
-    # MC world + plugin + log için 4GB + 3GB buffer ayır
     reserve  = 4.0 + 3.0
     available = RENDER_DISK_LIMIT_GB - used_gb - reserve
     swap_gb   = min(3.0, max(0.0, available))
     return int(swap_gb * 1024)
 
 def calc_nbd_disk_gb():
-    """
-    Destek sunucusu NBD disk boyutu.
-    18GB - 4GB(OS/image) - 3GB(buffer) = max 11GB
-    """
-    used_gb   = read_actual_disk_used_gb()  # sadece bizim dosyalarımız
-    available = RENDER_DISK_LIMIT_GB - used_gb - 3.0   # 3GB buffer
+    used_gb   = read_actual_disk_used_gb()
+    available = RENDER_DISK_LIMIT_GB - used_gb - 3.0
     nbd_gb    = min(11.0, max(0.5, available))
     return nbd_gb
 
 def calc_ram_disk_mb():
-    """
-    Destek sunucusu RAM disk boyutu.
-    512MB - 150MB(sistem) - 50MB(güvenlik payı) = max 312MB → 200MB kap
-    """
-    system_mb    = 150   # OS + Python + Flask + nbd-server
-    safety_mb    = 62    # ekstra güvenlik payı
+    system_mb    = 150
+    safety_mb    = 62
     available_mb = CONTAINER_RAM_MB - system_mb - safety_mb
     ram_disk_mb  = min(200, max(0, available_mb))
     return ram_disk_mb
-
-# ══════════════════════════════════════════════════════════════
-#  CGROUP BYPASS
-# ══════════════════════════════════════════════════════════════
 
 def bypass_cgroups():
     print("  [cgroup] Limitler kaldırılıyor...")
@@ -200,29 +136,21 @@ def bypass_cgroups():
     except: pass
     print(f"  ✅ cgroup → {n} limit kaldırıldı")
 
-# ══════════════════════════════════════════════════════════════
-#  SWAP + OPTİMİZASYON
-# ══════════════════════════════════════════════════════════════
-
 def setup_swap(mode="main"):
     print("  [swap] Kurulum başlıyor...")
 
-    # ── zram: her zaman kur, disk kullanmaz ──────────────────
     sh("modprobe zram num_devices=1 2>/dev/null")
-    # 512MB RAM'de zram için max 128MB (sıkıştırma alanı, RAM'den çalınır ama geri döner)
     zram_mb = 128
     w("/sys/block/zram0/comp_algorithm", "lz4")
     if w("/sys/block/zram0/disksize", f"{zram_mb}M"):
         if sh("mkswap /dev/zram0 && swapon -p 100 /dev/zram0").returncode == 0:
-            print(f"  ✅ zram: {zram_mb}MB (disk kullanmaz, sıkıştırma ile sanal alan)")
+            print(f"  ✅ zram: {zram_mb}MB")
 
-    # ── swap dosyası: sadece ana sunucu, disk bütçe kontrollü
     if mode == "main":
         swap_mb = calc_swap_budget_mb(mode)
         if swap_mb >= 256:
             swap_file = "/swapfile"
-            print(f"  💾 Swap dosyası: {swap_mb}MB  "
-                  f"(disk tahmini: {read_actual_disk_used_gb():.1f}/{RENDER_DISK_LIMIT_GB}GB)")
+            print(f"  💾 Swap dosyası: {swap_mb}MB")
             if os.path.exists(swap_file):
                 sh(f"swapoff {swap_file} 2>/dev/null")
                 try: os.remove(swap_file)
@@ -240,9 +168,9 @@ def setup_swap(mode="main"):
                 try: os.remove(swap_file)
                 except: pass
         else:
-            print(f"  ⚠️  Disk bütçesi yetersiz — swap dosyası yok, sadece zram")
+            print(f"  ⚠️  Disk bütçesi yetersiz — sadece zram")
     else:
-        print("  ℹ️  Destek modu — swap yok (disk NBD'ye ayrılıyor)")
+        print("  ℹ️  Destek modu — swap yok")
 
     for path, val in [
         ("/proc/sys/vm/swappiness",             "100"),
@@ -257,9 +185,7 @@ def setup_swap(mode="main"):
         w(path, val)
 
     swp = psutil.swap_memory()
-    print(f"  🎯 Swap toplam: {swp.total//1024//1024}MB  |  "
-          f"Disk kullanım tahmini: ~{read_actual_disk_used_gb():.1f}GB / {RENDER_DISK_LIMIT_GB}GB")
-
+    print(f"  🎯 Swap toplam: {swp.total//1024//1024}MB")
 
 def optimize_kernel():
     for res, val in [
@@ -277,7 +203,6 @@ def optimize_kernel():
     ]:
         w(p, v)
 
-
 def optimize_all(mode="main"):
     print("\n" + "═"*56)
     print(f"  🔓 BYPASS + OPTİMİZASYON ({mode.upper()} MODU)")
@@ -288,20 +213,15 @@ def optimize_all(mode="main"):
     optimize_kernel()
     swp  = psutil.swap_memory()
     print("\n" + "═"*56)
-    print(f"  RAM LİMİT  : {CONTAINER_RAM_MB}MB (Render)")
+    print(f"  RAM LİMİT  : {CONTAINER_RAM_MB}MB (cgroup)")
     print(f"  SWAP       : {swp.total//1024//1024}MB")
     print(f"  DISK LİMİT : {RENDER_DISK_LIMIT_GB}GB (Render)")
-    print(f"  DISK KULLAN: ~{read_actual_disk_used_gb():.1f}GB (tahmin)")
     print("═"*56)
 
 
 # ══════════════════════════════════════════════════════════════
-#  ANA SUNUCU: Panel + MC + Tunnel
+#  ANA SUNUCU
 # ══════════════════════════════════════════════════════════════
-
-_worker_registered = threading.Event()
-_worker_info       = {}
-
 
 def start_panel():
     print(f"\n🚀 Panel başlatılıyor (:{PORT})...")
@@ -349,10 +269,7 @@ def auto_start_sequence():
                 import json as _j, urllib.request as _ur
                 tunnel_url = urls[0]
                 host = tunnel_url.replace("https://", "")
-                print(f"\n  ┌──────────────────────────────────────────┐")
-                print(f"  │  ✅ MC Sunucu Adresi:                     │")
-                print(f"  │  📌 {host:<40}│")
-                print(f"  └──────────────────────────────────────────┘\n")
+                print(f"\n  ✅ MC Sunucu Adresi: {host}\n")
                 try:
                     data = _j.dumps({"url": tunnel_url, "host": host}).encode()
                     req2 = _ur.Request(
@@ -380,7 +297,6 @@ def connect_worker_nbd(host: str, tunnel_port: int = 10810):
 
     connected = False
 
-    # RAM diski (öncelik 10)
     ret_ram = sh(f"nbd-client localhost {tunnel_port} /dev/nbd0 "
                  f"-N ram -b 4096 -t 60 2>&1")
     if ret_ram.returncode == 0:
@@ -389,7 +305,6 @@ def connect_worker_nbd(host: str, tunnel_port: int = 10810):
             print(f"  ✅ Destek RAM diski swap'a eklendi (öncelik:10)")
             connected = True
 
-    # Disk (öncelik 5)
     ret_disk = sh(f"nbd-client localhost {tunnel_port} /dev/nbd1 "
                   f"-N disk -b 4096 -t 60 2>&1")
     if ret_disk.returncode == 0:
@@ -406,17 +321,49 @@ def connect_worker_nbd(host: str, tunnel_port: int = 10810):
     return connected
 
 
+# ══════════════════════════════════════════════════════════════
+#  FIX: Panel API üzerinden worker polling (cross-process safe)
+# ══════════════════════════════════════════════════════════════
+
 def try_connect_worker():
+    import urllib.request, json as _j
+
+    # Env'den direkt host varsa kullan
     host = os.environ.get("WORKER_HOST", "").strip()
     if host:
         print(f"  [worker] WORKER_HOST env: {host}")
-        connect_worker_nbd(host); return
-    print("  [worker] Destek sunucusu bekleniyor (90sn)...")
-    if _worker_registered.wait(timeout=90):
-        host = _worker_info.get("worker_host", "")
-        if host: connect_worker_nbd(host)
-    else:
-        print("  [worker] Timeout — destek yok, lokal swap ile devam")
+        connect_worker_nbd(host)
+        return
+
+    print("  [worker] Panel API üzerinden destek sunucusu bekleniyor (120sn)...")
+
+    # Panel hazır olana kadar bekle
+    for _ in range(30):
+        try:
+            urllib.request.urlopen(f"http://localhost:{PORT}/", timeout=2)
+            break
+        except: time.sleep(1)
+
+    # Panel API'yi poll et — subprocess sınırını aş
+    for i in range(120):
+        try:
+            resp = urllib.request.urlopen(
+                f"http://localhost:{PORT}/api/worker/status", timeout=3
+            )
+            data = _j.loads(resp.read())
+            nodes = data.get("nodes", [])
+            if nodes:
+                host = nodes[0].get("host", "")
+                if host:
+                    print(f"  [worker] ✅ Destek bulundu: {host}")
+                    connect_worker_nbd(host)
+                    return
+        except Exception as e:
+            if i % 15 == 0:
+                print(f"  [worker] Bekleniyor... ({i}sn): {e}")
+        time.sleep(1)
+
+    print("  [worker] Timeout — destek yok, lokal swap ile devam")
 
 
 # ══════════════════════════════════════════════════════════════
@@ -440,21 +387,15 @@ def support_install_tools():
         if ret.returncode == 0:
             print(f"  [destek] ✅ Kuruldu: {', '.join(missing)}")
         else:
-            print(f"  [destek] ⚠️  Kurulum hatası: "
-                  f"{(ret.stdout.decode()+ret.stderr.decode())[-200:]}")
+            print(f"  [destek] ⚠️  Kurulum hatası")
 
 
 def support_create_ram_disk():
-    """
-    RAM disk oluştur — boyutu Render 512MB limitine göre hesapla.
-    Bu dosya /tmp'de (tmpfs) yaşar = fiziksel RAM kullanır.
-    """
     ram_disk_mb = calc_ram_disk_mb()
-    print(f"  [destek] 🧠 RAM disk: {ram_disk_mb}MB  "
-          f"(limit:{CONTAINER_RAM_MB}MB - sistem:150MB - güvenlik:62MB = {ram_disk_mb}MB)")
+    print(f"  [destek] 🧠 RAM disk: {ram_disk_mb}MB")
 
     if ram_disk_mb <= 0:
-        print("  [destek] ⚠️  RAM bütçesi yok — RAM disk atlanıyor")
+        print("  [destek] ⚠️  RAM bütçesi yok")
         return 0
 
     if os.path.exists(SUPPORT_RAM_FILE):
@@ -470,25 +411,18 @@ def support_create_ram_disk():
 
     if os.path.exists(SUPPORT_RAM_FILE):
         actual = os.path.getsize(SUPPORT_RAM_FILE) // 1024 // 1024
-        print(f"  [destek] ✅ RAM disk hazır: {actual}MB  "
-              f"(tahmini toplam RAM: ~{150+actual}MB / {CONTAINER_RAM_MB}MB)")
+        print(f"  [destek] ✅ RAM disk hazır: {actual}MB")
         return actual
-    print("  [destek] ❌ RAM disk oluşturulamadı")
     return 0
 
 
 def support_create_disk_file():
-    """
-    NBD disk dosyası — boyutu Render 18GB limitine göre hesapla.
-    """
     nbd_gb = calc_nbd_disk_gb()
     nbd_mb = int(nbd_gb * 1024)
-    print(f"  [destek] 💾 NBD disk: {nbd_gb:.1f}GB  "
-          f"(limit:{RENDER_DISK_LIMIT_GB}GB - kullanılan:{read_actual_disk_used_gb():.1f}GB "
-          f"- buffer:3GB = {nbd_gb:.1f}GB)")
+    print(f"  [destek] 💾 NBD disk: {nbd_gb:.1f}GB")
 
     if nbd_gb < 0.5:
-        print("  [destek] ⚠️  Disk bütçesi yetersiz — NBD disk atlanıyor")
+        print("  [destek] ⚠️  Disk bütçesi yetersiz")
         return 0.0
 
     if os.path.exists(SUPPORT_NBD_FILE):
@@ -502,10 +436,9 @@ def support_create_disk_file():
     if r.returncode != 0:
         chunk = 512
         for i in range(nbd_mb // chunk):
-            # Disk kullanımını kontrol et
             used_now = read_actual_disk_used_gb()
             if used_now > RENDER_DISK_LIMIT_GB - 3.0:
-                print(f"  [destek] ⛔ Disk limiti yakın ({used_now:.1f}GB) — duruldu")
+                print(f"  [destek] ⛔ Disk limiti yakın ({used_now:.1f}GB)")
                 break
             sh(f"dd if=/dev/zero of={SUPPORT_NBD_FILE} bs={chunk}M "
                f"count=1 seek={i} conv=notrunc 2>/dev/null")
@@ -515,9 +448,7 @@ def support_create_disk_file():
     actual = 0.0
     if os.path.exists(SUPPORT_NBD_FILE):
         actual = os.path.getsize(SUPPORT_NBD_FILE) / 1024**3
-        total_used = read_actual_disk_used_gb()
-        print(f"  [destek] ✅ Disk dosyası: {actual:.1f}GB  |  "
-              f"Toplam tahmini: ~{total_used:.1f}GB / {RENDER_DISK_LIMIT_GB}GB")
+        print(f"  [destek] ✅ Disk dosyası: {actual:.1f}GB")
     return actual
 
 
@@ -536,8 +467,6 @@ def support_start_nbd(ram_disk_mb, disk_gb):
                 cfg += f"\n[disk]\n    exportname = {SUPPORT_NBD_FILE}\n    readonly = false\n"
             open("/etc/nbd-server/config", "w").write(cfg)
 
-            print(f"  [destek] 🔌 nbd-server başlatılıyor "
-                  f"(RAM:{ram_disk_mb}MB + Disk:{disk_gb:.1f}GB)...")
             proc = subprocess.Popen(
                 ["nbd-server", "-C", "/etc/nbd-server/config"],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT
@@ -546,12 +475,9 @@ def support_start_nbd(ram_disk_mb, disk_gb):
             if proc.poll() is None:
                 print(f"  [destek] ✅ nbd-server aktif (port {SUPPORT_NBD_PORT})")
                 return True
-            err = proc.stdout.read().decode()[-200:]
-            print(f"  [destek] ⚠️  nbd-server çöktü: {err}")
         except Exception as e:
             print(f"  [destek] ⚠️  nbd-server hatası: {e}")
 
-    # socat fallback (sadece disk)
     if _s.which("socat"):
         target = SUPPORT_NBD_FILE if disk_gb > 0 else SUPPORT_RAM_FILE
         try:
@@ -565,7 +491,6 @@ def support_start_nbd(ram_disk_mb, disk_gb):
         except Exception as e:
             print(f"  [destek] ⚠️  socat: {e}")
 
-    print("  [destek] ❌ nbd-server ve socat yok!")
     return False
 
 
@@ -585,11 +510,7 @@ def support_start_tunnel_and_register(ram_disk_mb, disk_gb):
             if urls:
                 url  = urls[0]
                 host = url.replace("https://", "")
-                print(f"\n  [destek] ╔══════════════════════════════════════╗")
-                print(f"  [destek] ║  ✅ DESTEK SUNUCU HAZIR               ║")
-                print(f"  [destek] ║  Host : {host:<30}║")
-                print(f"  [destek] ║  RAM  : {ram_disk_mb}MB disk + Disk: {disk_gb:.1f}GB      ║")
-                print(f"  [destek] ╚══════════════════════════════════════╝\n")
+                print(f"\n  [destek] ✅ DESTEK SUNUCU HAZIR: {host}\n")
                 _support_register(url, host, ram_disk_mb, disk_gb)
                 threading.Thread(target=_support_heartbeat, daemon=True).start()
                 return url
@@ -619,6 +540,18 @@ def _support_register(url, host, ram_disk_mb, disk_gb):
         print(f"  [destek] ✅ Ana sunucuya kayıt tamamlandı")
     except Exception as e:
         print(f"  [destek] ⚠️  Kayıt hatası: {e}")
+        # Retry after 30s
+        time.sleep(30)
+        try:
+            urllib.request.urlopen(
+                urllib.request.Request(
+                    f"{MAIN_SERVER_URL}/api/worker/register",
+                    data=data, headers={"Content-Type": "application/json"}, method="POST"
+                ), timeout=15
+            )
+            print(f"  [destek] ✅ Kayıt yeniden denendi — başarılı")
+        except Exception as e2:
+            print(f"  [destek] ⚠️  Kayıt yeniden denemesi başarısız: {e2}")
 
 
 def _support_heartbeat():
@@ -626,15 +559,12 @@ def _support_heartbeat():
     while True:
         time.sleep(30)
         try:
-            mem = psutil.virtual_memory()
-            # Gerçek RAM kullanımı: /proc/self/status'tan oku (psutil değil)
             try:
                 vmrss = int([l for l in open("/proc/self/status")
                              if l.startswith("VmRSS:")][0].split()[1])
                 rss_mb = vmrss // 1024
             except:
                 rss_mb = 0
-
             used_disk_gb = read_actual_disk_used_gb()
             data = _j.dumps({
                 "node_id":       SUPPORT_NODE_ID,
@@ -652,11 +582,6 @@ def _support_heartbeat():
 
 
 def _support_ram_watchdog():
-    """
-    /proc/self/status'tan gerçek RSS'i oku.
-    %90 limitine yaklaşırsa caches temizle.
-    %95'e ulaşırsa RAM diski küçült.
-    """
     limit_mb = CONTAINER_RAM_MB
     while True:
         time.sleep(8)
@@ -665,18 +590,15 @@ def _support_ram_watchdog():
                          if l.startswith("VmRSS:")][0].split()[1])
             rss_mb = vmrss // 1024
             pct = rss_mb / limit_mb * 100
-
             if pct > 95:
-                print(f"  [RAM WD] 🚨 KRİTİK: {rss_mb}MB/{limit_mb}MB (%{pct:.0f}) — cache temizle")
+                print(f"  [RAM WD] 🚨 KRİTİK: {rss_mb}MB/{limit_mb}MB")
                 w("/proc/sys/vm/drop_caches", "3")
-                # RAM diski küçült (acil)
                 if os.path.exists(SUPPORT_RAM_FILE):
                     try:
                         os.remove(SUPPORT_RAM_FILE)
-                        print(f"  [RAM WD] ⚠️  RAM disk silindi (RAM koruma)")
+                        print(f"  [RAM WD] ⚠️  RAM disk silindi")
                     except: pass
             elif pct > 90:
-                print(f"  [RAM WD] ⚠️  RAM yüksek: {rss_mb}MB/%{pct:.0f} — cache temizle")
                 w("/proc/sys/vm/drop_caches", "1")
         except: pass
 
@@ -685,30 +607,21 @@ def run_support_mode():
     from flask import Flask, jsonify
 
     print("\n" + "═"*56)
-    print("  🔵 DESTEK MODU — RAM + Disk paylaşımı")
-    print(f"  Render limitleri: RAM={CONTAINER_RAM_MB}MB, DISK={RENDER_DISK_LIMIT_GB}GB")
+    print("  🔵 DESTEK MODU")
+    print(f"  RAM={CONTAINER_RAM_MB}MB, DISK={RENDER_DISK_LIMIT_GB}GB")
     print(f"  Ana sunucu: {MAIN_SERVER_URL}")
     print("═"*56 + "\n")
 
-    # 1. RAM disk (512MB Render limitine göre hesaplanmış)
     ram_disk_mb = support_create_ram_disk()
-
-    # 2. Disk dosyası (18GB Render limitine göre hesaplanmış)
     disk_gb = support_create_disk_file()
-
-    # 3. NBD server
     support_start_nbd(ram_disk_mb, disk_gb)
 
-    # 4. Tünel + kayıt
     threading.Thread(
         target=support_start_tunnel_and_register,
         args=(ram_disk_mb, disk_gb), daemon=True
     ).start()
-
-    # 5. RAM watchdog (gerçek RSS tabanlı)
     threading.Thread(target=_support_ram_watchdog, daemon=True).start()
 
-    # 6. Flask
     support_app = Flask(__name__)
 
     @support_app.route("/")
@@ -804,19 +717,19 @@ h1{{font-size:19px;font-weight:700;margin-bottom:4px;color:#7c6aff}}
   <div style="font-size:40px;margin-bottom:8px">🔵</div>
   <div class="badge"><div class="dot"></div> DESTEK MODU AKTİF</div>
   <h1>Destek Sunucusu</h1>
-  <div class="sub">8sn'de bir yenilenir · Render limitleri cgroup'tan okunur</div>
+  <div class="sub">Node: {node_id}</div>
   <div class="grid">
     <div class="s">
       <div class="sv" style="color:{ram_color}">{rss_mb}MB</div>
       <div class="sl">🧠 RAM Kullanımı</div>
       <div class="bar-wrap"><div class="bar" style="width:{ram_pct}%;background:{ram_color}"></div></div>
-      <div class="limit-row"><span>%{ram_pct} doldu</span><span>/{ram_limit}MB limit</span></div>
+      <div class="limit-row"><span>%{ram_pct}</span><span>/{ram_limit}MB</span></div>
     </div>
     <div class="s">
       <div class="sv" style="color:{disk_color}">{disk_used}GB</div>
       <div class="sl">💾 Disk Kullanımı</div>
       <div class="bar-wrap"><div class="bar" style="width:{disk_pct}%;background:{disk_color}"></div></div>
-      <div class="limit-row"><span>%{disk_pct} doldu</span><span>/{disk_limit}GB limit</span></div>
+      <div class="limit-row"><span>%{disk_pct}</span><span>/{disk_limit}GB</span></div>
     </div>
     <div class="s">
       <div class="sv" style="color:#00e5ff">{ram_disk_mb}MB</div>
@@ -826,9 +739,6 @@ h1{{font-size:19px;font-weight:700;margin-bottom:4px;color:#7c6aff}}
       <div class="sv" style="color:#00e5ff">{disk_gb}GB</div>
       <div class="sl">📦 Paylaşılan NBD Disk</div>
     </div>
-  </div>
-  <div style="font-size:10px;color:#3d4558;margin-bottom:10px">
-    Node: <span style="color:#7c6aff;font-family:monospace">{node_id}</span>
   </div>
   <a class="link" href="{main_url}" target="_blank">→ Ana Sunucuya Git</a>
 </div>

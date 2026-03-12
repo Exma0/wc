@@ -1,11 +1,17 @@
 """
-⛏️  Minecraft Yönetim Paneli — Tam Sürüm
+⛏️  Minecraft Yönetim Paneli — v9.1
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Flask + Flask-SocketIO + Eventlet
+Düzeltmeler:
+  - get_jvm_args: psutil yerine cgroup'tan RAM oku
+  - api_plugin_search: requests yerine urllib (eventlet uyumlu)
+  - import requests kaldırıldı
 """
 
 import os, sys, json, time, threading, subprocess, shutil, zipfile
-import re, glob, requests
+import re, glob
+import urllib.request as _urllib_req
+import urllib.parse as _urllib_parse
+import ssl as _ssl_mod
 from collections import deque
 from datetime import datetime
 from pathlib import Path
@@ -41,8 +47,7 @@ server_state = {
     "max_players": 20,
     "online_players": 0,
 }
-# Worker/destek sunucuları listesi
-support_nodes = {}   # {node_id: {host, nbd_gb, ram_mb, connected_at, ...}}
+support_nodes = {}
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = "mc-panel-secret"
@@ -155,9 +160,7 @@ def _ram_monitor():
 # ══════════════════════════════════════════════════════════════
 
 def download_paper():
-    import urllib.request as urlreq
     import ssl
-
     ctx = ssl.create_default_context()
     log("[Panel] 📥 Paper MC indiriliyor...")
     try:
@@ -165,8 +168,8 @@ def download_paper():
             f"https://api.papermc.io/v2/projects/paper"
             f"/versions/{MC_VERSION}/builds"
         )
-        req = urlreq.Request(api_url, headers={"User-Agent": "MCPanel/2.0"})
-        with urlreq.urlopen(req, timeout=20, context=ctx) as r:
+        req = _urllib_req.Request(api_url, headers={"User-Agent": "MCPanel/9.1"})
+        with _urllib_req.urlopen(req, timeout=20, context=ctx) as r:
             builds = json.loads(r.read()).get("builds", [])
 
         if not builds:
@@ -180,9 +183,9 @@ def download_paper():
         )
         log(f"[Panel] 📦 {jar_name} indiriliyor (build #{build})...")
 
-        req2 = urlreq.Request(url, headers={"User-Agent": "MCPanel/2.0"})
+        req2 = _urllib_req.Request(url, headers={"User-Agent": "MCPanel/9.1"})
         done = 0
-        with urlreq.urlopen(req2, timeout=180, context=ctx) as r2:
+        with _urllib_req.urlopen(req2, timeout=180, context=ctx) as r2:
             total = int(r2.headers.get("Content-Length", 0))
             with open(MC_JAR, "wb") as f:
                 while True:
@@ -258,7 +261,7 @@ def write_server_config():
 
 
 def _setup_swap():
-    import psutil, subprocess, os, glob
+    import psutil
 
     def _w(path, val):
         try:
@@ -268,7 +271,6 @@ def _setup_swap():
             return False
 
     try:
-        # ── cgroup v2 ─────────────────────────────────────────
         for path, val in [
             ("/sys/fs/cgroup/memory.max",      "max"),
             ("/sys/fs/cgroup/memory.swap.max", "max"),
@@ -281,8 +283,6 @@ def _setup_swap():
             for fn, v in [("memory.max","max"),("memory.swap.max","max"),
                           ("memory.high","max"),("cpu.max","max"),("pids.max","max")]:
                 _w(cg_dir + fn, v)
-
-        # ── cgroup v1 ─────────────────────────────────────────
         for path, val in [
             ("/sys/fs/cgroup/memory/memory.limit_in_bytes",       "-1"),
             ("/sys/fs/cgroup/memory/memory.memsw.limit_in_bytes", "-1"),
@@ -332,7 +332,6 @@ def _setup_swap():
             else:
                 log(f"[Panel] ⚠️  Swap/cgroup hatası: {r2.stderr.decode().strip()}")
 
-        # ── VM ayarları ────────────────────────────────────────
         for path, val in [
             ("/proc/sys/vm/swappiness",             "100"),
             ("/proc/sys/vm/vfs_cache_pressure",     "200"),
@@ -388,64 +387,65 @@ def _ram_watchdog():
 
 def get_jvm_args():
     """
-    ✅ DÜZELTİLDİ: G1PeriodicGCSysLoadThreshold kaldırıldı (Java 21 uyumsuz)
-    Strateji: Fiziksel RAM (RSS) düşük tut → Render 512MB limitini aşma.
+    FIX v9.1: cgroup'tan gerçek container RAM'i oku.
+    psutil host değerlerini (31GB+) döndürür — KULLANMA.
+    Render 512MB container için Xmx max 384MB olmalı.
     """
     import psutil
-    mem      = psutil.virtual_memory()
-    swp      = psutil.swap_memory()
-    total_mb = int(mem.total / 1024 / 1024)
-    swap_mb  = int(swp.total / 1024 // 1024)
 
-    xmx_mb = min(12288, int(total_mb * 0.50) + int(swap_mb * 0.70))
-    xmx_mb = max(512, xmx_mb)
-    xms_mb = 64
+    # Önce main.py'nin env'e koyduğu değeri al
+    container_ram_mb = int(os.environ.get("CONTAINER_RAM_MB", "512"))
 
+    # cgroup'tan kontrol et (daha güvenilir)
+    for path in ["/sys/fs/cgroup/memory.max",
+                 "/sys/fs/cgroup/memory/memory.limit_in_bytes"]:
+        try:
+            val = open(path).read().strip()
+            if val not in ("max", "-1"):
+                mb = int(val) // 1024 // 1024
+                if 64 < mb < 65536:
+                    container_ram_mb = mb
+                    break
+        except:
+            pass
+
+    swp = psutil.swap_memory()
+    swap_mb = int(swp.total / 1024 / 1024)
+
+    # Render 512MB: OS+Python~150MB → MC için max 384MB fiziksel
+    xmx_mb = min(384, container_ram_mb - 128)
+    xmx_mb = max(256, xmx_mb)
+
+    # Swap varsa daha yüksek Xmx (swap'a taşar, OOM olmaz)
+    if swap_mb > 512:
+        xmx_mb = min(xmx_mb + min(swap_mb // 4, 512), 2048)
+
+    xms_mb = 32
     xmx = f"{xmx_mb}M"
     xms = f"{xms_mb}M"
-    log(f"[Panel] 🧠 RAM={total_mb}MB Swap={swap_mb}MB → Xms={xms} Xmx={xmx}")
+    log(f"[Panel] 🧠 Container RAM={container_ram_mb}MB Swap={swap_mb}MB → Xms={xms} Xmx={xmx}")
 
     return [
         "java",
         f"-Xms{xms}", f"-Xmx{xmx}",
-
-        # ── Compressed sınıflar küçük tut ─────────────────────
-        "-XX:CompressedClassSpaceSize=128m",
-        "-XX:MaxMetaspaceSize=256m",
-
-        # ── G1GC + Heap'i OS'a geri ver ───────────────────────
+        "-XX:CompressedClassSpaceSize=64m",
+        "-XX:MaxMetaspaceSize=128m",
         "-XX:+UseG1GC",
         "-XX:+ParallelRefProcEnabled",
         "-XX:MaxGCPauseMillis=200",
         "-XX:+UnlockExperimentalVMOptions",
         "-XX:+DisableExplicitGC",
-
-        # ✅ G1PeriodicGCSysLoadThreshold KALDIRILDI (Java 21 desteklemiyor)
-        # Periyodik GC: boş heap sayfalarını OS'a geri ver → RSS düşer
         "-XX:G1PeriodicGCInterval=15000",
         "-XX:+G1PeriodicGCInvokesConcurrent",
-
-        # Heap bölge boyutu
         "-XX:G1NewSizePercent=20",
         "-XX:G1MaxNewSizePercent=30",
         "-XX:G1HeapRegionSize=4m",
         "-XX:G1ReservePercent=20",
         "-XX:InitiatingHeapOccupancyPercent=15",
-        "-XX:G1MixedGCCountTarget=8",
-        "-XX:G1MixedGCLiveThresholdPercent=85",
-        "-XX:G1HeapWastePercent=5",
-
-        # Agresif bellek geri alma
         "-XX:SoftRefLRUPolicyMSPerMB=0",
-        "-XX:SurvivorRatio=32",
-        "-XX:MaxTenuringThreshold=1",
         "-XX:+UseStringDeduplication",
-
-        # Genel
         "-Djava.net.preferIPv4Stack=true",
         "-Dfile.encoding=UTF-8",
-        "-Duser.timezone=Europe/Istanbul",
-        "-Dpaper.playerconnection.keepAlive=60",
         "-Dcom.mojang.eula.agree=true",
         "-jar", str(MC_JAR), "--nogui",
     ]
@@ -588,11 +588,6 @@ def api_tunnel():
 
 @app.route("/api/worker/register", methods=["POST"])
 def api_worker_register():
-    """
-    Destek sunucusu başladığında buraya bildirim gönderir.
-    Otomatik olarak NBD bağlantısı kurulur.
-    """
-    import sys as _sys
     d = request.json or {}
     host    = d.get("worker_host", "")
     nbd_gb  = d.get("nbd_gb", 0)
@@ -600,7 +595,6 @@ def api_worker_register():
 
     log(f"[Panel] ⚙️  Destek düğümü bağlandı: {host} ({nbd_gb}GB)")
 
-    # Destek sunucusunu kaydet
     support_nodes[node_id] = {
         "node_id":      node_id,
         "host":         host,
@@ -609,32 +603,20 @@ def api_worker_register():
         "status":       "connecting",
     }
     socketio.emit("support_nodes_update", list(support_nodes.values()))
-
-    # main.py'deki event'i tetikle
-    main_mod = _sys.modules.get("__main__")
-    if main_mod:
-        info = getattr(main_mod, "_worker_info", {})
-        info["worker_host"] = host
-        info["nbd_gb"]      = nbd_gb
-        ev = getattr(main_mod, "_worker_registered", None)
-        if ev:
-            ev.set()
-
     socketio.emit("worker_update", {"host": host, "nbd_gb": nbd_gb})
     return jsonify({"ok": True, "message": f"Destek düğümü {host} kaydedildi"})
 
 
 @app.route("/api/worker/heartbeat", methods=["POST"])
 def api_worker_heartbeat():
-    """Destek sunucusu periyodik ping gönderir."""
     d = request.json or {}
     node_id = d.get("node_id", "")
     if node_id in support_nodes:
         support_nodes[node_id].update({
-            "last_ping": time.time(),
-            "ram_mb":    d.get("ram_mb", 0),
+            "last_ping":    time.time(),
+            "ram_mb":       d.get("rss_mb", 0),
             "disk_free_gb": d.get("disk_free_gb", 0),
-            "status":    "connected",
+            "status":       "connected",
         })
         socketio.emit("support_nodes_update", list(support_nodes.values()))
     return jsonify({"ok": True})
@@ -642,14 +624,8 @@ def api_worker_heartbeat():
 
 @app.route("/api/worker/status")
 def api_worker_status():
-    import sys as _sys
-    main_mod = _sys.modules.get("__main__")
-    info = {}
-    if main_mod:
-        info = getattr(main_mod, "_worker_info", {})
     return jsonify({
         "nodes": list(support_nodes.values()),
-        "legacy": info
     })
 
 
@@ -918,21 +894,38 @@ def api_plugin_toggle():
 
 @app.route("/api/plugins/search")
 def api_plugin_search():
+    """
+    FIX v9.1: requests kütüphanesi eventlet.monkey_patch() ile
+    sonsuz recursion'a giriyor. urllib kullan.
+    """
     q = request.args.get("q", "")
+    if not q:
+        return jsonify([])
+
     try:
-        r = requests.get(f"https://hangar.papermc.io/api/v1/projects?q={q}&limit=12", timeout=10)
-        data = r.json()
-        out  = []
+        ctx = _ssl_mod.create_default_context()
+        url = (
+            "https://hangar.papermc.io/api/v1/projects?"
+            + _urllib_parse.urlencode({"q": q, "limit": 12})
+        )
+        req = _urllib_req.Request(url, headers={"User-Agent": "MCPanel/9.1"})
+        with _urllib_req.urlopen(req, timeout=10, context=ctx) as resp:
+            data = json.loads(resp.read())
+
+        out = []
         for p in data.get("result", []):
-            ns = p.get("namespace", {})
+            ns    = p.get("namespace", {})
+            owner = ns.get("owner", "")
+            name  = p.get("name", "")
             out.append({
-                "name":        p.get("name", ""),
+                "name":        name,
                 "description": p.get("description", "")[:120],
                 "downloads":   p.get("stats", {}).get("downloads", 0),
-                "url":  f"https://hangar.papermc.io/{ns.get('owner','')}/{p.get('name','')}",
-                "owner":       ns.get("owner", ""),
+                "url":         f"https://hangar.papermc.io/{owner}/{name}",
+                "owner":       owner,
             })
         return jsonify(out)
+
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -1567,26 +1560,15 @@ input[type=file] { display: none; }
     <div class="card" style="margin-bottom:14px">
       <div class="card-hd">🔗 Bağlı Destek Düğümleri</div>
       <p style="font-size:12px;color:var(--t2);margin-bottom:14px">
-        Diğer Render hesaplarında çalışan destek servisleri buraya otomatik bağlanır. 
-        Her destek sunucusu ekstra disk ve RAM sağlar.
+        Diğer Render hesaplarında çalışan destek servisleri buraya otomatik bağlanır.
       </p>
-      <div id="nodes-list"><div style="color:var(--t2);text-align:center;padding:20px">Henüz bağlı destek düğümü yok.<br><span style="font-size:11px">Başka bir Render hesabına aynı kodu yükleyin — otomatik bağlanır.</span></div></div>
-    </div>
-    <div class="card">
-      <div class="card-hd">📋 Nasıl Çalışır?</div>
-      <div style="font-size:12px;color:var(--t2);line-height:1.8">
-        <div style="margin-bottom:8px">1️⃣ Başka bir Render hesabına aynı kodu deploy edin</div>
-        <div style="margin-bottom:8px">2️⃣ O hesabın servisi otomatik olarak bu ana sunucuyu bulur</div>
-        <div style="margin-bottom:8px">3️⃣ Diskini NBD üzerinden swap olarak paylaşır</div>
-        <div style="margin-bottom:8px">4️⃣ Ana sunucu ekstra disk alanını swap olarak kullanır</div>
-        <div style="margin-bottom:8px">5️⃣ Her destek sunucusu +14GB ekstra bellek sağlar</div>
-      </div>
+      <div id="nodes-list"><div style="color:var(--t2);text-align:center;padding:20px">Henüz bağlı destek düğümü yok.</div></div>
     </div>
   </div>
 
-  </div><!-- /pages -->
-</div><!-- /main -->
-</div><!-- /layout -->
+  </div>
+</div>
+</div>
 
 <div class="notif-wrap" id="notif-wrap"></div>
 
@@ -1683,16 +1665,14 @@ function updateNodes(list) {
   if(count>0){
     bar.classList.remove('hidden');
     barTxt.textContent=allNodes.map(n=>`${n.host||n.node_id} (${n.nbd_gb||0}GB)`).join(' · ');
-  } else {
-    bar.classList.add('hidden');
-  }
+  } else { bar.classList.add('hidden'); }
   if(curPage==='support') renderNodes(allNodes);
 }
 
 function renderNodes(list) {
   const el=document.getElementById('nodes-list');
   if(!el) return;
-  if(!list||!list.length){el.innerHTML='<div style="color:var(--t2);text-align:center;padding:20px">Henüz bağlı destek düğümü yok.<br><span style="font-size:11px">Başka bir Render hesabına aynı kodu yükleyin — otomatik bağlanır.</span></div>';return;}
+  if(!list||!list.length){el.innerHTML='<div style="color:var(--t2);text-align:center;padding:20px">Henüz bağlı destek düğümü yok.<br><span style="font-size:11px">Başka bir Render hesabına aynı kodu yükleyin.</span></div>';return;}
   el.innerHTML=list.map(n=>`
     <div class="node-card">
       <div class="node-header">
@@ -1704,7 +1684,7 @@ function renderNodes(list) {
       <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;font-size:11px;color:var(--t2)">
         <div>💾 Disk: <span style="color:var(--t1)">${n.nbd_gb||0}GB</span></div>
         <div>🧠 RAM: <span style="color:var(--t1)">${n.ram_mb||0}MB</span></div>
-        <div>🕐 Bağlandı: <span style="color:var(--t1)">${n.connected_at?new Date(n.connected_at*1000).toLocaleTimeString('tr'):'—'}</span></div>
+        <div>🕐 <span style="color:var(--t1)">${n.connected_at?new Date(n.connected_at*1000).toLocaleTimeString('tr'):'—'}</span></div>
       </div>
     </div>`).join('');
 }
@@ -1761,7 +1741,7 @@ async function uploadPlugin(input){const fd=new FormData();for(const f of input.
 function dropPlugin(e){e.preventDefault();const fd=new FormData();for(const f of e.dataTransfer.files)if(f.name.endsWith('.jar'))fd.append(f.name,f);fetch('/api/plugins/upload',{method:'POST',body:fd}).then(r=>r.json()).then(d=>{notify(d.msg||'Yüklendi','ok');loadPlugins();});}
 async function deletePlugin(file){if(!confirm(file+' silinsin mi?'))return;await api('/api/plugins/delete',{file});notify('Plugin silindi','ok');loadPlugins();}
 async function togglePlugin(file){await api('/api/plugins/toggle',{file});loadPlugins();}
-async function searchPlugins(){const q=document.getElementById('plug-q').value.trim();if(!q)return;const res=document.getElementById('plug-results');res.innerHTML='<div style="color:var(--t2);padding:10px">Aranıyor...</div>';const d=await fetch('/api/plugins/search?q='+encodeURIComponent(q)).then(r=>r.json());if(!d.length||d.error){res.innerHTML='<div style="color:var(--t2);padding:10px">Sonuç bulunamadı</div>';return;}res.innerHTML=d.map(p=>`<div style="display:flex;justify-content:space-between;align-items:flex-start;padding:10px 0;border-bottom:1px solid rgba(255,255,255,.05)"><div><div style="font-size:13px;font-weight:600">${p.name}</div><div style="font-size:11px;color:var(--t2);margin-top:2px;max-width:320px">${p.description}</div><div style="font-size:10px;color:var(--t3);margin-top:2px">👤 ${p.owner} · ⬇ ${(p.downloads||0).toLocaleString()}</div></div><a class="btn btn-sm b-prim" href="${p.url}" target="_blank">🔗 Aç</a></div>`).join('');}
+async function searchPlugins(){const q=document.getElementById('plug-q').value.trim();if(!q)return;const res=document.getElementById('plug-results');res.innerHTML='<div style="color:var(--t2);padding:10px">Aranıyor...</div>';const d=await fetch('/api/plugins/search?q='+encodeURIComponent(q)).then(r=>r.json());if(d.error){res.innerHTML='<div style="color:var(--red);padding:10px">Hata: '+d.error+'</div>';return;}if(!d.length){res.innerHTML='<div style="color:var(--t2);padding:10px">Sonuç bulunamadı</div>';return;}res.innerHTML=d.map(p=>`<div style="display:flex;justify-content:space-between;align-items:flex-start;padding:10px 0;border-bottom:1px solid rgba(255,255,255,.05)"><div><div style="font-size:13px;font-weight:600">${p.name}</div><div style="font-size:11px;color:var(--t2);margin-top:2px;max-width:320px">${p.description}</div><div style="font-size:10px;color:var(--t3);margin-top:2px">👤 ${p.owner} · ⬇ ${(p.downloads||0).toLocaleString()}</div></div><a class="btn btn-sm b-prim" href="${p.url}" target="_blank">🔗 Aç</a></div>`).join('');}
 
 async function fmLoad(path=''){curDir=path;document.getElementById('fm-bread').textContent='/'+path;const items=await fetch('/api/files?path='+encodeURIComponent(path)).then(r=>r.json());const el=document.getElementById('fm-list');el.innerHTML=items.map(f=>`<div class="fm-item" onclick="fmClick('${f.path}','${f.type}','${f.name.replace(/'/g,"\\'")}')"><span class="fm-ico">${f.type==='dir'?'📁':fmIco(f.ext)}</span><span class="fm-name">${f.name}</span><span class="fm-size">${f.type==='dir'?'':fmtSize(f.size)}</span></div>`).join('')||'<div style="padding:12px;color:var(--t2);font-size:12px">Klasör boş</div>';}
 function fmIco(ext){const m={'.properties':'⚙️','.json':'📋','.yml':'📋','.yaml':'📋','.jar':'☕','.txt':'📄','.log':'📜','.sh':'🖥️','.zip':'📦','.png':'🖼️','.dat':'🗃️','.conf':'⚙️','.toml':'⚙️'};return m[ext]||'📄';}
