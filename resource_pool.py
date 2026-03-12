@@ -242,29 +242,52 @@ class ResourcePool:
 
     # ── RAM Cache API ────────────────────────────────────────
 
-    def cache_set(self, key: str, data: bytes, prefer_agent: str = None) -> bool:
-        agent = (self.agents.get(prefer_agent) if prefer_agent
-                 else self._least_loaded())
-        if not agent:
+    def cache_set(self, key: str, data: bytes, prefer_agent: str = None,
+                  replicate: bool = False) -> bool:
+        """
+        replicate=True → tüm sağlıklı agentlara yaz (büyük statik dosyalar için).
+        replicate=False → key hash'ine göre sabit agent seç (veri tutarlılığı).
+        """
+        agents = self.get_agents()
+        if not agents:
             return False
-        return agent.cache_set(key, data)
+
+        if prefer_agent and prefer_agent in self.agents:
+            return self.agents[prefer_agent].cache_set(key, data)
+
+        if replicate:
+            # Tüm agentlara yaz — her agent aynı veriyi tutar
+            results = []
+            for a in agents:
+                results.append(a.cache_set(key, data))
+            return any(results)
+
+        # Belirleyici: key hash'ine göre sabit agent (her seferinde aynı)
+        idx   = int(hashlib.md5(key.encode()).hexdigest(), 16) % len(agents)
+        return agents[idx].cache_set(key, data)
+
+    def cache_set_distributed(self, key: str, data: bytes) -> bool:
+        """
+        Büyük veriyi parçalara bölerek farklı agentlara dağıt.
+        Şimdilik 1 agent'a yaz ama key hash ile sabit agent seç.
+        """
+        return self.cache_set(key, data, replicate=False)
 
     def cache_get(self, key: str) -> Optional[bytes]:
-        """Tüm agent'larda ara (önce en az yüklü)."""
+        """Önce key hash'ine göre beklenen agenta bak, miss'te diğerleri."""
         agents = self.get_agents()
-        # Belirleyici arama: key hash'ine göre agent seç, hız için
-        if agents:
-            idx   = int(hashlib.md5(key.encode()).hexdigest(), 16) % len(agents)
-            first = agents[idx]
-            data  = first.cache_get(key)
-            if data is not None:
-                return data
-            # Miss → diğerlerini de dene
-            for a in agents:
-                if a.node_id != first.node_id:
-                    data = a.cache_get(key)
-                    if data is not None:
-                        return data
+        if not agents:
+            return None
+        idx   = int(hashlib.md5(key.encode()).hexdigest(), 16) % len(agents)
+        data  = agents[idx].cache_get(key)
+        if data is not None:
+            return data
+        # Miss → diğerlerini de dene (replicated veriler için)
+        for a in agents:
+            if a.node_id != agents[idx].node_id:
+                data = a.cache_get(key)
+                if data is not None:
+                    return data
         return None
 
     def cache_flush_all(self, prefix: str = "") -> int:
@@ -403,8 +426,9 @@ class ResourcePool:
                 # Disk doluluk kontrolü
                 import shutil as _sh
                 disk_free_gb = _sh.disk_usage("/").free / 1e9
-                if disk_free_gb > 8.0:
-                    break   # Yeterli yer var, gerek yok
+                # ÖNEMLİ: shutil.disk_usage host diskini okur (yanıltıcı).
+                # Her zaman arşivle — agent diski zaten bu iş için var.
+                pass   # Disk kontrolü kaldırıldı → hep arşivle
 
                 ok = self.store_region(dim_name, region_file)
                 if ok:

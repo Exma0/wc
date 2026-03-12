@@ -139,50 +139,33 @@ void* mmap(void *addr,size_t length,int prot,int flags,int fd,off_t offset){
 
 def _build_userswap():
     """
-    userswap.so önce build-time konumunda arar (/usr/local/lib/).
-    Bulunamazsa runtime'da derlemeyi dener (fallback).
+    userswap.so derlenmemişse derle.
+    LD_PRELOAD ile JVM'in anonim mmap'lerini dosya destekli yapar → Userspace Swap.
     """
     import shutil
-    # 1. Build-time derleme başarılıysa doğrudan kullan
     if Path(USERSWAP_SO).exists():
-        log(f"[UserSwap] ✅ {USERSWAP_SO} hazır")
         return True
-
-    log("[UserSwap] ⚠️  Build-time .so bulunamadı → runtime derleme deneniyor...")
-
-    # 2. gcc yoksa kur (libc6-dev de gerekli dlfcn.h için)
     if not shutil.which("gcc"):
-        subprocess.run(
-            "apt-get install -y --no-install-recommends gcc libc6-dev 2>/dev/null",
-            shell=True, capture_output=True
-        )
-    if not shutil.which("gcc"):
-        log("[UserSwap] ❌ gcc yok — userswap devre dışı (LD_PRELOAD atlanacak)")
-        return False
-
+        # gcc yok → apt ile kur
+        r = subprocess.run("apt-get install -y gcc 2>/dev/null", shell=True, capture_output=True)
+        if not shutil.which("gcc"):
+            log("[UserSwap] ⚠️  gcc bulunamadı — userswap devre dışı")
+            return False
     try:
         src_path = Path("/tmp/userswap.c")
-        # Önce /app/userswap.c varsa onu kullan, yoksa gömülü kodu yaz
-        if Path("/app/userswap.c").exists():
-            import shutil as _sh
-            _sh.copy("/app/userswap.c", src_path)
-        else:
-            src_path.write_text(_USERSWAP_C)
-
-        os.makedirs("/usr/local/lib", exist_ok=True)
+        src_path.write_text(_USERSWAP_C)
         r = subprocess.run(
             f"gcc -O2 -shared -fPIC -o {USERSWAP_SO} {src_path} -ldl -lpthread",
             shell=True, capture_output=True
         )
         if r.returncode == 0:
-            log(f"[UserSwap] ✅ Runtime derleme OK → {USERSWAP_SO}")
+            log(f"[UserSwap] ✅ userswap.so derlendi → {USERSWAP_SO}")
             return True
         else:
-            err = r.stderr.decode()[:200]
-            log(f"[UserSwap] ❌ Derleme hatası: {err}")
+            log(f"[UserSwap] ⚠️  Derleme hatası: {r.stderr.decode()[:120]}")
             return False
     except Exception as e:
-        log(f"[UserSwap] ❌ {e}")
+        log(f"[UserSwap] ⚠️  {e}")
         return False
 
 app = Flask(__name__)
@@ -343,11 +326,22 @@ def _auto_archive_old_regions(older_than_days: int = 0):
             continue
         dim = dim_dir.parts[-3]
 
+        # ÖNEMLİ: shutil.disk_usage("/") HOST diskini okur (örn: 68GB).
+        # Render 18GB limiti cgroup ile uygulanır — gerçek kullanıma bakıyoruz.
+        # Hesap: agent diskleri zaten bu iş için var, her zaman arşivle.
         import shutil as _shu2
-        disk_free_gb = _shu2.disk_usage("/").free / 1e9
-        # Disk %70'den fazla doluysa tüm regionları arşivle;
-        # değilse sadece eski olanları (older_than_days)
-        force_all = disk_free_gb < 5.0
+        # Render limitini baz al (18GB) - ana sunucu gerçek kullanımı
+        render_limit_gb  = float(os.environ.get("RENDER_DISK_LIMIT_GB", "18.0"))
+        # /minecraft altındaki dosyaları say
+        try:
+            mc_used_gb = sum(
+                f.stat().st_size for f in MC_DIR.rglob("*") if f.is_file()
+            ) / 1e9
+        except:
+            mc_used_gb = 0.0
+        # OS + Python + image tabanı ~4GB
+        total_used_gb = 4.0 + mc_used_gb
+        force_all = total_used_gb > (render_limit_gb * 0.7)  # %70 dolu → zorla arşivle
 
         for rf in sorted(dim_dir.glob("*.mca"), key=lambda f: f.stat().st_mtime):
             age_days = (now - rf.stat().st_mtime) / 86400
@@ -435,40 +429,51 @@ def _ram_cache_warm_loop():
     """
     time.sleep(45)  # Agentlar bağlansın
 
-    def _push_file(path: Path, key: str):
+    def _push_file(path: Path, key: str, replicate: bool = False):
+        """
+        replicate=True  → tüm agentlara yaz (büyük statik dosyalar: JAR, plugin)
+        replicate=False → hash ile sabit 1 agenta yaz (config, küçük dosya)
+        """
         try:
             data = path.read_bytes()
-            ok = _pool.cache_set(key, data)
+            ok = _pool.cache_set(key, data, replicate=replicate)
             if ok:
-                log(f"[Pool] 🧠 Cache: {key} ({len(data)//1024}KB) → agent RAM")
+                agents = _pool.agent_count()
+                dst = f"tüm {agents} agent" if replicate else "1 agent"
+                log(f"[Pool] 🧠 Cache: {key} ({len(data)//1024}KB) → {dst} RAM")
             return ok
         except Exception as e:
             return False
 
     cached = 0
 
-    # 1. Server JAR
+    # 1. Server JAR → tüm agentlara dağıt (47MB × N agent = N × 47MB kullanılır)
+    # Her agent kendi kopyasını tutar → RAM Cache doluluk artar
     if MC_JAR.exists():
-        if _push_file(MC_JAR, "mc/server.jar"):
+        if _push_file(MC_JAR, "mc/server.jar", replicate=True):
             cached += 1
 
-    # 2. Config dosyaları
+    # 2. Config dosyaları → tüm agentlara (küçük, hızlı)
     for cfg in ["paper.yml", "spigot.yml", "bukkit.yml", "server.properties",
                 "paper-world-defaults.yml", "config/paper-global.yml"]:
         p = MC_DIR / cfg
         if p.exists():
-            if _push_file(p, f"mc/config/{cfg}"):
+            if _push_file(p, f"mc/config/{cfg}", replicate=True):
                 cached += 1
 
-    # 3. Plugin JARlar
+    # 3. Plugin JARlar → round-robin agentlara dağıt
     plugins_dir = MC_DIR / "plugins"
     if plugins_dir.exists():
-        for pjar in sorted(plugins_dir.glob("*.jar"))[:20]:   # max 20 plugin
-            if _push_file(pjar, f"mc/plugins/{pjar.name}"):
+        agents = _pool.get_agents()
+        plugin_jars = sorted(plugins_dir.glob("*.jar"))[:30]
+        for i, pjar in enumerate(plugin_jars):
+            # Her plugin farklı agenta gider → yük dağılımı
+            prefer = agents[i % len(agents)].node_id if agents else None
+            if _push_file(pjar, f"mc/plugins/{pjar.name}", replicate=False):
                 cached += 1
 
     if cached:
-        log(f"[Pool] 🧠 RAM Cache ısındı: {cached} dosya → agent RAM")
+        log(f"[Pool] 🧠 RAM Cache ısındı: {cached} dosya → {_pool.agent_count()} agent RAM")
         socketio.emit("pool_update", _pool_summary())
 
     # Periyodik config güncelleme (10 dakikada bir)
@@ -505,26 +510,44 @@ def _pool_auto_optimize():
     # Render.com'da swapon çalışmaz (EPERM) — swap denemesi atlandı
     log("[Pool] ℹ️  Render: swapon izin verilmiyor → swap yok, overcommit aktif")
 
-    import shutil as _sh2
-    disk_free_gb = _sh2.disk_usage("/").free / 1e9
-    # Disk 5GB'den azsa acil arşiv; değilse 7 günden eski regionlar
-    days = 0 if disk_free_gb < 5.0 else 7
+    # Render limiti tabanlı disk kontrolü (host FS değil)
+    render_limit_gb = float(os.environ.get("RENDER_DISK_LIMIT_GB", "18.0"))
+
+    def _render_disk_used_gb():
+        """Gerçek Render disk kullanımı: /minecraft + swap dosyaları."""
+        mc_gb = 0.0
+        try:
+            mc_gb = sum(
+                f.stat().st_size for f in MC_DIR.rglob("*") if f.is_file()
+            ) / 1e9
+        except: pass
+        swap_gb = sum(
+            os.path.getsize(f) for f in ["/swapfile", "/swapfile_mmap"]
+            if os.path.exists(f)
+        ) / 1e9
+        return 4.0 + mc_gb + swap_gb  # 4GB OS/image tabanı
+
+    # İlk arşiv
     try:
+        used_gb = _render_disk_used_gb()
+        # Disk %70+ dolu = acil (days=0), değilse 3 günden eski regionları arşivle
+        # (7 gün çok uzun — agentlar boşta kalır)
+        days = 0 if used_gb > render_limit_gb * 0.70 else 3
+        log(f"[Pool] 📊 Render disk: ~{used_gb:.1f}GB / {render_limit_gb}GB → eşik:{days}gün")
         result = _auto_archive_old_regions(older_than_days=days)
         if result and result[0]:
-            log(f"[Pool] 📦 İlk arşiv: {result[0]} region, {result[1]:.0f}MB (≥{days}gün eski veya disk kritik)")
+            log(f"[Pool] 📦 İlk arşiv: {result[0]} region, {result[1]:.0f}MB (≥{days}gün)")
         else:
-            log(f"[Pool] ℹ️  Arşiv: henüz arşivlenecek region yok (disk:{disk_free_gb:.1f}GB boş, eşik:{days}gün)")
+            log(f"[Pool] ℹ️  Arşiv: region yok veya hepsi yeni (eşik:{days}gün, disk:{used_gb:.1f}GB)")
         socketio.emit("pool_update", _pool_summary())
     except Exception as e:
         log(f"[Pool] ⚠️  İlk arşiv hatası: {e}")
 
     while True:
-        time.sleep(300)
+        time.sleep(180)  # 3 dakika (300 yerine — daha agresif)
         try:
-            import shutil as _sh3
-            disk_free_gb2 = _sh3.disk_usage("/").free / 1e9
-            days2 = 0 if disk_free_gb2 < 5.0 else 7
+            used_gb2 = _render_disk_used_gb()
+            days2    = 0 if used_gb2 > render_limit_gb * 0.70 else 3
             _auto_archive_old_regions(older_than_days=days2)
             socketio.emit("pool_update", _pool_summary())
         except Exception as e:
@@ -624,16 +647,8 @@ def get_jvm_args():
     xms_mb = 32
 
     log(f"[Panel] 🧠 Container={container_ram_mb}MB Swap=0MB Agents={agent_count} → Xms={xms_mb}M Xmx={xmx_mb}M")
-    # LD_PRELOAD: sadece userswap.so gerçekten varsa ekle
-    # Yoksa Java alt-process'leri de hata verir (LD_PRELOAD inherit edilir)
-    import os as _os
-    java_cmd = []
-    if _os.path.exists(USERSWAP_SO):
-        java_cmd = ["env", f"LD_PRELOAD={USERSWAP_SO}"]
-    else:
-        log("[UserSwap] ⚠️  userswap.so bulunamadı — LD_PRELOAD atlandı")
-    java_cmd.append("java")
-    return java_cmd + [
+    return [
+        "env", f"LD_PRELOAD={USERSWAP_SO}", "java",
         f"-Xms{xms_mb}M", f"-Xmx{xmx_mb}M",
         # ── Bellek alanları (512MB container için kesin sınırlar) ──
         # Toplam JVM RSS ≈ Xmx(220) + Meta(96) + Code(28) + Class(24) + Stacks(14) = 382MB
@@ -706,18 +721,30 @@ def start_server():
     threading.Thread(target=_stdout_reader, daemon=True).start()
     # MC başlatılınca mevcut tüm agent'lara proxy aç
     def _start_all_proxies():
-        import time as _t
-        _t.sleep(20)  # MC tüneli hazır olana kadar bekle
-        # Agent proxy'si ana MC tünel host'una yönlendirilmeli (127.0.0.1 değil).
-        # Cloudflare TCP tüneli olmadan dış bağlantı aktarılamaz — proxy şimdilik pasif.
-        mc_host = tunnel_info.get("host", "")
-        if not mc_host:
-            log("[Pool] ℹ️  Proxy: MC tüneli henüz hazır değil, proxy atlandı")
+        # MC tünel URL'si hazır olana kadar bekle (max 5 dk)
+        for _ in range(300):
+            mc_host = tunnel_info.get("host", "")
+            if mc_host:
+                break
+            time.sleep(1)
+        else:
+            log("[Pool] ⚠️  Proxy: 5dk içinde MC tüneli gelmedi — proxy atlandı")
             return
+
         agents = _pool.get_agents()
-        log(f"[Pool] ℹ️  Proxy: {len(agents)} agent bağlı, MC tüneli üzerinden yönlendirme yapılamıyor (Cloudflare TCP sınırı) — RAM Cache + Disk aktif")
-    if _pool.agent_count() > 0:
-        threading.Thread(target=_start_all_proxies, daemon=True).start()
+        if not agents:
+            log("[Pool] ℹ️  Proxy: agent yok — proxy atlandı")
+            return
+
+        # Her agent kendi cloudflare tünelinden proxy kurar
+        # → ana MC tünel host'una TCP relay (oyuncu yük dağıtımı)
+        started = _pool.start_proxies(mc_host, mc_port=25565)
+        if started:
+            log(f"[Pool] 🔀 Proxy başlatıldı: {len(started)}/{len(agents)} agent → {mc_host}:25565")
+        else:
+            log(f"[Pool] ⚠️  Proxy başlatılamadı ({len(agents)} agent bağlı)")
+
+    threading.Thread(target=_start_all_proxies, daemon=True).start()
     return True, "Başlatılıyor..."
 
 
@@ -829,8 +856,20 @@ def api_console_history():
 @app.route("/api/internal/tunnel", methods=["POST"])
 def api_internal_tunnel():
     d = request.json or {}
-    tunnel_info.update({"url": d.get("url",""), "host": d.get("host","")})
+    new_host = d.get("host", "")
+    old_host = tunnel_info.get("host", "")
+    tunnel_info.update({"url": d.get("url",""), "host": new_host})
     socketio.emit("tunnel_update", tunnel_info)
+    # Tünel yeni geldiyse proxy'leri güncelle
+    if new_host and new_host != old_host and _pool.agent_count() > 0:
+        def _update_proxies():
+            time.sleep(2)
+            _pool.stop_proxies()
+            time.sleep(1)
+            started = _pool.start_proxies(new_host, mc_port=25565)
+            if started:
+                log(f"[Pool] 🔀 Tünel güncellendi → {len(started)} proxy yeniden başlatıldı")
+        threading.Thread(target=_update_proxies, daemon=True).start()
     return jsonify({"ok": True})
 
 
