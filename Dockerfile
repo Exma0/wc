@@ -23,7 +23,7 @@ RUN curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg \
     && apt-get update && apt-get install -y cloudflared \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# ── ADIM 3: Java 21 + Python + araçlar ────────────────────
+# ── ADIM 3: Java 21 + Python + araçlar ─────────────────────
 RUN apt-get update && apt-get install -y --no-install-recommends \
     openjdk-21-jdk-headless \
     python3 python3-pip \
@@ -35,7 +35,24 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/* /usr/share/doc/* \
               /usr/share/man/* /usr/share/info/*
 
-# ── ADIM 4: Python paketleri ───────────────────────────────
+# ── ADIM 4: NBD araçları + kmod (modprobe) ──────────────────
+# kmod  : modprobe komutu için zorunlu
+# nbd-client : Network Block Device bağlantısı için
+# nbd-server : Destek modunda NBD sunucu olarak çalışmak için
+# linux-modules-extra : nbd.ko kernel modülü
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    kmod \
+    nbd-client \
+    nbd-server \
+    socat \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# nbd modülünü önceden yükle (build time'da çalışmaz ama modprobe'un
+# çalışacağı ortamda modülü hazır tut)
+RUN mkdir -p /etc/modules-load.d \
+    && echo "nbd" >> /etc/modules-load.d/nbd.conf
+
+# ── ADIM 5: Python paketleri ───────────────────────────────
 RUN pip3 install --no-cache-dir \
     flask \
     flask-socketio \
@@ -45,7 +62,7 @@ RUN pip3 install --no-cache-dir \
     && pip3 cache purge \
     && rm -rf /root/.cache
 
-# ── ADIM 5: Tam root + Minecraft dizinleri ─────────────────
+# ── ADIM 6: Tam root + Minecraft dizinleri ──────────────────
 RUN echo "root ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers \
     && mkdir -p /minecraft/plugins /minecraft/backups /minecraft/config
 

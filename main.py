@@ -549,28 +549,39 @@ def connect_worker_nbd(host: str, node_id: str = "") -> bool:
     _panel_log(f"[Panel] {msg}")
 
     # ── nbd kernel modülü ──
-    # PATH'de /sbin olmayabilir — tam yol dene
+    import shutil as _s2
+    # kmod kurulu değilse kur
+    if not _s2.which("modprobe") and not os.path.exists("/sbin/modprobe"):
+        _panel_log("[Panel] ⚙️  kmod (modprobe) kuruluyor...")
+        sh("apt-get install -y --no-install-recommends kmod 2>/dev/null")
+
     mod_ok = False
     for mp in ["/sbin/modprobe", "/usr/sbin/modprobe", "modprobe"]:
         r_mod = sh(f"{mp} nbd max_part=0 2>&1")
+        out = r_mod.stdout.decode()
         if r_mod.returncode == 0:
+            _panel_log(f"[Panel] ✅ modprobe nbd OK ({mp})")
             mod_ok = True
             break
-    if not mod_ok:
-        _panel_log(f"[Panel] ⚠️  modprobe başarısız — mknod fallback deneniyor")
-        # Kernel modülü yüklenemediyse cihazı elle oluştur
-        for i in range(16):
-            dev_path = f"/dev/nbd{i}"
-            if not os.path.exists(dev_path):
-                sh(f"mknod {dev_path} b 43 {i} 2>/dev/null")
-        # sysfs üzerinden yüklemeyi dene
-        sh("echo nbd > /sys/bus/platform/drivers_probe 2>/dev/null")
 
-    # /dev/nbdX cihazı var mı kontrol et, yoksa oluştur
+    if not mod_ok:
+        if os.path.exists("/sys/module/nbd"):
+            _panel_log("[Panel] ✅ nbd modülü /sys/module/nbd üzerinden tespit edildi")
+            mod_ok = True
+        else:
+            _panel_log("[Panel] ⚠️  modprobe başarısız — mknod ile /dev/nbd* oluşturuluyor")
+            for i in range(16):
+                dp = f"/dev/nbd{i}"
+                if not os.path.exists(dp):
+                    sh(f"mknod {dp} b 43 {i} 2>/dev/null")
+
+    # /dev/nbdX cihazı var mı kontrol et
     if not os.path.exists(dev):
-        sh(f"mknod {dev} b 43 {dev_num} 2>/dev/null")
+        r_mk = sh(f"mknod {dev} b 43 {dev_num} 2>&1")
         if not os.path.exists(dev):
-            _panel_log(f"[Panel] ❌ {dev} cihazı oluşturulamadı!")
+            err = r_mk.stdout.decode()[:120]
+            _panel_log(f"[Panel] ❌ {dev} oluşturulamadı: {err}")
+            _panel_log("[Panel] ❌ Dockerfile'da 'kmod nbd-client' kurulu mu? render.yaml'da privileged:true var mı?")
             with _nbd_lock: _nbd_nodes.pop(node_id, None)
             return False
     _panel_log(f"[Panel] ✅ {dev} cihazı hazır")
