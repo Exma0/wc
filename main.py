@@ -543,17 +543,39 @@ def connect_worker_nbd(host: str, node_id: str = "") -> bool:
         _nbd_nodes[node_id] = {"port": port, "dev": dev, "connected": False, "stop": None}
 
     cnt_before = nbd_connected_count()
+    dev_num = int(dev.replace("/dev/nbd", ""))
     msg = f"[nbd] 🔌 Bağlanılıyor: {node_id} | local:{port} → {dev}"
     print(f"\n  {msg}")
     _panel_log(f"[Panel] {msg}")
 
-    # nbd kernel modülü
-    r_mod = sh("modprobe nbd max_part=0 2>&1")
-    if r_mod.returncode != 0:
-        out = r_mod.stdout.decode()[:100]
-        _panel_log(f"[Panel] ⚠️  modprobe nbd: {out} (devam ediliyor)")
+    # ── nbd kernel modülü ──
+    # PATH'de /sbin olmayabilir — tam yol dene
+    mod_ok = False
+    for mp in ["/sbin/modprobe", "/usr/sbin/modprobe", "modprobe"]:
+        r_mod = sh(f"{mp} nbd max_part=0 2>&1")
+        if r_mod.returncode == 0:
+            mod_ok = True
+            break
+    if not mod_ok:
+        _panel_log(f"[Panel] ⚠️  modprobe başarısız — mknod fallback deneniyor")
+        # Kernel modülü yüklenemediyse cihazı elle oluştur
+        for i in range(16):
+            dev_path = f"/dev/nbd{i}"
+            if not os.path.exists(dev_path):
+                sh(f"mknod {dev_path} b 43 {i} 2>/dev/null")
+        # sysfs üzerinden yüklemeyi dene
+        sh("echo nbd > /sys/bus/platform/drivers_probe 2>/dev/null")
 
-    # nbd-client kurulu mu?
+    # /dev/nbdX cihazı var mı kontrol et, yoksa oluştur
+    if not os.path.exists(dev):
+        sh(f"mknod {dev} b 43 {dev_num} 2>/dev/null")
+        if not os.path.exists(dev):
+            _panel_log(f"[Panel] ❌ {dev} cihazı oluşturulamadı!")
+            with _nbd_lock: _nbd_nodes.pop(node_id, None)
+            return False
+    _panel_log(f"[Panel] ✅ {dev} cihazı hazır")
+
+    # ── nbd-client kurulu mu? ──
     import shutil as _s
     if not _s.which("nbd-client"):
         _panel_log("[Panel] ⚙️  nbd-client kuruluyor...")
@@ -565,7 +587,7 @@ def connect_worker_nbd(host: str, node_id: str = "") -> bool:
             with _nbd_lock: _nbd_nodes.pop(node_id, None)
             return False
 
-    # WS istemci köprüsü başlat
+    # ── WS istemci köprüsü başlat ──
     stop_ev = threading.Event()
     bridge_t = threading.Thread(
         target=_ws_bridge_client_loop,
@@ -576,13 +598,22 @@ def connect_worker_nbd(host: str, node_id: str = "") -> bool:
 
     # Köprü TCP portu açılana kadar bekle (20sn)
     if not wait_port(port, timeout=20):
-        _panel_log(f"[Panel] ❌ WS köprü portu {port} açılmadı (20sn) — "
-                   f"nbd-client atlanıyor")
+        _panel_log(f"[Panel] ❌ WS köprü portu {port} açılmadı (20sn)")
         stop_ev.set()
         with _nbd_lock: _nbd_nodes.pop(node_id, None)
         return False
 
-    _panel_log(f"[Panel] ✅ WS köprüsü :127.0.0.1:{port} hazır, nbd-client bağlanıyor...")
+    # ── WS bağlantısının karşı tarafa ulaşmasını bekle ──
+    # Port açık = TCP server hazır. Ama SSL+WS handshake için ekstra 5sn bekle
+    # Bu sayede nbd-server'ın magic bytes'larını hazır buluruz.
+    _panel_log(f"[Panel] ✅ WS köprüsü :{port} hazır, cloudflare handshake 5sn bekleniyor...")
+    time.sleep(5)
+
+    # Önceki kullanımdan kalan dev'i temizle
+    sh(f"nbd-client -d {dev} 2>/dev/null")
+    time.sleep(1)
+
+    _panel_log(f"[Panel] 🔗 nbd-client bağlanıyor: 127.0.0.1:{port} → {dev}")
 
     # nbd-client bağlan
     r = sh(f"nbd-client 127.0.0.1 {port} {dev} -N disk -b 4096 -t 30 2>&1")
@@ -638,13 +669,17 @@ def connect_worker_nbd(host: str, node_id: str = "") -> bool:
 
 def _connect_node_loop(host: str, node_id: str):
     """Tek bir düğümü bağlayana kadar sürekli yeniden dene."""
+    # İlk deneme öncesi küçük stagger (race condition önlemek için)
+    import random
+    time.sleep(random.uniform(0.5, 2.5))
     attempt = 0
     while True:
         attempt += 1
         if connect_worker_nbd(host, node_id):
             return
-        wait = min(120, 10 * attempt)
+        wait = min(120, 15 * attempt)
         print(f"  [nbd] {node_id} başarısız (#{attempt}), {wait}sn sonra yeniden...")
+        _panel_log(f"[Panel] ⚠️  NBD {node_id} #{attempt} başarısız, {wait}sn sonra tekrar")
         time.sleep(wait)
 
 
@@ -879,7 +914,15 @@ def support_create_disk():
 
 def support_start_nbd(disk_gb):
     support_install_tools()
-    sh("modprobe nbd max_part=0 2>/dev/null")
+    # modprobe tam yol dene
+    for mp in ["/sbin/modprobe", "/usr/sbin/modprobe", "modprobe"]:
+        if sh(f"{mp} nbd max_part=0 2>/dev/null").returncode == 0:
+            break
+    # /dev/nbd* cihazları oluştur (modprobe başarısız olsa bile)
+    for i in range(4):
+        dp = f"/dev/nbd{i}"
+        if not os.path.exists(dp):
+            sh(f"mknod {dp} b 43 {i} 2>/dev/null")
     os.makedirs("/etc/nbd-server", exist_ok=True)
     cfg = f"[generic]\n    port = {NBD_SERVER_PORT}\n    allowlist = true\n"
     if disk_gb > 0 and os.path.exists(SUPPORT_NBD_FILE):
