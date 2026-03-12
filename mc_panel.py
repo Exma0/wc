@@ -236,11 +236,31 @@ def _tps_monitor():
 
 def _stdout_reader():
     global mc_process
+    _remap_done = False
+    _remap_in_progress = False
     while mc_process and mc_process.poll() is None:
         try:
             line = mc_process.stdout.readline()
-            if line:
-                log(line.decode("utf-8", errors="replace"))
+            if not line:
+                continue
+            txt = line.decode("utf-8", errors="replace")
+            log(txt)
+
+            # Remap aşaması tespiti
+            if "Remapping server" in txt and not _remap_in_progress:
+                _remap_in_progress = True
+                log("[Panel] 🔄 ReobfServer remapping başladı — UserSwap RAM'i karşılıyor...")
+
+            # Remap tamamlandı → cache'i agent diskine yedekle
+            if _remap_in_progress and not _remap_done:
+                if ("Applying patches" in txt or
+                    "Loading libraries" in txt or
+                    "[00:00:" in txt):  # Paper log başladı = remap bitti
+                    _remap_done = True
+                    _remap_in_progress = False
+                    log("[Panel] ✅ Remapping tamamlandı — cache agent disklere yedekleniyor...")
+                    threading.Thread(target=_save_remap_cache, daemon=True).start()
+
         except Exception:
             break
     server_state["status"] = "stopped"
@@ -301,6 +321,92 @@ def _pool_summary() -> dict:
             for a in s["agents"]
         ],
     }
+
+
+
+# ══════════════════════════════════════════════════════════════
+#  PAPER REMAP CACHE  — agent diskine yedekle / geri yükle
+# ══════════════════════════════════════════════════════════════
+# Paper MC ilk başlatmada server.jar'ı remap eder → cache/patched_*.jar
+# Bu ~400MB heap kullanır ve ~2dk sürer.
+# cache/ dosyaları agent diskinde saklanırsa sonraki başlatmalarda remap ATLANIR.
+
+PAPER_CACHE_DIR = MC_DIR / "cache"
+
+def _remap_cache_files():
+    """Mevcut remap cache dosyalarını listele."""
+    if not PAPER_CACHE_DIR.exists():
+        return []
+    return list(PAPER_CACHE_DIR.glob("patched_*.jar")) +            list(PAPER_CACHE_DIR.glob("bundler_*.jar")) +            list(PAPER_CACHE_DIR.glob("*.jar"))
+
+def _save_remap_cache():
+    """
+    Remap tamamlandıktan sonra cache/patched_*.jar dosyalarını
+    tüm agent'ların diskine yedekle.
+    """
+    files = _remap_cache_files()
+    if not files:
+        return 0
+    agents = _pool.get_agents()
+    if not agents:
+        return 0
+
+    saved = 0
+    import concurrent.futures as _cf
+    for f in files:
+        try:
+            data  = f.read_bytes()
+            fname = f.name
+            def _up_one(a, _d=data, _n=fname):
+                try: return a.file_upload("paper_cache", _n, _d)
+                except: return False
+            with _cf.ThreadPoolExecutor(max_workers=len(agents)) as ex:
+                results = list(ex.map(_up_one, agents))
+            if any(results):
+                n = sum(1 for r in results if r)
+                log(f"[Panel] 💾 Remap cache yedeklendi: {fname} → {n}/{len(agents)} agent "
+                    f"({len(data)//1024//1024}MB)")
+                saved += 1
+        except Exception as e:
+            log(f"[Panel] ⚠️  Remap cache yedek hatası: {f.name}: {e}")
+    return saved
+
+def _restore_remap_cache():
+    """
+    MC başlatılmadan önce agent'lardan remap cache'ini geri yükle.
+    Başarılı olursa remap aşaması tamamen ATLANIR → RAM spike yok.
+    """
+    agents = _pool.get_agents()
+    if not agents:
+        return False
+
+    PAPER_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Agent'lardan paper_cache dosyalarını listele
+    restored = 0
+    for agent in agents:
+        try:
+            files = agent.file_list("paper_cache")
+            for fi in files:
+                fname = fi if isinstance(fi, str) else fi.get("name", "")
+                if not fname.endswith(".jar"):
+                    continue
+                dest = PAPER_CACHE_DIR / fname
+                if dest.exists() and dest.stat().st_size > 1024 * 1024:
+                    continue  # Zaten var — atla
+                data = agent.file_download("paper_cache", fname)
+                if data and len(data) > 1024 * 1024:
+                    dest.write_bytes(data)
+                    log(f"[Panel] ✅ Remap cache geri yüklendi: {fname} "
+                        f"({len(data)//1024//1024}MB) ← {agent.node_id}")
+                    restored += 1
+                    break  # 1 agenten alındı yeter
+        except Exception as e:
+            continue
+
+    if restored:
+        log(f"[Panel] 🚀 Remap cache hazır ({restored} dosya) — remapping ATLANACAK")
+    return restored > 0
 
 
 def _auto_archive_old_regions(older_than_days: int = 0):
@@ -389,48 +495,41 @@ def _world_backup_loop():
             if _pool.agent_count() == 0:
                 time.sleep(30); continue
 
-            # Değişen dosyaları tespit et
-            changed = []
+            sent = 0
             for dim_dir in [
                 MC_DIR / "world" / "region",
                 MC_DIR / "world_nether" / "DIM-1" / "region",
                 MC_DIR / "world_the_end" / "DIM1" / "region",
             ]:
-                if not dim_dir.exists(): continue
+                if not dim_dir.exists():
+                    continue
                 dim = dim_dir.parts[-3]
                 for rf in dim_dir.glob("*.mca"):
                     try:
                         md5 = _file_md5(rf)
-                        k   = f"{dim}/{rf.name}"
-                        if _sent_hashes.get(k) != md5:
-                            changed.append((dim, rf, k, md5))
-                    except: continue
+                        cache_key = f"{dim}/{rf.name}"
+                        if _sent_hashes.get(cache_key) == md5:
+                            continue   # Değişmemiş — atla
+                        ok = _pool.store_region_backup(dim, rf)
+                        if ok:
+                            _sent_hashes[cache_key] = md5
+                            sent += 1
+                    except Exception:
+                        continue
 
-            if changed:
-                import concurrent.futures as _cf3
-                def _up(item):
-                    dim, rf, k, md5 = item
-                    try:
-                        if _pool.store_region_backup(dim, rf):
-                            _sent_hashes[k] = md5
-                            return 1
-                    except: pass
-                    return 0
-                with _cf3.ThreadPoolExecutor(max_workers=4) as ex:
-                    sent = sum(ex.map(_up, changed))
-                if sent:
-                    log(f"[Pool] 💾 Yedek: {sent}/{len(changed)} region → agent disk")
-                    socketio.emit("pool_update", _pool_summary())
+            if sent:
+                log(f"[Pool] 💾 Dünya yedeklendi: {sent} region → agent disk")
+                socketio.emit("pool_update", _pool_summary())
         except Exception as e:
             log(f"[Pool] ⚠️  Yedek hatası: {e}")
-        time.sleep(120)  # 2dk (değişen regionları hızlı yedekle)
+        time.sleep(180)   # 3 dakika
 
 
 # ── Agent başına kaç MB cache dolduralım ──────────────────────────────────
 # Her agent 382MB free RAM var, RamCache limiti agent'ta RAM_CACHE_MB env ile ayarlanır.
 # Ana sunucu bu değeri bilmez — agent'ın cache/stats endpoint'inden okur.
 # Güvenli hedef: cache limitinin %90'ı
-AGENT_CACHE_FILL_TARGET = 0.97   # Cache limitinin %97'sine kadar doldur
+AGENT_CACHE_FILL_TARGET = 0.90   # Her agentin cache'ini %90 doldur
 
 
 def _get_agent_cache_limit_mb(agent_client) -> int:
@@ -541,159 +640,70 @@ def _warm_single_agent(agent_client, log_fn=None, fill_regions: bool = True):
 
 def _ram_cache_warm_loop():
     """
-    Hızlı paralel cache warm:
-    - 1 dosya oku → tüm agentlere eş zamanlı HTTP POST (_blast)
-    - Panel RAM'de max 1 dosya → OOM yok
-    - MC "running" + 60sn bekle (GC + world I/O)
-    - Her 2dk: yeni agent kontrolü. Her 5dk: tüm havuzu tazele
+    Tüm agent cache'lerini paralel doldur.
+    Her 5 dakikada bir yeni region'ları ve yeni agentları güncelle.
     """
-    import gc as _gcw
-    import concurrent.futures as _cf
-
-    # JAR + agent hazır bekle (15dk)
+    # MC JAR + en az 1 agent hazır olana kadar bekle (max 15 dk)
     for _ in range(900):
         if MC_JAR.exists() and _pool.agent_count() > 0:
             break
         time.sleep(1)
     else:
-        log("[Pool] ⚠️  Cache warm: 15dk içinde hazır olmadı"); return
+        log("[Pool] ⚠️  Cache warm: JAR veya agent 15dk içinde hazır olmadı")
+        return
 
-    # MC "Done" olana kadar bekle
-    log("[Pool] 🕐 Cache warm: MC tam başlayana kadar bekliyor...")
-    for _ in range(600):
-        if server_state.get("status") == "running":
-            break
-        time.sleep(1)
-    else:
-        log("[Pool] ⚠️  MC 10dk içinde hazır olmadı, warm atlandı"); return
-
-    log("[Pool] 🕐 Cache warm: 60sn bekleniyor (GC + world I/O)...")
-    time.sleep(60)
-
-    def _get_limits(agents):
-        """Tüm agentların cache limitlerini paralel al."""
-        limits = {}
-        with _cf.ThreadPoolExecutor(max_workers=max(1, len(agents))) as ex:
-            futs = {ex.submit(_get_agent_cache_limit_mb, a): a for a in agents}
-            for ft, a in futs.items():
-                try:    limits[a.node_id] = int(ft.result() * AGENT_CACHE_FILL_TARGET) * 1024 * 1024
-                except: limits[a.node_id] = int(350 * AGENT_CACHE_FILL_TARGET) * 1024 * 1024
-        return limits
+    time.sleep(10)  # MC başlasın + world dosyaları oluşsun
 
     def _fill_all_agents():
-        """1 dosya oku → N agente paralel HTTP POST. Panel RAM: max 1 dosya."""
         agents = _pool.get_agents()
         if not agents:
             return 0
-        limits  = _get_limits(agents)
-        pushed  = {a.node_id: 0 for a in agents}
-        counts  = {a.node_id: 0 for a in agents}
+        threads, results = [], []
 
-        def _blast(key, data):
-            """1 key → tüm sağlıklı agentlere paralel HTTP."""
-            def _one(a):
-                if pushed[a.node_id] >= limits[a.node_id]:
-                    return
-                try:
-                    if a.cache_set(key, data):
-                        pushed[a.node_id] += len(data)
-                        counts[a.node_id] += 1
-                except:
-                    pass
-            with _cf.ThreadPoolExecutor(max_workers=len(agents)) as ex:
-                list(ex.map(_one, agents))
+        def _t(a):
+            n = _warm_single_agent(a, log_fn=log, fill_regions=True)
+            results.append(n)
 
-        # 1. JAR — 4MB chunk'larla (panel RAM'de max 4MB)
-        _CHUNK = 4 * 1024 * 1024
-        if MC_JAR.exists():
-            try:
-                n_ch = (MC_JAR.stat().st_size + _CHUNK - 1) // _CHUNK
-                with open(MC_JAR, "rb") as jf:
-                    for ci in range(n_ch):
-                        ch = jf.read(_CHUNK)
-                        if not ch: break
-                        _blast(f"mc/jar/c{ci:04d}", ch)
-                        del ch; _gcw.collect()
-                _blast("mc/jar/meta", f'{{"n":{n_ch}}}'.encode())
-            except: pass
-
-        # 2. Config
-        for cfg in ["server.properties","paper.yml","spigot.yml","bukkit.yml",
-                    "config/paper-global.yml","config/paper-world-defaults.yml"]:
-            p = MC_DIR / cfg
-            if p.exists():
-                try: d = p.read_bytes(); _blast(f"mc/cfg/{cfg}", d); del d
-                except: pass
-
-        # 3. Plugin JARlar (5MB altı)
-        plg = MC_DIR / "plugins"
-        if plg.exists():
-            for pj in sorted(plg.glob("*.jar"))[:20]:
-                try:
-                    if pj.stat().st_size <= 5 * 1024 * 1024:
-                        d = pj.read_bytes()
-                        _blast(f"mc/plg/{pj.name}", d)
-                        del d; _gcw.collect()
-                except: pass
-
-        # 4. Region + entities + poi (tüm agentlar aynı veriyi alır — tam replikasyon)
-        for dim_dir, dim_name in [
-            (MC_DIR/"world"/"region",                  "world"),
-            (MC_DIR/"world_nether"/"DIM-1"/"region",  "world_nether"),
-            (MC_DIR/"world_the_end"/"DIM1"/"region",  "world_the_end"),
-        ]:
-            if not dim_dir.exists(): continue
-            for rf in sorted(dim_dir.glob("*.mca"),
-                             key=lambda f: f.stat().st_mtime, reverse=True):
-                if all(pushed[a.node_id] >= limits[a.node_id] for a in agents): break
-                try:
-                    if rf.stat().st_size > 8 * 1024 * 1024: continue
-                    d = rf.read_bytes()
-                    _blast(f"mc/region/{dim_name}/{rf.name}", d)
-                    del d; _gcw.collect()
-                except: pass
-
-        for sub in ["entities", "poi"]:
-            sub_dir = MC_DIR / "world" / sub
-            if not sub_dir.exists(): continue
-            for sf in sorted(sub_dir.rglob("*.mca"),
-                             key=lambda f: f.stat().st_mtime, reverse=True):
-                if all(pushed[a.node_id] >= limits[a.node_id] for a in agents): break
-                try:
-                    if sf.stat().st_size > 4 * 1024 * 1024: continue
-                    d = sf.read_bytes()
-                    _blast(f"mc/{sub}/{sf.name}", d)
-                    del d; _gcw.collect()
-                except: pass
-
-        total    = sum(counts.values())
-        total_mb = sum(pushed.values()) // 1024 // 1024
-        cap_mb   = sum(limits.values())  // 1024 // 1024
+        for a in agents:
+            t = threading.Thread(target=_t, args=(a,), daemon=True)
+            threads.append(t)
+            t.start()
+        for t in threads:
+            t.join(timeout=180)
+        total = sum(results)
         if total:
-            log(f"[Pool] 🧠 Cache: {len(agents)} agent | {total_mb}MB/{cap_mb}MB | {total} dosya")
+            log(f"[Pool] 🧠 Cache tamamlandı: {len(agents)} agent, toplam {total} dosya gönderildi")
             socketio.emit("pool_update", _pool_summary())
         return total
 
     _fill_all_agents()
 
-    _warmed: set   = set(a.node_id for a in _pool.get_agents())
-    _last_fill     = time.time()
+    # Periyodik: yeni agentları ısıt + tüm havuzu tazele
+    _warmed_agents: set = set(a.node_id for a in _pool.get_agents())
 
     while True:
-        time.sleep(120)
+        time.sleep(300)  # 5 dakika
         try:
-            if _pool.agent_count() == 0: continue
+            if _pool.agent_count() == 0:
+                continue
+
             current = set(a.node_id for a in _pool.get_agents())
-            new_ids = current - _warmed
+            new_ids = current - _warmed_agents
             if new_ids:
-                log(f"[Pool] 🧠 Yeni agent(lar): {new_ids} — cache warm")
-                _fill_all_agents()
-                _warmed = current
-            elif time.time() - _last_fill >= 300:
-                _fill_all_agents()
-                _last_fill = time.time()
+                log(f"[Pool] 🧠 Yeni agent ısınıyor: {new_ids}")
+                for nid in new_ids:
+                    a = _pool.agents.get(nid)
+                    if a:
+                        threading.Thread(
+                            target=_warm_single_agent,
+                            args=(a, log, True), daemon=True
+                        ).start()
+                _warmed_agents.update(current)
+
+            # World yeni region'ları çıktıysa tazele (oyun genişledi)
+            _fill_all_agents()
         except Exception as e:
-            log(f"[Pool] ⚠️  Cache warm döngü: {e}")
+            log(f"[Pool] ⚠️  Cache warm döngü hatası: {e}")
 
 
 def _pool_auto_optimize():
@@ -802,76 +812,23 @@ def write_server_config():
         f"server-port={MC_PORT}\nmax-players=20\nonline-mode=false\n"
         "gamemode=survival\ndifficulty=normal\nlevel-name=world\n"
         "motd=\\u00A7a\\u00A7lRender MC Server\n"
-        "view-distance=5\nsimulation-distance=4\n"  # 4→5/3→4: oyun kalitesi artış
+        "view-distance=4\nsimulation-distance=3\n"
         "spawn-protection=0\nallow-flight=true\n"
         "enable-rcon=false\nmax-tick-time=60000\nwhite-list=false\n"
         "enable-command-block=true\npvp=true\ngenerate-structures=true\n"
         "allow-nether=true\nsync-chunk-writes=false\n"
-        "network-compression-threshold=256\n"  # <256B paketler sıkıştırılmaz
-        "rate-limit=0\n"
-        "region-file-compression=deflate\n"
         "entity-broadcast-range-percentage=50\n"
     )
     config = MC_DIR / "config"
     config.mkdir(exist_ok=True)
-    # paper-global.yml — async chunk IO + timings kapat
-    pg = config / "paper-global.yml"
-    pg.write_text(
-        "timings:\n  enabled: false\n"
-        "chunk-system:\n"
-        "  io-threads: 2\n"
-        "  worker-threads: 2\n"
-        "console:\n"
-        "  enable-brigadier-completions: false\n"
-        "packet-limiter:\n"
-        "  all-packets:\n    action: KICK\n    interval: 7.0\n    max-packet-rate: 500.0\n"
-        "misc:\n"
-        "  use-alternative-luck-formula: false\n"
-        "  load-permissions-yml-before-plugins: true\n"
-    )
     pw = config / "paper-world-defaults.yml"
     pw.write_text(
         "world-settings:\n  default:\n"
-        # Mob limitleri — düşük RAM, az mob = az tick yükü
-        "    spawn-limits:\n"
-        "      monsters: 30\n      animals: 6\n"
-        "      water-animals: 2\n      water-ambient: 5\n      ambient: 1\n"
-        # Chunk I/O
-        "    chunks:\n"
-        "      auto-save-interval: 6000\n"         # 10dk → 5dk küçük spike
-        "      max-auto-save-chunks-per-tick: 8\n" # daha hızlı save → spike kısa
-        "      prevent-moving-into-unloaded-chunks: true\n"
-        # Tick optimizasyon
-        "    optimize-explosions: true\n"
-        "    mob-spawner-tick-rate: 2\n"
-        "    container-update-tick-rate: 3\n"
-        "    grass-spread-tick-rate: 4\n"
-        "    use-faster-eigencraft-redstone: true\n"
-        "    hopper:\n"
-        "      disable-move-event: true\n"
-        "      ignore-occluding-blocks: true\n"
-        # Item despawn hızlandır (cobblestone vs yavaş sunucuyu kasıyor)
-        "    alt-item-despawn-rate:\n"
-        "      enabled: true\n"
-        "      items:\n"
-        "        COBBLESTONE: 300\n"
-        "        NETHERRACK: 300\n"
-        "        DIRT: 300\n"
-        "        GRAVEL: 300\n"
-        "        SAND: 300\n"
-        "        STONE: 300\n"
-        # Armor stand collision (gereksiz entity lookup kaldır)
-        "    armor-stands:\n"
-        "      do-collision-entity-lookups: false\n"
-        "      tick: false\n"
-        # Entity per chunk limit (sunucu donmasını önle)
-        "    entity-per-chunk-save-limit:\n"
-        "      arrow: 16\n"
-        "      snowball: 8\n"
-        "      enderpearl: 8\n"
-        "      fireball: 8\n"
-        "      thrown-exp-bottle: 8\n"
-        "      llama-spit: 3\n"
+        "    spawn-limits:\n      monsters: 40\n      animals: 8\n"
+        "      water-animals: 3\n      water-ambient: 10\n"
+        "    chunks:\n      auto-save-interval: 12000\n"
+        "    max-auto-save-chunks-per-tick: 4\n"
+        "    prevent-moving-into-unloaded-chunks: true\n"
     )
 
 
@@ -905,13 +862,10 @@ def get_jvm_args():
     #   Xmx=320 → RSS_JVM ≈ 250MB (aktif heap) + 220MB (swap'a taşan) → fiziksel ~480MB peak
     #   Peak 512MB'yi aşınca UserSwap devreye girer → dosyaya yazar, crash YOK
     #   Steady-state (GC sonrası): RSS ~380MB → güvenli
+    xmx_mb = 320   # UserSwap aktif → Paper 1.21 bootstrap için yeterli heap
+    xms_mb = 48    # Düşük başlangıç → JVM lazy expand eder
+
     userswap_ok = os.path.exists(USERSWAP_SO)
-    if userswap_ok:
-        xmx_mb = 400  # UserSwap: taşma /swapfile_mmap'e → fiziksel peak ~480MB, crash YOK
-        xms_mb = 64   # Hızlı başlangıç
-    else:
-        xmx_mb = 240  # UserSwap yok → konservatif (OOM'a karşı)
-        xms_mb = 48
     swap_label  = f"UserSwap(4GB)" if userswap_ok else "NoSwap"
     log(f"[Panel] 🧠 Container={container_ram_mb}MB {swap_label} Agents={agent_count} → Xms={xms_mb}M Xmx={xmx_mb}M")
 
@@ -927,39 +881,31 @@ def get_jvm_args():
         # ── Bellek alanları (UserSwap ile taşma dosyaya gider) ──
         # Meta + Code + Class + Stack ≈ 162MB sabit
         # Fiziksel peak ≈ 320(heap) + 162(meta/etc) + 130(python) = 612MB → ~100MB UserSwap'a
-        "-XX:MaxMetaspaceSize=128m",  # Plugin classloader için daha fazla alan
+        "-XX:MaxMetaspaceSize=96m",
         "-XX:CompressedClassSpaceSize=24m",
-        "-XX:ReservedCodeCacheSize=64m",  # JIT derleme cache — 28→64MB
-        "-Xss512k",  # Stack size — derin çağrı zinciri için
+        "-XX:ReservedCodeCacheSize=28m",
+        "-Xss256k",
         # ── DirectBuffer: SINIR YOK ──
         # Paper MC Netty için 32-128MB DirectBuffer gerekir.
         # MaxDirectMemorySize=32m CRASH yaratır (OOM: Cannot reserve direct buffer).
         # Sınır belirtilmezse JVM varsayılan = Xmx (220MB) olur → yeterli.
         # ── GC: G1 ──
-        # Aikar's Flags — Paper MC için optimize (en düşük GC dip)
         "-XX:+UseG1GC",
         "-XX:+ParallelRefProcEnabled",
-        "-XX:MaxGCPauseMillis=200",
+        "-XX:MaxGCPauseMillis=100",
+        "-XX:ConcGCThreads=1",
+        "-XX:ParallelGCThreads=1",
         "-XX:+UnlockExperimentalVMOptions",
         "-XX:+DisableExplicitGC",
-        "-XX:G1NewSizePercent=30",
+        "-XX:G1NewSizePercent=20",
         "-XX:G1MaxNewSizePercent=40",
-        "-XX:G1HeapRegionSize=8m",
-        "-XX:G1ReservePercent=20",
+        "-XX:G1HeapRegionSize=2m",
+        "-XX:G1ReservePercent=10",
         "-XX:InitiatingHeapOccupancyPercent=15",
-        "-XX:G1HeapWastePercent=5",
-        "-XX:G1MixedGCCountTarget=4",
-        "-XX:G1MixedGCLiveThresholdPercent=90",
-        "-XX:G1RSetUpdatingPauseTimePercent=5",
-        "-XX:SurvivorRatio=32",
-        "-XX:+PerfDisableSharedMem",
-        "-XX:MaxTenuringThreshold=1",
-        "-XX:ConcGCThreads=2",
-        "-XX:ParallelGCThreads=2",
+        "-XX:SoftRefLRUPolicyMSPerMB=0",
+        "-XX:+UseStringDeduplication",
         "-XX:+UseCompressedOops",
         "-XX:+OptimizeStringConcat",
-        "-XX:+UseStringDeduplication",
-        "-XX:SoftRefLRUPolicyMSPerMB=0",
         # ── Diğer ──
         "-Djava.net.preferIPv4Stack=true",
         "-Dfile.encoding=UTF-8",
@@ -984,6 +930,17 @@ def start_server():
             socketio.emit("server_status", server_state)
             return False, "Jar indirilemedi"
     write_server_config()
+
+    # ── Remap cache: agent diskinden geri yükle (remap'i atla) ──
+    if _pool.agent_count() > 0:
+        log("[Panel] 🔍 Agent'lardan remap cache kontrol ediliyor...")
+        if _restore_remap_cache():
+            log("[Panel] ✅ Remap cache hazır — Paper remapping ATLANABİLİR")
+        else:
+            log("[Panel] ℹ️  Remap cache yok — ilk başlatmada remap yapılacak (UserSwap halleder)")
+    else:
+        log("[Panel] ℹ️  Agent yok — remap cache atlandı")
+
     server_state.update({"status": "starting", "online_players": 0})
     players.clear()
     socketio.emit("server_status", server_state)
@@ -1055,18 +1012,17 @@ def send_command(cmd: str) -> bool:
 
 def _ram_watchdog():
     import psutil
-    _pressure_count  = 0
+    _pressure_count = 0
     _CONT_MB = int(os.environ.get("CONTAINER_RAM_MB", "512"))
-    _US_PATH = USERSWAP_SO   # UserSwap aktifse JVM RSSlimitini artır
+    _US_PATH = USERSWAP_SO
 
     while True:
         eventlet.sleep(8)
         try:
-            # psutil.virtual_memory() Render'da HOST RAM'ini okur → YANLIŞ
-            # Process RSS ile ölç: panel + JVM
+            # psutil.virtual_memory() → Render'da HOST RAM okur (YANLIŞ)
+            # Panel RSS + JVM RSS → gerçek container kullanımı
             try:
-                _ps = psutil.Process(os.getpid())
-                _panel_rss = int(_ps.memory_info().rss / 1024 / 1024)
+                _panel_rss = int(psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024)
             except: _panel_rss = 200
 
             _jvm_rss = 0
@@ -1074,24 +1030,28 @@ def _ram_watchdog():
                 try: _jvm_rss = int(psutil.Process(mc_process.pid).memory_info().rss / 1024 / 1024)
                 except: pass
 
-            used_mb  = _panel_rss + _jvm_rss
+            used_mb = _panel_rss + _jvm_rss
             swap_pct = 0
             try:
                 swp = psutil.swap_memory()
                 swap_pct = swp.percent if swp.total > 0 else 0
             except: pass
 
-            # UserSwap varsa JVM RAM'i dosyaya taşır — panel RSS önemli
-            _us_ok = os.path.exists(_US_PATH)
-            if _us_ok:
-                # JVM UserSwap ile rahat → sadece panel şişerse uyar
+            # Remap aşamasında (status=starting) alarm sustur
+            # UserSwap 4GB dosya swap → JVM taşarsa dosyaya yazar, crash yok
+            _starting  = server_state.get("status") == "starting"
+            _us_ok     = os.path.exists(_US_PATH)
+
+            if _starting:
+                pressure = False  # Remap sırasında RAM spike normal — sessiz kal
+            elif _us_ok:
+                # JVM UserSwap ile RAM'i taşırabilir — sadece panel şişerse uyar
                 pressure = _panel_rss > 300 or swap_pct > 95
             else:
                 pressure = used_mb > (_CONT_MB * 0.88) or swap_pct > 80
 
             if pressure:
                 _pressure_count += 1
-                # Her baskıda: drop_caches + item temizliği
                 try: open("/proc/sys/vm/drop_caches","w").write("1")
                 except: pass
 
