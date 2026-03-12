@@ -8,6 +8,8 @@ services:
       - key: PORT
         value: "5000"
       - key: MC_RAM
-        value: "300M"  # JVM Xmx cap: 300MB (Render free 512MB limit)
+        value: "300M"
+      - key: RENDER_DISK_LIMIT_GB
+        value: "18.0"  # Render free plan disk kotası — psutil host değerini sınırlar
     healthCheckPath: /
     numInstances: 1

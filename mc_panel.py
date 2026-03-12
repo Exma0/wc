@@ -34,6 +34,10 @@ PANEL_PORT = int(os.environ.get("PORT", "5000"))
 MC_VERSION = "1.21.1"
 MC_RAM     = os.environ.get("MC_RAM", "2G")
 
+# ── Render plan limitleri (psutil host değil, tahsis edilen kapasite) ─
+RENDER_RAM_LIMIT_MB  = int(os.environ.get("CONTAINER_RAM_MB",    "512"))
+RENDER_DISK_LIMIT_GB = float(os.environ.get("RENDER_DISK_LIMIT_GB", "18.0"))
+
 # ── Global durum ─────────────────────────────────────────────
 mc_process   = None
 console_buf  = deque(maxlen=3000)
@@ -339,27 +343,41 @@ def get_jvm_args():
     swp   = _ps.swap_memory()
     sw_mb = int(swp.total / 1024 / 1024)
 
-    # Render free: 512MB toplam. Python/Flask/SocketIO/OS ~160-180MB kullanır.
-    # Bu yüzden JVM'e MAX 300MB verebiliriz (güvenli sınır 280MB).
-    # Swap varsa biraz daha ekle ama 512MB'yi geçme (swap ile birlikte).
-    PYTHON_OVERHEAD_MB = 180   # Flask + eventlet + psutil + OS
-    safe_xmx = container_ram_mb - PYTHON_OVERHEAD_MB   # 512-180 = 332 → swap olmadan 280 kapat
-    safe_xmx = min(safe_xmx, 300)                       # Hard üst sınır: 300MB
-    safe_xmx = max(safe_xmx, 160)                       # Hard alt sınır: 160MB
+    # ── JVM Xmx hesabı ───────────────────────────────────────
+    # Paper 1.21.1 Blocks.clinit() için minimum ~400MB heap gerekiyor.
+    # Render free = 512MB RAM. Python/Flask/OS ~160MB overhead.
+    # Swap varsa JVM'e daha fazla verebiliriz (swap'a taşar ama crash etmez).
+    PYTHON_OVERHEAD_MB = 160
 
-    # Swap varsa JVM biraz büyüyebilir ama Render OOM'a dikkat et
     if sw_mb >= 512:
-        bonus = min(sw_mb // 8, 128)   # swap'ın 1/8'i, max +128MB
-        safe_xmx = min(safe_xmx + bonus, 512)
+        # Swap var → JVM heap swap'ı kullanabilir, güvenli Xmx artır
+        safe_xmx = min(container_ram_mb - PYTHON_OVERHEAD_MB + min(sw_mb // 4, 256), 512)
+    else:
+        # Swap yok → RAM tek başına yetmeli. Paper 1.21.1 minimum ~400MB.
+        # 512MB - 160MB = 352MB → yeterli değil. Swap oluşturmayı dene.
+        safe_xmx = container_ram_mb - PYTHON_OVERHEAD_MB
+
+    safe_xmx = min(safe_xmx, 450)   # Hard üst sınır
+    safe_xmx = max(safe_xmx, 256)   # Hard alt sınır
+
+    # Swap yoksa oluşturmayı dene (ana swap başlatmada başarısız olduysa)
+    if sw_mb < 256:
+        log("[Panel] ⚠️  Swap yetersiz → zram oluşturmayı deniyorum...")
+        _try_create_swap_emergency()
+        swp   = _ps.swap_memory()
+        sw_mb = int(swp.total / 1024 / 1024)
+        if sw_mb >= 256:
+            safe_xmx = min(container_ram_mb - PYTHON_OVERHEAD_MB + 128, 450)
+            log(f"[Panel] ✅ Acil swap: {sw_mb}MB → Xmx {safe_xmx}MB'ye güncellendi")
+        else:
+            log(f"[Panel] ⚠️  Swap oluşturulamadı (Render kısıtı?). Xmx={safe_xmx}MB ile devam.")
 
     xmx_mb = safe_xmx
-    xms_mb = 32   # Düşük başla, ihtiyaç oldukça büyüsün
+    xms_mb = 64   # 32'den artırıldı — Paper bootstrap için daha hızlı
 
-    # Agent pool varsa view-distance düşür → daha az chunk → daha az JVM
     agent_count = _pool.agent_count()
     if agent_count >= 2:
-        log(f"[Panel] 🔗 {agent_count} agent mevcut → Xmx artırılabilir")
-        xmx_mb = min(xmx_mb + 32, 340)   # Agent varsa +32MB
+        xmx_mb = min(xmx_mb + 32, 450)
 
     log(f"[Panel] 🧠 Container={container_ram_mb}MB Swap={sw_mb}MB Agents={agent_count} → Xms={xms_mb}M Xmx={xmx_mb}M")
     return [
@@ -372,21 +390,52 @@ def get_jvm_args():
         "-XX:+UnlockExperimentalVMOptions", "-XX:+DisableExplicitGC",
         "-XX:G1PeriodicGCInterval=10000", "-XX:+G1PeriodicGCInvokesConcurrent",
         "-XX:G1NewSizePercent=15", "-XX:G1MaxNewSizePercent=25",
-        "-XX:G1HeapRegionSize=2m",   # Küçük heap → küçük region
+        "-XX:G1HeapRegionSize=2m",
         "-XX:G1ReservePercent=15",
         "-XX:InitiatingHeapOccupancyPercent=20",
         "-XX:SoftRefLRUPolicyMSPerMB=0",
-        # Bellek baskısı azaltma
         "-XX:+UseStringDeduplication",
         "-XX:+UseCompressedOops",
         "-XX:+OptimizeStringConcat",
-        "-XX:+TieredCompilation", "-XX:TieredStopAtLevel=1",  # JIT hızlı, az kod önbelleği
+        "-XX:+TieredCompilation", "-XX:TieredStopAtLevel=1",
         "-Djava.net.preferIPv4Stack=true",
         "-Dfile.encoding=UTF-8", "-Dcom.mojang.eula.agree=true",
-        # GC log sessiz
         "-Xlog:disable",
         "-jar", str(MC_JAR), "--nogui",
     ]
+
+
+def _try_create_swap_emergency():
+    """
+    Başlatmada swap oluşturulamadıysa (Render disk kısıtı vs.)
+    zram ile en azından ~512MB sanal swap oluştur.
+    zram RAM'den sıkıştırarak çalışır — disk kotası gerekmez.
+    """
+    import subprocess as _sp
+    # zram yeniden dene
+    for sz in ["512M", "384M", "256M"]:
+        r = _sp.run(
+            f"modprobe zram num_devices=1 2>/dev/null; "
+            f"echo lz4 > /sys/block/zram0/comp_algorithm 2>/dev/null; "
+            f"echo {sz} > /sys/block/zram0/disksize && "
+            f"mkswap /dev/zram0 && swapon -p 100 /dev/zram0",
+            shell=True, capture_output=True
+        )
+        if r.returncode == 0:
+            return
+    # Disk swap dene (küçük boyutlarla)
+    for sw_mb in [1024, 512, 256]:
+        sf = "/swapfile_mc"
+        _sp.run(f"swapoff {sf} 2>/dev/null; rm -f {sf}", shell=True)
+        r = _sp.run(
+            f"fallocate -l {sw_mb}M {sf} 2>/dev/null || "
+            f"dd if=/dev/zero of={sf} bs=64M count={max(1,sw_mb//64)} status=none",
+            shell=True, capture_output=True
+        )
+        if r.returncode == 0:
+            _sp.run(f"chmod 600 {sf} && mkswap -f {sf} && swapon -p 1 {sf}",
+                    shell=True, capture_output=True)
+            return
 
 
 def start_server():
@@ -939,12 +988,46 @@ def api_performance():
         pool_info = _pool_summary()
         res  = pool_info.get("resources", {})
 
-        # ── Birleşik (ana + tüm agentlar) hesaplama ─────────────
-        main_ram_free_mb  = int(vm.available / 1024 / 1024)
-        main_disk_free_gb = round(dk.free / 1e9, 1)
+        # ── Ana sunucu — Render sınırlı kaynak hesabı ────────────
+        # psutil host makinesinin toplam RAM/Disk'ini okur (10GB+, 400GB+ gibi).
+        # Render free plan 512MB RAM + 18GB disk tahsis eder.
+        # Gerçek kullanımı okuyup tahsis edilen limite karşı sınırla.
+
+        # RAM: cgroup limiti varsa onu, yoksa RENDER_RAM_LIMIT_MB env'ini kullan
+        _ram_cap_mb = RENDER_RAM_LIMIT_MB
+        for _cg in ["/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"]:
+            try:
+                _v = open(_cg).read().strip()
+                if _v not in ("max", "-1"):
+                    _mb = int(_v) // 1024 // 1024
+                    if 64 < _mb < 65536:
+                        _ram_cap_mb = _mb
+                        break
+            except: pass
+        ram_used_capped_mb  = min(int(vm.used / 1024 / 1024), _ram_cap_mb)
+        main_ram_free_mb    = max(0, _ram_cap_mb - ram_used_capped_mb)
+        ram_pct_capped      = round(ram_used_capped_mb / _ram_cap_mb * 100, 1) if _ram_cap_mb else 0
+
+        # Disk: /minecraft dizininin gerçek kullanımı + Render limitine karşı
+        try:
+            import shutil as _sh
+            _mc_used_gb = sum(
+                f.stat().st_size for f in MC_DIR.rglob("*") if f.is_file()
+            ) / 1e9 if MC_DIR.exists() else 0
+        except:
+            _mc_used_gb = 0
+        # Swap dosyaları da hesaba kat
+        _swap_gb = sum(
+            os.path.getsize(f) for f in ["/swapfile", "/swapfile2"] if os.path.exists(f)
+        ) / 1e9
+        disk_used_capped_gb = round(_mc_used_gb + _swap_gb + 3.5, 1)  # 3.5GB sistem + deps
+        disk_used_capped_gb = min(disk_used_capped_gb, RENDER_DISK_LIMIT_GB)
+        main_disk_free_gb   = round(max(0.0, RENDER_DISK_LIMIT_GB - disk_used_capped_gb), 1)
+        disk_pct_capped     = round(disk_used_capped_gb / RENDER_DISK_LIMIT_GB * 100, 1) if RENDER_DISK_LIMIT_GB else 0
+
         agent_ram_mb      = res.get("ram_free_mb",  0)
         agent_disk_gb     = res.get("disk_free_gb", 0)
-        combined_ram_mb   = main_ram_free_mb  + agent_ram_mb
+        combined_ram_mb   = main_ram_free_mb + agent_ram_mb
         combined_disk_gb  = round(main_disk_free_gb + agent_disk_gb, 1)
 
         # Agent başına detay — resource_pool.AgentClient kullanılır
@@ -966,19 +1049,19 @@ def api_performance():
             })
 
         return jsonify({
-            # Ana sunucu
+            # Ana sunucu — Render sınırlı değerler
             "cpu":           round(cpu, 1),
-            "ram_pct":       round(vm.percent, 1),
-            "ram_used_mb":   int(vm.used    / 1024 / 1024),
-            "ram_total_mb":  int(vm.total   / 1024 / 1024),
+            "ram_pct":       ram_pct_capped,
+            "ram_used_mb":   ram_used_capped_mb,
+            "ram_total_mb":  _ram_cap_mb,
             "ram_free_mb":   main_ram_free_mb,
             "swap_total_mb": int(swp.total  / 1024 / 1024),
             "swap_used_mb":  int(swp.used   / 1024 / 1024),
             "swap_free_mb":  int(swp.free   / 1024 / 1024),
             "swap_pct":      round(swp.percent, 1),
-            "disk_pct":      round(dk.percent, 1),
-            "disk_used_gb":  round(dk.used  / 1e9, 1),
-            "disk_total_gb": round(dk.total / 1e9, 1),
+            "disk_pct":      disk_pct_capped,
+            "disk_used_gb":  disk_used_capped_gb,
+            "disk_total_gb": RENDER_DISK_LIMIT_GB,
             "disk_free_gb":  main_disk_free_gb,
             "cpu_count":     psutil.cpu_count(),
             "mc":            mc_info,

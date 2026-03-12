@@ -8,10 +8,14 @@ services:
       - key: PORT
         value: "5000"
       - key: MAIN_URL
-        value: "https://wc-tsgd.onrender.com"   # ← Ana sunucu URL'in
+        value: "https://wc-tsgd.onrender.com"
       - key: RAM_CACHE_MB
-        value: "300"   # Render free: 512MB toplam, 300MB önbelleğe ayır
+        value: "256"   # Render free: 512MB toplam, 256MB önbelleğe ayır
+      - key: RAM_LIMIT_MB
+        value: "512"   # Render free plan RAM kotası — psutil host değerini sınırlar
+      - key: DISK_LIMIT_GB
+        value: "10.0"  # Render free plan disk kotası (agent_data dahil)
     disk:
       name: agent-disk
       mountPath: /agent_data
-      sizeGB: 10    # Render'da disk eklenebiliyorsa artır
+      sizeGB: 10

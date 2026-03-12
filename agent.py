@@ -38,8 +38,9 @@ NODE_ID      = (
 )
 
 DATA_DIR     = Path("/agent_data")          # Dosya deposu
-RAM_CACHE_MB = int(os.environ.get("RAM_CACHE_MB", "256"))  # RAM önbelleği boyutu
-DISK_LIMIT_GB= 14.0                         # Disk limiti (Render ~18GB)
+RAM_CACHE_MB  = int(os.environ.get("RAM_CACHE_MB",   "256"))  # RAM önbelleği boyutu
+RAM_LIMIT_MB  = int(os.environ.get("RAM_LIMIT_MB",   "512"))  # Render plan RAM kotası
+DISK_LIMIT_GB = float(os.environ.get("DISK_LIMIT_GB", "10.0")) # Render plan Disk kotası (agent)
 # ─────────────────────────────────────────────
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -511,28 +512,52 @@ def cpu_queue():
 def _get_resource_info() -> dict:
     import psutil
     vm   = psutil.virtual_memory()
-    disk = psutil.disk_usage("/")
     cpu  = psutil.cpu_count(logical=True)
     try:
         load1, load5, _ = os.getloadavg()
     except:
         load1 = load5 = 0.0
-    # DÜZELTİLDİ: tunnel alanı state'den alınıyor — boşsa da dahil ediliyor.
-    # Heartbeat tünel hazır olmadan giderse ana sunucu URL'yi bilemez,
-    # bu yüzden _register_loop tünel hazır olana kadar bekliyor (değişmedi).
+
+    # ── Render sınırlı RAM hesabı ────────────────────────────
+    # psutil.virtual_memory() host makinesinin RAM'ini okur (10-30GB gibi).
+    # Render free plan gerçekte 512MB tahsis eder. Sınırı ortam değişkeninden
+    # veya cgroup'tan okuyarak doğru değeri bildir.
+    agent_ram_limit_mb = RAM_LIMIT_MB   # env: RAM_LIMIT_MB (varsayılan 512)
+    for cg in ["/sys/fs/cgroup/memory.max",
+               "/sys/fs/cgroup/memory/memory.limit_in_bytes"]:
+        try:
+            val = open(cg).read().strip()
+            if val not in ("max", "-1"):
+                mb = int(val) // 1024 // 1024
+                if 64 < mb < 65536:
+                    agent_ram_limit_mb = mb
+                    break
+        except: pass
+
+    # Kullanılan RAM = min(gerçek kullanım, limit)
+    ram_used_mb  = min(int(vm.used  / 1024 / 1024), agent_ram_limit_mb)
+    ram_total_mb = agent_ram_limit_mb
+    ram_free_mb  = max(0, ram_total_mb - ram_used_mb)
+
+    # ── Render sınırlı Disk hesabı ───────────────────────────
+    # Disk kullanımı sadece /agent_data altındaki dosyalar üzerinden hesaplanır.
+    # Host filesystem toplam boyutu (400GB+) gösterilmez.
+    disk_store_gb = round(_disk_used_gb(), 2)
+    disk_free_gb  = round(max(0.0, DISK_LIMIT_GB - disk_store_gb - 0.3), 2)  # 0.3GB sistem rezervi
+
     return {
         "node_id":      NODE_ID,
         "tunnel":       state["tunnel"],
         "ram": {
-            "total_mb":   vm.total  // 1024 // 1024,
-            "free_mb":    vm.available // 1024 // 1024,
+            "total_mb":   ram_total_mb,
+            "free_mb":    ram_free_mb,
             "cache_mb":   ram_cache.stats["used_mb"],
             "cache_keys": ram_cache.stats["keys"],
         },
         "disk": {
-            "total_gb": round(disk.total / 1e9, 1),
-            "free_gb":  round(disk.free  / 1e9, 1),
-            "store_gb": round(_disk_used_gb(), 2),
+            "total_gb": DISK_LIMIT_GB,
+            "free_gb":  disk_free_gb,
+            "store_gb": disk_store_gb,
         },
         "cpu": {
             "cores":  cpu,
