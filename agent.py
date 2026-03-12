@@ -40,7 +40,8 @@ NODE_ID      = (
 DATA_DIR     = Path("/agent_data")          # Dosya deposu
 RAM_CACHE_MB  = int(os.environ.get("RAM_CACHE_MB",   "256"))  # RAM önbelleği boyutu
 RAM_LIMIT_MB  = int(os.environ.get("RAM_LIMIT_MB",   "512"))  # Render plan RAM kotası
-DISK_LIMIT_GB = float(os.environ.get("DISK_LIMIT_GB", "10.0")) # Render plan Disk kotası (agent)
+DISK_LIMIT_GB = float(os.environ.get("DISK_LIMIT_GB", "17.5")) # Render plan Disk kotası
+AGENT_OVERHEAD_MB = 130  # Flask + psutil + OS taban kullanımı (~130MB)
 # ─────────────────────────────────────────────
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -511,47 +512,36 @@ def cpu_queue():
 
 def _get_resource_info() -> dict:
     import psutil
-    vm   = psutil.virtual_memory()
     cpu  = psutil.cpu_count(logical=True)
     try:
         load1, load5, _ = os.getloadavg()
     except:
         load1 = load5 = 0.0
 
-    # ── Render sınırlı RAM hesabı ────────────────────────────
-    # psutil.virtual_memory() host makinesinin RAM'ini okur (10-30GB gibi).
-    # Render free plan gerçekte 512MB tahsis eder. Sınırı ortam değişkeninden
-    # veya cgroup'tan okuyarak doğru değeri bildir.
-    agent_ram_limit_mb = RAM_LIMIT_MB   # env: RAM_LIMIT_MB (varsayılan 512)
-    for cg in ["/sys/fs/cgroup/memory.max",
-               "/sys/fs/cgroup/memory/memory.limit_in_bytes"]:
-        try:
-            val = open(cg).read().strip()
-            if val not in ("max", "-1"):
-                mb = int(val) // 1024 // 1024
-                if 64 < mb < 65536:
-                    agent_ram_limit_mb = mb
-                    break
-        except: pass
+    # ── Render sınırlı RAM ──────────────────────────────────
+    # psutil.virtual_memory() host RAM'ini okur (10-30GB) — yanıltıcı.
+    # Kendi process RSS + ram_cache kullanımı üzerinden hesapla.
+    try:
+        my_rss_mb = int(psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024)
+    except:
+        my_rss_mb = AGENT_OVERHEAD_MB
+    cache_mb     = ram_cache.stats["used_mb"]
+    agent_used_mb = max(my_rss_mb, AGENT_OVERHEAD_MB)  # en az overhead kadar say
+    ram_free_mb  = max(0, RAM_LIMIT_MB - agent_used_mb)
 
-    # Kullanılan RAM = min(gerçek kullanım, limit)
-    ram_used_mb  = min(int(vm.used  / 1024 / 1024), agent_ram_limit_mb)
-    ram_total_mb = agent_ram_limit_mb
-    ram_free_mb  = max(0, ram_total_mb - ram_used_mb)
-
-    # ── Render sınırlı Disk hesabı ───────────────────────────
-    # Disk kullanımı sadece /agent_data altındaki dosyalar üzerinden hesaplanır.
-    # Host filesystem toplam boyutu (400GB+) gösterilmez.
+    # ── Render sınırlı Disk ─────────────────────────────────
+    # Sadece /agent_data kullanımını ölç — host FS değil.
     disk_store_gb = round(_disk_used_gb(), 2)
-    disk_free_gb  = round(max(0.0, DISK_LIMIT_GB - disk_store_gb - 0.3), 2)  # 0.3GB sistem rezervi
+    disk_free_gb  = round(max(0.0, DISK_LIMIT_GB - disk_store_gb), 2)
 
     return {
         "node_id":      NODE_ID,
         "tunnel":       state["tunnel"],
         "ram": {
-            "total_mb":   ram_total_mb,
+            "total_mb":   RAM_LIMIT_MB,
             "free_mb":    ram_free_mb,
-            "cache_mb":   ram_cache.stats["used_mb"],
+            "used_mb":    agent_used_mb,
+            "cache_mb":   cache_mb,
             "cache_keys": ram_cache.stats["keys"],
         },
         "disk": {

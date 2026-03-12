@@ -141,61 +141,42 @@ def bypass_cgroups():
 
 
 def setup_swap():
-    # ── 1. zRAM (disk kotası gerektirmez, her zaman çalışır) ──
+    # ── 1. zRAM — disk kotası gerektirmez, her zaman çalışır ──
     sh("modprobe zram num_devices=1 2>/dev/null")
     w("/sys/block/zram0/comp_algorithm", "lz4")
-    # 512MB zram → ~50% sıkıştırma ile ~1GB sanal swap
     zram_ok = False
     for zram_sz in ["512M", "384M", "256M", "128M"]:
         w("/sys/block/zram0/disksize", zram_sz)
-        if sh(f"mkswap /dev/zram0 && swapon -p 100 /dev/zram0").returncode == 0:
+        if sh("mkswap /dev/zram0 2>/dev/null && swapon -p 100 /dev/zram0 2>/dev/null").returncode == 0:
             print(f"  ✅ zram: {zram_sz}")
             zram_ok = True
             break
     if not zram_ok:
-        print("  ⚠️  zram başlatılamadı")
+        print("  ⚠️  zram başlatılamadı (Render kısıtı)")
 
-    # ── 2. Disk swap ──────────────────────────────────────────
-    # Render free disk: 18GB tahsis, ancak psutil host FS'i okur.
-    # Disk kullanımını doğrudan ölç.
-    try:
-        import shutil as _sh
-        # Render container'ında gerçek kullanımı: jar + minecraft + deps ~5GB
-        # Disk swap için ne kadar alan var?
-        disk_free_real_gb = _sh.disk_usage("/").free / 1024**3
-        # Render'ın 18GB kotasından güvenli alan: min(gerçek boş, 18GB limiti içinde boş)
-        # Swap dosyaları için 4-6GB deneyelim
-        sw_gb = min(4.0, max(0.0, min(disk_free_real_gb, RENDER_DISK_LIMIT_GB) - 8.0))
-        sw_mb = int(sw_gb * 1024)
-    except:
-        sw_mb = 0
-
-    if sw_mb >= 256:
-        sf = "/swapfile"
+    # ── 2. Disk Swap ─────────────────────────────────────────
+    # Render 18GB disk tahsis eder. Sistem + deps ~4GB kullanır.
+    # MC jar + dünya ~2GB. Swap için 4-6GB ayırabiliriz.
+    for sw_mb, sf in [(4096, "/swapfile"), (2048, "/swapfile"), (1024, "/swapfile"), (512, "/swapfile")]:
         if os.path.exists(sf): sh(f"swapoff {sf} 2>/dev/null")
         try: os.remove(sf)
         except: pass
-        # Önce fallocate dene, başarısız olursa küçük boyutlarla dd dene
-        created = False
-        for try_mb in [sw_mb, sw_mb // 2, 512, 256]:
-            if try_mb < 256:
+        r = sh(f"fallocate -l {sw_mb}M {sf} 2>/dev/null")
+        if r.returncode != 0:
+            r = sh(f"dd if=/dev/zero of={sf} bs=64M count={max(1,sw_mb//64)} status=none 2>/dev/null")
+        if r.returncode == 0 and os.path.exists(sf) and os.path.getsize(sf) >= sw_mb * 1024 * 900:
+            sh(f"chmod 600 {sf} && mkswap -f {sf} 2>/dev/null")
+            if sh(f"swapon -p 0 {sf} 2>/dev/null").returncode == 0:
+                print(f"  ✅ Disk Swap: {sw_mb}MB")
                 break
-            r = sh(f"fallocate -l {try_mb}M {sf} 2>/dev/null")
-            if r.returncode != 0:
-                r = sh(f"dd if=/dev/zero of={sf} bs=64M count={max(1,try_mb//64)} status=none 2>/dev/null")
-            if r.returncode == 0 and os.path.exists(sf):
-                sh(f"chmod 600 {sf} && mkswap -f {sf}")
-                if sh(f"swapon -p 0 {sf}").returncode == 0:
-                    print(f"  ✅ Disk Swap: {try_mb}MB")
-                    created = True
-                    break
-                else:
-                    try: os.remove(sf)
-                    except: pass
-        if not created:
-            print(f"  ⚠️  Disk swap oluşturulamadı (Render disk kotası dolu olabilir)")
+            else:
+                try: os.remove(sf)
+                except: pass
+        else:
+            try: os.remove(sf)
+            except: pass
     else:
-        print(f"  ℹ️  Disk swap atlandı (boş alan yetersiz, zram kullanılıyor)")
+        print("  ⚠️  Disk swap oluşturulamadı (Render disk kısıtı?). Yalnızca zram aktif.")
 
     for p, v in [
         ("/proc/sys/vm/swappiness",         "100"),
