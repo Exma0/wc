@@ -287,6 +287,28 @@ class ResourcePool:
             self._log(f"[Pool] 📤 Region arşivlendi: {dimension}/{region_file.name} → {agent.node_id}")
         return ok
 
+    def store_region_backup(self, dimension: str, region_file: Path) -> bool:
+        """
+        Region dosyasını agent diskine YEDEK olarak gönder (orijinali SİLMEZ).
+        Round-robin: tüm agentlara dağıt, disk dolmayan birini seç.
+        """
+        agents = self.get_agents()
+        if not agents:
+            return False
+        # En çok boş disk olan agenta yükle
+        agent = max(agents, key=lambda a: a.info.get("disk", {}).get("free_gb", 0))
+        if agent.info.get("disk", {}).get("free_gb", 0) < 0.5:
+            return False   # Disk dolmak üzere — atla
+        try:
+            data = region_file.read_bytes()
+            ok = agent.file_upload("regions", f"{dimension}/{region_file.name}", data)
+            if ok:
+                self._log(f"[Pool] 💾 Yedek: {dimension}/{region_file.name} → {agent.node_id}")
+            return ok
+        except Exception as e:
+            self._log(f"[Pool] ⚠️  Yedek hata: {region_file.name}: {e}")
+            return False
+
     def fetch_region(self, dimension: str, filename: str,
                      dest: Path) -> bool:
         """Agent'lardan region dosyasını indir."""

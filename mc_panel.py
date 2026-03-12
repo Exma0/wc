@@ -240,6 +240,124 @@ def _auto_archive_old_regions(older_than_days: int = 0):
     return archived, freed_mb
 
 
+
+def _world_backup_loop():
+    """
+    Her 3 dakikada MC world/*.mca dosyalarını agent diskine YEDEK olarak gönder.
+    Silmez — sadece kopyalar. Agent'ların 140GB Disk Deposunu doldurur.
+    """
+    import hashlib as _hlib
+    _sent_hashes: dict = {}   # path → md5 — sadece değişenleri gönder
+
+    def _file_md5(path):
+        try:
+            return _hlib.md5(open(path, "rb").read(256*1024)).hexdigest()
+        except: return ""
+
+    # İlk bekleme: MC + agent'lar hazır olsun
+    time.sleep(60)
+
+    while True:
+        try:
+            if not (mc_process and mc_process.poll() is None):
+                time.sleep(30); continue
+            if _pool.agent_count() == 0:
+                time.sleep(30); continue
+
+            sent = 0
+            for dim_dir in [
+                MC_DIR / "world" / "region",
+                MC_DIR / "world_nether" / "DIM-1" / "region",
+                MC_DIR / "world_the_end" / "DIM1" / "region",
+            ]:
+                if not dim_dir.exists():
+                    continue
+                dim = dim_dir.parts[-3]
+                for rf in dim_dir.glob("*.mca"):
+                    try:
+                        md5 = _file_md5(rf)
+                        cache_key = f"{dim}/{rf.name}"
+                        if _sent_hashes.get(cache_key) == md5:
+                            continue   # Değişmemiş — atla
+                        ok = _pool.store_region_backup(dim, rf)
+                        if ok:
+                            _sent_hashes[cache_key] = md5
+                            sent += 1
+                    except Exception:
+                        continue
+
+            if sent:
+                log(f"[Pool] 💾 Dünya yedeklendi: {sent} region → agent disk")
+                socketio.emit("pool_update", _pool_summary())
+        except Exception as e:
+            log(f"[Pool] ⚠️  Yedek hatası: {e}")
+        time.sleep(180)   # 3 dakika
+
+
+def _ram_cache_warm_loop():
+    """
+    Agent RAM Cache'ini statik MC dosyalarıyla doldur:
+      • server.jar (47MB)
+      • plugins/*.jar
+      • configs: paper.yml, spigot.yml, bukkit.yml, server.properties
+    Böylece 8 × 382MB = ~3GB agent RAM aktif kullanılır.
+    """
+    time.sleep(45)  # Agentlar bağlansın
+
+    def _push_file(path: Path, key: str):
+        try:
+            data = path.read_bytes()
+            ok = _pool.cache_set(key, data)
+            if ok:
+                log(f"[Pool] 🧠 Cache: {key} ({len(data)//1024}KB) → agent RAM")
+            return ok
+        except Exception as e:
+            return False
+
+    cached = 0
+
+    # 1. Server JAR
+    if MC_JAR.exists():
+        if _push_file(MC_JAR, "mc/server.jar"):
+            cached += 1
+
+    # 2. Config dosyaları
+    for cfg in ["paper.yml", "spigot.yml", "bukkit.yml", "server.properties",
+                "paper-world-defaults.yml", "config/paper-global.yml"]:
+        p = MC_DIR / cfg
+        if p.exists():
+            if _push_file(p, f"mc/config/{cfg}"):
+                cached += 1
+
+    # 3. Plugin JARlar
+    plugins_dir = MC_DIR / "plugins"
+    if plugins_dir.exists():
+        for pjar in sorted(plugins_dir.glob("*.jar"))[:20]:   # max 20 plugin
+            if _push_file(pjar, f"mc/plugins/{pjar.name}"):
+                cached += 1
+
+    if cached:
+        log(f"[Pool] 🧠 RAM Cache ısındı: {cached} dosya → agent RAM")
+        socketio.emit("pool_update", _pool_summary())
+
+    # Periyodik config güncelleme (10 dakikada bir)
+    while True:
+        time.sleep(600)
+        try:
+            if _pool.agent_count() == 0:
+                continue
+            refreshed = 0
+            for cfg in ["server.properties", "paper.yml", "spigot.yml"]:
+                p = MC_DIR / cfg
+                if p.exists():
+                    if _pool.cache_set(f"mc/config/{cfg}", p.read_bytes()):
+                        refreshed += 1
+            if refreshed:
+                socketio.emit("pool_update", _pool_summary())
+        except Exception:
+            pass
+
+
 def _pool_auto_optimize():
     """
     1) Agent gelene kadar bekle (maks 90sn)
@@ -1976,7 +2094,9 @@ init();
 threading.Thread(target=_ram_monitor,        daemon=True).start()
 threading.Thread(target=_ram_watchdog,       daemon=True).start()
 # _pool_health_watchdog KALDIRILDI: resource_pool.health_monitor() zaten arka planda çalışıyor
-threading.Thread(target=_pool_auto_optimize, daemon=True).start()
+threading.Thread(target=_pool_auto_optimize,  daemon=True).start()
+threading.Thread(target=_world_backup_loop,   daemon=True).start()  # Agent disk doldur
+threading.Thread(target=_ram_cache_warm_loop, daemon=True).start()  # Agent RAM doldur
 _pool.set_logger(log)   # Panel log fonksiyonunu pool'a inject et
 
 if __name__ == "__main__":
