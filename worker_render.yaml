@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: mc-worker
+    runtime: docker
+    dockerfilePath: ./worker.Dockerfile
+    plan: free
+    envVars:
+      - key: PORT
+        value: "5000"
+      - key: MAIN_URL
+        value: "https://wc-tsgd.onrender.com"   # ← Ana sunucu URL'in
+    disk:
+      name: worker-disk
+      mountPath: /
+      sizeGB: 1    # Render free: disk ek ekleyemezsin ama /tmp 512MB var

@@ -612,6 +612,42 @@ def api_tunnel():
     return jsonify(tunnel_info)
 
 
+@app.route("/api/worker/register", methods=["POST"])
+def api_worker_register():
+    """
+    Worker servisi başladığında buraya bildirim gönderir.
+    main.py'deki _worker_registered event'ini tetikler → NBD bağlantısı kurulur.
+    """
+    import sys as _sys
+    d = request.json or {}
+    host    = d.get("worker_host", "")
+    nbd_gb  = d.get("nbd_gb", 0)
+    log(f"[Panel] ⚙️  Worker bildirildi: {host} ({nbd_gb}GB)")
+
+    # main.py'deki event'i tetikle (aynı process'te çalışıyor)
+    main_mod = _sys.modules.get("__main__")
+    if main_mod:
+        info = getattr(main_mod, "_worker_info", {})
+        info["worker_host"] = host
+        info["nbd_gb"]      = nbd_gb
+        ev = getattr(main_mod, "_worker_registered", None)
+        if ev:
+            ev.set()
+
+    socketio.emit("worker_update", {"host": host, "nbd_gb": nbd_gb})
+    return jsonify({"ok": True, "message": f"Worker {host} kaydedildi"})
+
+
+@app.route("/api/worker/status")
+def api_worker_status():
+    import sys as _sys
+    main_mod = _sys.modules.get("__main__")
+    info = {}
+    if main_mod:
+        info = getattr(main_mod, "_worker_info", {})
+    return jsonify(info)
+
+
 @app.route("/api/players")
 def api_players():
     send_command("list")

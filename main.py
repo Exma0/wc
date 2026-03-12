@@ -353,6 +353,74 @@ def auto_start_sequence():
 #  MAIN
 # ══════════════════════════════════════════════════════════════
 
+
+# ══════════════════════════════════════════════════════════════
+#  WORKER NBD — 2. Render hesabının diskini swap olarak bağla
+# ══════════════════════════════════════════════════════════════
+# render.yaml'a WORKER_HOST=xxx.trycloudflare.com ekle
+# VEYA worker servisi otomatik olarak /api/worker/register'a bildirir.
+
+_worker_registered = threading.Event()
+_worker_info       = {}
+
+
+def connect_worker_nbd(host: str, local_port: int = 10810, nbd_dev: str = "/dev/nbd0"):
+    """
+    1. cloudflared access TCP → yerel port aç
+    2. nbd-client → /dev/nbd0
+    3. mkswap + swapon (öncelik 5)
+    """
+    print(f"\n  [worker-nbd] Bağlanılıyor: {host}...")
+
+    sh("modprobe nbd max_part=0 2>/dev/null")
+
+    # cloudflared access TCP tüneli → yerel port
+    cf_proc = subprocess.Popen([
+        "cloudflared", "access", "tcp",
+        "--hostname", host,
+        "--url", f"localhost:{local_port}",
+    ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    time.sleep(4)
+
+    # nbd-client
+    ret = sh(f"nbd-client localhost {local_port} {nbd_dev} -N disk -b 4096 -t 60")
+    if ret.returncode != 0:
+        print(f"  ⚠️  nbd-client başarısız: {ret.stderr.decode().strip()}")
+        cf_proc.terminate()
+        return False
+
+    sh(f"mkswap {nbd_dev}")
+    ret2 = sh(f"swapon -p 5 {nbd_dev}")   # öncelik 5 > yerel disk (0) < zram (100)
+    if ret2.returncode == 0:
+        import psutil as _p
+        swp = _p.swap_memory()
+        mem = _p.virtual_memory()
+        print(f"  ✅ Worker diski swap'a eklendi!")
+        print(f"  🎯 YENİ TOPLAM: RAM={mem.total//1024//1024}MB"
+              f" + Swap={swp.total//1024//1024}MB"
+              f" = {(mem.total+swp.total)//1024//1024}MB")
+        return True
+    else:
+        print(f"  ⚠️  swapon worker: {ret2.stderr.decode().strip()}")
+        return False
+
+
+def try_connect_worker():
+    """Env'den WORKER_HOST varsa bağlan, yoksa bildirim bekle (90sn)."""
+    host = os.environ.get("WORKER_HOST", "").strip()
+    if host:
+        print(f"  [worker] WORKER_HOST env: {host}")
+        connect_worker_nbd(host)
+        return
+    print("  [worker] WORKER_HOST bekleniyor (90sn timeout)...")
+    if _worker_registered.wait(timeout=90):
+        host = _worker_info.get("worker_host", "")
+        if host:
+            connect_worker_nbd(host)
+    else:
+        print("  [worker] Timeout — worker yok, lokal swap ile devam")
+
+
 print("\n" + "━"*52)
 print("  ⛏️   Minecraft Server — RENDER BYPASS v5.0")
 print(f"      PORT={PORT}  |  MC_RAM={MC_RAM}")
@@ -363,9 +431,11 @@ optimize_all()
 
 panel_proc = start_panel()
 threading.Thread(target=auto_start_sequence, daemon=True).start()
+threading.Thread(target=try_connect_worker, daemon=True).start()
 
 print(f"\n{'━'*52}")
 print(f"  Panel: http://0.0.0.0:{PORT}")
 print(f"{'━'*52}\n")
 
 panel_proc.wait()
+
