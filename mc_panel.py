@@ -212,8 +212,15 @@ def _auto_archive_old_regions(older_than_days: int = 0):
             continue
         dim = dim_dir.parts[-3]
 
+        import shutil as _shu2
+        disk_free_gb = _shu2.disk_usage("/").free / 1e9
+        # Disk %70'den fazla doluysa tüm regionları arşivle;
+        # değilse sadece eski olanları (older_than_days)
+        force_all = disk_free_gb < 5.0
+
         for rf in sorted(dim_dir.glob("*.mca"), key=lambda f: f.stat().st_mtime):
-            if (now - rf.stat().st_mtime) / 86400 < older_than_days:
+            age_days = (now - rf.stat().st_mtime) / 86400
+            if not force_all and age_days < older_than_days:
                 continue
             if _pool.region_exists_remote(dim, rf.name):
                 continue   # Zaten uzakta
@@ -228,14 +235,7 @@ def _auto_archive_old_regions(older_than_days: int = 0):
 
     if archived > 0:
         new_free_gb = _sh.disk_usage("/").free / 1e9
-        sw_mb = min(6144, int(new_free_gb * 0.7 * 1024))
-        sf2   = "/swapfile2"
-        # swapoff atlandı — Render'da swapon zaten çalışmadı
-        try:
-            if Path(sf2).exists(): Path(sf2).unlink()
-        except: pass
-        # swap genişletme atlandı (Render EPERM)
-        log(f"[Pool] 💾 {archived} region arşivlendi ({freed_mb:.0f}MB) → disk açıldı")
+        log(f"[Pool] 💾 {archived} region arşivlendi ({freed_mb:.0f}MB) → Ana disk:{new_free_gb:.1f}GB boş")
 
     return archived, freed_mb
 
@@ -256,10 +256,16 @@ def _pool_auto_optimize():
     # Render.com'da swapon çalışmaz (EPERM) — swap denemesi atlandı
     log("[Pool] ℹ️  Render: swapon izin verilmiyor → swap yok, overcommit aktif")
 
+    import shutil as _sh2
+    disk_free_gb = _sh2.disk_usage("/").free / 1e9
+    # Disk 5GB'den azsa acil arşiv; değilse 7 günden eski regionlar
+    days = 0 if disk_free_gb < 5.0 else 7
     try:
-        result = _auto_archive_old_regions(older_than_days=0)
-        if result:
-            log(f"[Pool] 📦 İlk arşiv: {result[0]} region, {result[1]:.0f}MB")
+        result = _auto_archive_old_regions(older_than_days=days)
+        if result and result[0]:
+            log(f"[Pool] 📦 İlk arşiv: {result[0]} region, {result[1]:.0f}MB (≥{days}gün eski veya disk kritik)")
+        else:
+            log(f"[Pool] ℹ️  Arşiv: henüz arşivlenecek region yok (disk:{disk_free_gb:.1f}GB boş, eşik:{days}gün)")
         socketio.emit("pool_update", _pool_summary())
     except Exception as e:
         log(f"[Pool] ⚠️  İlk arşiv hatası: {e}")
@@ -267,7 +273,10 @@ def _pool_auto_optimize():
     while True:
         time.sleep(300)
         try:
-            _auto_archive_old_regions(older_than_days=0)
+            import shutil as _sh3
+            disk_free_gb2 = _sh3.disk_usage("/").free / 1e9
+            days2 = 0 if disk_free_gb2 < 5.0 else 7
+            _auto_archive_old_regions(older_than_days=days2)
             socketio.emit("pool_update", _pool_summary())
         except Exception as e:
             log(f"[Pool] ⚠️  Arşiv hatası: {e}")
@@ -368,32 +377,34 @@ def get_jvm_args():
     log(f"[Panel] 🧠 Container={container_ram_mb}MB Swap=0MB Agents={agent_count} → Xms={xms_mb}M Xmx={xmx_mb}M")
     return [
         "java", f"-Xms{xms_mb}M", f"-Xmx{xmx_mb}M",
-        # ── Bellek alanları — tümü küçük tutuldu (512MB kota) ──
-        "-XX:MaxMetaspaceSize=96m",       # default 512MB → 96MB yeter
+        # ── Bellek alanları (512MB container için kesin sınırlar) ──
+        # Toplam JVM RSS ≈ Xmx(220) + Meta(96) + Code(28) + Class(24) + Stacks(14) = 382MB
+        # Python panel + OS ≈ 130MB → 382+130 = 512MB TAMAM
+        "-XX:MaxMetaspaceSize=96m",
         "-XX:CompressedClassSpaceSize=24m",
         "-XX:ReservedCodeCacheSize=28m",
-        "-Xss256k",                        # thread stack — Paper 256k'da sorunsuz
-        # ── GC: G1 + küçük heap için ayarlar ──
+        "-Xss256k",
+        # ── DirectBuffer: SINIR YOK ──
+        # Paper MC Netty için 32-128MB DirectBuffer gerekir.
+        # MaxDirectMemorySize=32m CRASH yaratır (OOM: Cannot reserve direct buffer).
+        # Sınır belirtilmezse JVM varsayılan = Xmx (220MB) olur → yeterli.
+        # ── GC: G1 ──
         "-XX:+UseG1GC",
         "-XX:+ParallelRefProcEnabled",
-        "-XX:MaxGCPauseMillis=100",        # daha sık ama kısa GC pause
+        "-XX:MaxGCPauseMillis=100",
         "-XX:ConcGCThreads=1",
-        "-XX:ParallelGCThreads=1",         # tek vCPU'ya göre
+        "-XX:ParallelGCThreads=1",
         "-XX:+UnlockExperimentalVMOptions",
         "-XX:+DisableExplicitGC",
         "-XX:G1NewSizePercent=20",
         "-XX:G1MaxNewSizePercent=40",
         "-XX:G1HeapRegionSize=2m",
         "-XX:G1ReservePercent=10",
-        "-XX:InitiatingHeapOccupancyPercent=15",  # GC'yi erken başlat
-        "-XX:SoftRefLRUPolicyMSPerMB=0",           # soft ref → hemen sil
+        "-XX:InitiatingHeapOccupancyPercent=15",
+        "-XX:SoftRefLRUPolicyMSPerMB=0",
         "-XX:+UseStringDeduplication",
         "-XX:+UseCompressedOops",
         "-XX:+OptimizeStringConcat",
-        # ── Overcommit + agresif bellek iade ──
-        "-XX:+AlwaysPreTouch",             # heap'i önceden fiziksel belleğe map et
-        "-XX:+UseTransparentHugePages",    # THP — büyük sayfa desteği
-        "-XX:MaxDirectMemorySize=32m",     # NIO direct buffer sınırı
         # ── Diğer ──
         "-Djava.net.preferIPv4Stack=true",
         "-Dfile.encoding=UTF-8",
@@ -436,13 +447,15 @@ def start_server():
     # MC başlatılınca mevcut tüm agent'lara proxy aç
     def _start_all_proxies():
         import time as _t
-        _t.sleep(15)  # MC port hazır olana kadar bekle
+        _t.sleep(20)  # MC tüneli hazır olana kadar bekle
+        # Agent proxy'si ana MC tünel host'una yönlendirilmeli (127.0.0.1 değil).
+        # Cloudflare TCP tüneli olmadan dış bağlantı aktarılamaz — proxy şimdilik pasif.
+        mc_host = tunnel_info.get("host", "")
+        if not mc_host:
+            log("[Pool] ℹ️  Proxy: MC tüneli henüz hazır değil, proxy atlandı")
+            return
         agents = _pool.get_agents()
-        for ag in agents:
-            if not ag.info.get("proxy", {}).get("active"):
-                ok = ag.proxy_start("127.0.0.1", MC_PORT, listen_port=MC_PORT)
-                if ok:
-                    log(f"[Pool] 🔀 Proxy başlatıldı: {ag.node_id}")
+        log(f"[Pool] ℹ️  Proxy: {len(agents)} agent bağlı, MC tüneli üzerinden yönlendirme yapılamıyor (Cloudflare TCP sınırı) — RAM Cache + Disk aktif")
     if _pool.agent_count() > 0:
         threading.Thread(target=_start_all_proxies, daemon=True).start()
     return True, "Başlatılıyor..."
@@ -615,15 +628,10 @@ def api_agent_register():
             f"CPU:{d.get('cpu',{}).get('cores',0)} core")
         # ── Proxy otomatik başlat ──────────────────────────────
         # MC çalışıyorsa yeni agent'ta hemen proxy aç
-        if mc_process and mc_process.poll() is None:
-            def _auto_proxy(nid, turl):
-                import time as _t; _t.sleep(3)  # Agent'ın hazır olmasını bekle
-                agent = _pool.agents.get(nid)
-                if agent and not agent.info.get("proxy", {}).get("active"):
-                    ok = agent.proxy_start("127.0.0.1", MC_PORT, listen_port=MC_PORT)
-                    if ok:
-                        log(f"[Pool] 🔀 Otomatik proxy: {nid} → 127.0.0.1:{MC_PORT}")
-            threading.Thread(target=_auto_proxy, args=(node_id, tunnel_url), daemon=True).start()
+        # Proxy otomatik başlatma devre dışı:
+        # Agent'tan ana sunucuya TCP tüneli Cloudflare HTTP tünel üzerinden çalışmıyor.
+        # Agent'lar RAM Cache + Disk Store ile katkı sağlıyor.
+        pass
     socketio.emit("pool_update", _pool_summary())
     return jsonify({"ok": True})
 
