@@ -141,40 +141,34 @@ def bypass_cgroups():
 
 
 def setup_swap():
-    # ── 1. zRAM — disk kotası gerektirmez ────────────────────
+    # ── 1. zRAM ──────────────────────────────────────────────
     sh("modprobe zram num_devices=1 2>/dev/null")
     w("/sys/block/zram0/comp_algorithm", "lz4")
     zram_ok = False
     for zram_sz in ["512M", "384M", "256M", "128M"]:
-        # Her denemeden önce sıfırla
         sh("echo 0 > /sys/block/zram0/reset 2>/dev/null")
-        if not w("/sys/block/zram0/disksize", zram_sz):
-            break
-        if sh(f"mkswap /dev/zram0 2>/dev/null && swapon -p 100 /dev/zram0 2>/dev/null").returncode == 0:
+        w("/sys/block/zram0/disksize", zram_sz)
+        if sh("mkswap /dev/zram0 2>/dev/null && swapon -p 100 /dev/zram0 2>/dev/null").returncode == 0:
             print(f"  ✅ zram: {zram_sz}")
             zram_ok = True
             break
     if not zram_ok:
         print("  ⚠️  zram başlatılamadı")
 
-    # ── 2. Disk Swap ─────────────────────────────────────────
-    # SORUN: Docker overlay2 üzerinde doğrudan swapon çalışmaz.
-    # ÇÖZÜM: Loop device kullan → overlay2 kısıtını aşar.
-    #   fallocate → losetup /dev/loop0 → mkswap /dev/loop0 → swapon /dev/loop0
-    sf = "/swapfile"
+    # ── 2. Disk Swap — LOOP DEVICE (Docker overlay2 sorunu) ──
+    # Docker overlay2 üzerinde doğrudan swapon çalışmaz.
+    # Çözüm: fallocate → losetup /dev/loop0 → mkswap loop → swapon loop
     disk_swap_ok = False
-
+    sf = "/swapfile"
     for sw_mb in [4096, 2048, 1024, 512]:
-        # Önceki deneyi temizle
         sh("swapoff /dev/loop0 2>/dev/null; losetup -d /dev/loop0 2>/dev/null")
         try:
             if os.path.exists(sf): os.remove(sf)
         except: pass
 
-        # Dosya oluştur
         r = sh(f"fallocate -l {sw_mb}M {sf} 2>/dev/null")
         if r.returncode != 0:
-            r = sh(f"dd if=/dev/zero of={sf} bs=64M count={max(1, sw_mb//64)} status=none 2>/dev/null")
+            r = sh(f"dd if=/dev/zero of={sf} bs=64M count={max(1,sw_mb//64)} status=none 2>/dev/null")
         if r.returncode != 0 or not os.path.exists(sf):
             continue
         if os.path.getsize(sf) < sw_mb * 1024 * 700:
@@ -182,28 +176,23 @@ def setup_swap():
 
         sh(f"chmod 600 {sf}")
 
-        # Loop device dene (overlay2 üzerinde swapon sorununu çözer)
-        if sh(f"losetup /dev/loop0 {sf} 2>/dev/null").returncode == 0:
-            target = "/dev/loop0"
-        else:
-            target = sf   # losetup yoksa doğrudan dosyayla dene
+        # Loop device bağla (overlay2 kısıtını aşar)
+        use_loop = sh(f"losetup /dev/loop0 {sf} 2>/dev/null").returncode == 0
+        target = "/dev/loop0" if use_loop else sf
 
-        mk = sh(f"mkswap -f {target} 2>/dev/null")
-        if mk.returncode != 0:
-            continue
-
-        sw = sh(f"swapon -p 0 {target} 2>/dev/null")
-        if sw.returncode == 0:
+        sh(f"mkswap -f {target} 2>/dev/null")
+        r = sh(f"swapon -p 0 {target} 2>/dev/null")
+        if r.returncode == 0:
             print(f"  ✅ Disk Swap: {sw_mb}MB ({target})")
             disk_swap_ok = True
             break
         else:
-            err = sh(f"swapon -p 0 {target}").stderr.decode().strip()[:80]
-            print(f"  ⚠️  swapon başarısız ({sw_mb}MB): {err}")
+            err = sh(f"swapon -p 0 {target}").stderr.decode()[:60]
+            print(f"  ⚠️  swapon {sw_mb}MB: {err}")
             sh("losetup -d /dev/loop0 2>/dev/null")
 
     if not disk_swap_ok:
-        print("  ⚠️  Disk swap oluşturulamadı — yalnızca zram aktif")
+        print("  ⚠️  Disk swap kurulamadı — yalnızca zram aktif")
 
     for p, v in [
         ("/proc/sys/vm/swappiness",         "100"),
