@@ -228,14 +228,14 @@ class ResourcePool:
         return min(agents, key=lambda a: a.info.get("ram", {}).get("cache_mb", 999))
 
     def _most_ram(self) -> Optional[AgentClient]:
-        """En fazla boş RAM'e sahip sağlıklı agent'ı döndür."""
+        """En fazla bos RAM'e sahip saglikli agent'i dondur."""
         agents = self.get_agents()
         if not agents:
             return None
         return max(agents, key=lambda a: a.info.get("ram", {}).get("free_mb", 0))
 
     def _most_disk(self) -> Optional[AgentClient]:
-        """En çok boş diski olan agent'ı döndür."""
+        """En cok bos diski olan agent'i dondur."""
         agents = self.get_agents()
         if not agents:
             return None
