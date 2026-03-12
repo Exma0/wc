@@ -268,8 +268,10 @@ def run_agent_mode():
         # Basit sağlık sunucusu
         from flask import Flask, jsonify
         app2 = Flask(__name__)
-        @app2.route("/"); @app2.route("/health")
-        def h(): return jsonify({"status":"ok","mode":"agent-stub"})
+        @app2.route("/")
+        @app2.route("/health")
+        def h():
+            return jsonify({"status": "ok", "mode": "agent-stub"})
         app2.run(host="0.0.0.0", port=PORT, debug=False)
         return
 
