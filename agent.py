@@ -579,6 +579,91 @@ def bulk_cache_and_store():
 # Heartbeat thread — hemen başlar, hiç durmaz
 threading.Thread(target=_heartbeat_loop, daemon=True).start()
 
+
+
+# ══════════════════════════════════════════════════════════════
+#  5.  SWAP BLOĞU  — Ana sunucu bu ajanın diskini swap olarak kullanır
+# ══════════════════════════════════════════════════════════════
+
+SWAP_BLOCK_PATH = AGENT_DATA / "swap_block.bin"
+_swap_allocated = False
+_swap_size_mb   = 0
+
+@app.route("/api/swap/allocate", methods=["POST"])
+def swap_allocate():
+    """Ana sunucu isteğiyle disk üzerinde swap bloğu oluştur."""
+    global _swap_allocated, _swap_size_mb
+    d       = request.json or {}
+    size_mb = int(d.get("size_mb", 1500))
+    # Disk yeterliliği kontrol et
+    free_gb = store_free_gb()
+    if free_gb < size_mb / 1024 + 0.5:
+        return jsonify({"ok": False, "error": f"Yetersiz disk: {free_gb:.1f}GB boş"})
+    # Dosya oluştur (sıfırlarla dolu)
+    _log_local(f"[Swap] {size_mb}MB swap bloğu oluşturuluyor...")
+    try:
+        with open(SWAP_BLOCK_PATH, "wb") as f:
+            chunk = b"\x00" * (1024 * 1024)   # 1MB chunk
+            for _ in range(size_mb):
+                f.write(chunk)
+        _swap_allocated = True
+        _swap_size_mb   = size_mb
+        _log_local(f"[Swap] ✅ {size_mb}MB swap bloğu hazır")
+        return jsonify({"ok": True, "size_mb": size_mb, "path": str(SWAP_BLOCK_PATH)})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
+
+
+@app.route("/api/swap/read")
+def swap_read():
+    """Ana sunucu swap bloğunu parça parça okur (streaming download)."""
+    if not SWAP_BLOCK_PATH.exists():
+        return jsonify({"ok": False, "error": "Swap bloğu yok"}), 404
+    offset = int(request.args.get("offset", 0))
+    size   = int(request.args.get("size", 64 * 1024 * 1024))
+    with open(SWAP_BLOCK_PATH, "rb") as f:
+        f.seek(offset)
+        data = f.read(size)
+    return Response(data, mimetype="application/octet-stream")
+
+
+@app.route("/api/swap/write", methods=["PUT"])
+def swap_write():
+    """Ana sunucu swap sayfasını geri yazar (uzak bellek güncelleme)."""
+    if not SWAP_BLOCK_PATH.exists():
+        return jsonify({"ok": False, "error": "Swap bloğu yok"}), 404
+    offset = int(request.args.get("offset", 0))
+    data   = request.get_data()
+    with open(SWAP_BLOCK_PATH, "r+b") as f:
+        f.seek(offset)
+        f.write(data)
+    return jsonify({"ok": True, "written": len(data)})
+
+
+@app.route("/api/swap/status")
+def swap_status():
+    size = SWAP_BLOCK_PATH.stat().st_size if SWAP_BLOCK_PATH.exists() else 0
+    return jsonify({
+        "allocated": _swap_allocated,
+        "size_mb":   _swap_size_mb,
+        "file_mb":   size // (1024*1024),
+        "path":      str(SWAP_BLOCK_PATH),
+    })
+
+
+@app.route("/api/swap/release", methods=["POST"])
+def swap_release():
+    global _swap_allocated, _swap_size_mb
+    if SWAP_BLOCK_PATH.exists():
+        SWAP_BLOCK_PATH.unlink()
+    _swap_allocated = False
+    _swap_size_mb   = 0
+    return jsonify({"ok": True})
+
+
+def _log_local(msg):
+    print(msg)
+
 if __name__ == "__main__":
     print(f"[Agent] :{PORT} başlatılıyor...")
     app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)

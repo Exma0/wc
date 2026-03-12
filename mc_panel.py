@@ -24,7 +24,7 @@ import eventlet
 eventlet.monkey_patch()
 
 from flask import Flask, request, jsonify, send_file, abort, Response
-from resource_pool import pool, pool_api
+from cluster import vcluster, cluster_api
 from flask_socketio import SocketIO, emit
 
 # ── Ayarlar ───────────────────────────────────────────────────
@@ -55,8 +55,8 @@ app = Flask(__name__)
 app.config["SECRET_KEY"] = "mc-panel-secret"
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet",
                     ping_timeout=60, ping_interval=25)
-app.register_blueprint(pool_api)
-pool.set_socketio(socketio)
+if cluster_api: app.register_blueprint(cluster_api)
+vcluster.set_socketio(socketio)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -169,39 +169,6 @@ def _pool_register(tunnel_url: str, node_id: str, info: dict):
     return is_new
 
 
-def _pool_summary() -> dict:
-    with _agents_lock:
-        agents = list(_agents.values())
-    healthy = [a for a in agents if a["healthy"]]
-    total_ram_mb   = sum(a["info"].get("ram",  {}).get("free_mb",   0) for a in healthy)
-    total_disk_gb  = sum(a["info"].get("disk", {}).get("free_gb",   0) for a in healthy)
-    total_cache_mb = sum(a["info"].get("ram",  {}).get("cache_mb",  0) for a in healthy)
-    total_cpu      = sum(a["info"].get("cpu",  {}).get("cores",     0) for a in healthy)
-    return {
-        "total":    len(agents),
-        "healthy":  len(healthy),
-        "resources": {
-            "ram_free_mb":   total_ram_mb,
-            "disk_free_gb":  round(total_disk_gb, 1),
-            "cache_used_mb": total_cache_mb,
-            "cpu_cores":     total_cpu,
-        },
-        "agents": [
-            {
-                "node_id":      a["node_id"],
-                "url":          a["url"],
-                "healthy":      a["healthy"],
-                "connected_at": a["connected_at"],
-                "last_ping":    a["last_ping"],
-                "ram":          a["info"].get("ram",   {}),
-                "disk":         a["info"].get("disk",  {}),
-                "cpu":          a["info"].get("cpu",   {}),
-                "proxy":        a["info"].get("proxy", {}),
-            }
-            for a in agents
-        ],
-    }
-
 
 def _agent_req(agent: dict, method: str, path: str,
                data: bytes = None, headers: dict = None, timeout: int = 15):
@@ -267,7 +234,7 @@ def _pool_health_watchdog():
                 # 90sn yanıt yoksa unhealthy
                 if time.time() - ag["last_ping"] > 90:
                     ag["healthy"] = False
-        socketio.emit("pool_update", _pool_summary())
+        socketio.emit("pool_update", vcluster.summary())
 
 
 def _pool_auto_optimize():
@@ -541,7 +508,7 @@ def api_restart():
 def api_status():
     return jsonify({**server_state, "players": _players_list(),
                     "tunnel": tunnel_info,
-                    "pool": _pool_summary()})
+                    "pool": vcluster.summary()})
 
 
 @app.route("/api/command", methods=["POST"])
@@ -613,7 +580,7 @@ def api_agent_register():
             f"RAM:{d.get('ram',{}).get('free_mb',0)}MB | "
             f"Disk:{d.get('disk',{}).get('free_gb',0):.1f}GB | "
             f"CPU:{d.get('cpu',{}).get('cores',0)} core")
-    socketio.emit("pool_update", _pool_summary())
+    socketio.emit("pool_update", vcluster.summary())
     return jsonify({"ok": True})
 
 
@@ -622,20 +589,20 @@ def api_agent_heartbeat():
     d = request.json or {}
     if d.get("node_id") and d.get("tunnel"):
         _pool_register(d["tunnel"], d["node_id"], d)
-    socketio.emit("pool_update", _pool_summary())
+    socketio.emit("pool_update", vcluster.summary())
     return jsonify({"ok": True})
 
 
 @app.route("/api/pool/status")
 def api_pool_status():
-    return jsonify(_pool_summary())
+    return jsonify(vcluster.summary())
 
 
 @app.route("/api/pool/cache/stats")
 def api_pool_cache_stats():
     stats = []
-    with _agents_lock:
-        agents = list(_agents.values())
+    with vcluster._lock:
+        agents = list(vcluster._agents.values())
     for ag in agents:
         r = _agent_json(ag, "GET", "/api/cache/stats")
         if r:
@@ -652,8 +619,8 @@ def api_pool_cache_stats():
 def api_pool_cache_flush():
     prefix = (request.json or {}).get("prefix", "")
     total  = 0
-    with _agents_lock:
-        agents = list(_agents.values())
+    with vcluster._lock:
+        agents = list(vcluster._agents.values())
     for ag in agents:
         r = _agent_json(ag, "POST", "/api/cache/flush", {"prefix": prefix})
         total += (r or {}).get("flushed", 0)
@@ -664,8 +631,8 @@ def api_pool_cache_flush():
 @app.route("/api/pool/storage")
 def api_pool_storage():
     result = []
-    with _agents_lock:
-        agents = list(_agents.values())
+    with vcluster._lock:
+        agents = list(vcluster._agents.values())
     for ag in agents:
         r = _agent_json(ag, "GET", "/api/files/storage/stats")
         if r:
@@ -701,8 +668,8 @@ def api_pool_proxy_start():
     d    = request.json or {}
     host = d.get("host", "127.0.0.1")
     port = int(d.get("port", 25565))
-    with _agents_lock:
-        agents = list(_agents.values())
+    with vcluster._lock:
+        agents = list(vcluster._agents.values())
     started = []
     for ag in agents:
         r = _agent_json(ag, "POST", "/api/proxy/start",
@@ -715,8 +682,8 @@ def api_pool_proxy_start():
 
 @app.route("/api/pool/proxy/stop", methods=["POST"])
 def api_pool_proxy_stop():
-    with _agents_lock:
-        agents = list(_agents.values())
+    with vcluster._lock:
+        agents = list(vcluster._agents.values())
     for ag in agents:
         _agent_json(ag, "POST", "/api/proxy/stop")
     return jsonify({"ok": True})
@@ -982,7 +949,7 @@ def api_performance():
                 proc=psutil.Process(mc_process.pid)
                 procs=[{"cpu":round(proc.cpu_percent(),1),"ram":int(proc.memory_info().rss/1024/1024),"threads":proc.num_threads()}]
             except: pass
-        pool=_pool_summary()
+        pool=vcluster.summary()
         return jsonify({
             "cpu":round(cpu,1),"ram_pct":round(vm.percent,1),
             "ram_used_mb":int(vm.used/1024/1024),"ram_total_mb":int(vm.total/1024/1024),
@@ -1008,7 +975,7 @@ def on_connect():
     emit("server_status",   server_state)
     emit("players_update",  _players_list())
     emit("tunnel_update",   tunnel_info)
-    emit("pool_update",     _pool_summary())
+    emit("pool_update",     vcluster.summary())
 
 
 @socketio.on("send_command")
@@ -1756,8 +1723,7 @@ init();
 
 threading.Thread(target=_ram_monitor,        daemon=True).start()
 threading.Thread(target=_ram_watchdog,       daemon=True).start()
-threading.Thread(target=_pool_health_watchdog, daemon=True).start()
-threading.Thread(target=_pool_auto_optimize, daemon=True).start()
+# cluster.py kendi thread'lerini başlatır
 
 if __name__ == "__main__":
     MC_DIR.mkdir(parents=True, exist_ok=True)
