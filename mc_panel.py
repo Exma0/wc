@@ -262,12 +262,16 @@ def write_server_config():
 
 def get_jvm_args():
     import psutil
-    total_mb = int(psutil.virtual_memory().total / 1024 / 1024)
-    xmx_mb   = max(256, int(total_mb * 0.85))   # toplam RAM'in %85'i
-    xms_mb   = max(256, int(xmx_mb   * 0.50))   # Xmx'in yarısı
+    # Gerçekten kullanılabilir RAM'i al (container limiti dahil)
+    mem = psutil.virtual_memory()
+    avail_mb = int(mem.available / 1024 / 1024)
+    total_mb = int(mem.total   / 1024 / 1024)
+    # Container'da kullanılabilir RAM'in %80'ini kullan, max 400MB güvenli üst sınır bırak
+    xmx_mb = max(256, min(avail_mb - 128, int(avail_mb * 0.80)))
+    xms_mb = max(128, int(xmx_mb * 0.50))
     xmx = f"{xmx_mb}M"
     xms = f"{xms_mb}M"
-    log(f"[Panel] 🧠 Sistem RAM: {total_mb}MB → Xms={xms} Xmx={xmx}")
+    log(f"[Panel] 🧠 RAM: toplam={total_mb}MB  kullanılabilir={avail_mb}MB  Xms={xms}  Xmx={xmx}")
     return [
         "java",
         f"-Xms{xms}", f"-Xmx{xmx}",
