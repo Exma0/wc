@@ -460,6 +460,18 @@ def start_server():
     MC_DIR.mkdir(parents=True, exist_ok=True)
     _setup_swap()
 
+    # NBD bağlantı kontrolü — uyarı ver (otomatik başlatma zaten bariyerli)
+    min_req  = int(os.environ.get("MIN_SUPPORT_NODES", "3"))
+    nbd_cnt  = nbd_connected_count()
+    if nbd_cnt < min_req:
+        log(f"[Panel] ⚠️  UYARI: {nbd_cnt}/{min_req} NBD dugumu bagli! "
+            f"Swap yetersiz — sunucu RAM'e sigilmayabilir.")
+    else:
+        import psutil as _ps
+        swp = _ps.swap_memory()
+        log(f"[Panel] ✅ {nbd_cnt}/{min_req} NBD dugumu hazir | "
+            f"Swap: {swp.total//1024//1024}MB")
+
     if not MC_JAR.exists():
         server_state["status"] = "downloading"
         socketio.emit("server_status", server_state)
@@ -580,17 +592,37 @@ def api_internal_tunnel():
     return jsonify({"ok": True})
 
 
+@app.route("/api/internal/status_msg", methods=["POST"])
+def api_internal_status_msg():
+    """main.py sistem mesajlarını konsola iletir."""
+    d = request.json or {}
+    msg = d.get("msg", "")
+    if msg:
+        log(msg)
+    return jsonify({"ok": True})
+
+
+def nbd_connected_count():
+    """NBD baglantisi tamamlanmis destek dugumu sayisi."""
+    return sum(1 for n in support_nodes.values()
+               if n.get("status") == "nbd_connected")
+
+
 @app.route("/api/internal/nbd_status", methods=["POST"])
 def api_internal_nbd_status():
-    """main.py NBD bağlantısı kurulunca buraya bildirir."""
+    """main.py NBD baglantisi kurulunca buraya bildirir."""
     d = request.json or {}
     if d.get("nbd_connected"):
-        host = d.get("host", "")
-        log(f"[Panel] 🔗 NBD bağlantısı kuruldu: {host}")
-        node_id = host.replace("https://", "").replace(".trycloudflare.com", "")
+        host    = d.get("host", "")
+        node_id = d.get("node_id", host.replace(".trycloudflare.com", ""))
+        dev     = d.get("dev", "")
         for nid, node in support_nodes.items():
-            if node.get("host", "") == host or nid == node_id:
+            if nid == node_id or node.get("host", "") == host:
                 support_nodes[nid]["status"] = "nbd_connected"
+                support_nodes[nid]["dev"]    = dev
+        cnt     = nbd_connected_count()
+        min_req = int(os.environ.get("MIN_SUPPORT_NODES", "3"))
+        log(f"[Panel] 🔗 NBD baglandi: {host} ({dev}) | {cnt}/{min_req} dugum hazir")
         socketio.emit("support_nodes_update", list(support_nodes.values()))
     return jsonify({"ok": True})
 

@@ -365,12 +365,45 @@ def _connect_node_loop(host: str, node_id: str):
         time.sleep(wait)
 
 
+def _ensure_main_tools():
+    """
+    Ana sunucuda wstunnel ve nbd-client kurulu olduğundan emin ol.
+    (Destek sunucusu kendi araçlarını ayrıca kurar.)
+    """
+    import shutil as _s
+    missing = [t for t in ["nbd-client"] if not _s.which(t)]
+    if missing:
+        print(f"  [ana] Eksik araçlar kuruluyor: {', '.join(missing)}")
+        sh("apt-get update -qq 2>/dev/null && "
+           "DEBIAN_FRONTEND=noninteractive apt-get install -y "
+           f"--no-install-recommends {' '.join(missing)} 2>/dev/null")
+
+    if not _s.which("wstunnel"):
+        print("  [ana] wstunnel kuruluyor (ana sunucu)...")
+        r = sh(
+            "curl -fsSL 'https://github.com/erebe/wstunnel/releases/download/v7.8.0/"
+            "wstunnel_7.8.0_linux_amd64.tar.gz' "
+            "| tar -xz -C /tmp/ 2>/dev/null && "
+            "mv /tmp/wstunnel /usr/local/bin/wstunnel && "
+            "chmod +x /usr/local/bin/wstunnel"
+        )
+        if r.returncode == 0:
+            print("  [ana] ✅ wstunnel kuruldu")
+        else:
+            print(f"  [ana] ❌ wstunnel kurulamadı: {r.stderr.decode()[:150]}")
+    else:
+        print("  [ana] ✅ wstunnel mevcut")
+
+
 def try_connect_all_workers():
     """
     Panel hazır olana kadar bekle, ardından tüm düğümleri
     paralel thread'lerle bağla. Yeni düğümler için sürekli polling.
     WORKER_HOST env: virgülle ayrılmış ön-tanımlı hostlar.
     """
+    # ❶ Önce araçları kur (wstunnel, nbd-client)
+    _ensure_main_tools()
+
     print("  [worker] Panel bekleniyor...")
     for _ in range(60):
         try:
