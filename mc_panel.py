@@ -26,16 +26,12 @@ eventlet.monkey_patch()
 # ── Render.com 512MB limiti — Python panel adres alanını sınırla ─────────────
 # Panel (Python) + JVM birlikte 512MB paylaşır.
 # Bu limit sadece Python process'e uygulanır (JVM ayrı subprocess).
-# ÖNEMLİ: Hard limit RLIM_INFINITY bırakılır — JVM subprocess kendi limitini
-# preexec_fn ile sıfırlayabilsin. Hard limit düşürülürse JVM heap rezervasyonu
-# "Could not reserve enough space for object heap" hatası verir.
 import resource as _resource
 try:
     _PANEL_LIMIT = 480 * 1024 * 1024   # 480MB — 32MB buffer
     _s, _h = _resource.getrlimit(_resource.RLIMIT_AS)
     if _h == _resource.RLIM_INFINITY or _h > _PANEL_LIMIT:
-        # Sadece soft limit kısıtlanır; hard limit korunur → JVM raise edebilir
-        _resource.setrlimit(_resource.RLIMIT_AS, (_PANEL_LIMIT, _h))
+        _resource.setrlimit(_resource.RLIMIT_AS, (_PANEL_LIMIT, _PANEL_LIMIT))
 except Exception:
     pass  # Bazı ortamlarda izin yok — devam et
 
@@ -56,7 +52,7 @@ RENDER_DISK_LIMIT_GB = float(os.environ.get("RENDER_DISK_LIMIT_GB", "18.0"))
 
 # ── Global durum ─────────────────────────────────────────────
 mc_process   = None
-console_buf  = deque(maxlen=3000)
+console_buf  = deque(maxlen=200)   # 3000→200: ~18MB Python RSS tasarrufu
 players      = {}
 tunnel_info  = {"url": "", "host": ""}
 server_state = {
@@ -64,6 +60,42 @@ server_state = {
     "ram_mb": 0, "uptime": 0, "started": None,
     "version": "—", "max_players": 20, "online_players": 0,
 }
+
+# ── Kalıcı Durum Dosyası (OOM restart sonrası kaldığı yerden devam) ──────────
+# Render OOM kill → container yeniden başlar → bu dosya MC'nin çalışıp
+# çalışmadığını hatırlar → otomatik başlatır.
+STATE_FILE = Path("/agent_data/panel_state.json")
+
+def _save_state():
+    """Mevcut sunucu durumunu diske kaydet (her 30s + kritik anlarda)."""
+    try:
+        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        data = {
+            "was_running": server_state["status"] in ("running", "starting", "downloading"),
+            "tunnel": tunnel_info.copy(),
+            "mc_jar_exists": MC_JAR.exists(),
+            "saved_at": time.time(),
+            "version": "10.0",
+        }
+        STATE_FILE.write_text(json.dumps(data))
+    except Exception:
+        pass
+
+
+def _load_prev_state() -> dict:
+    """Önceki state'i yükle. 5 dakikadan eskiyse (stale) boş döndür."""
+    try:
+        if STATE_FILE.exists():
+            data = json.loads(STATE_FILE.read_text())
+            age  = time.time() - data.get("saved_at", 0)
+            if age < 300:   # 5 dakika içinde kayıt geçerli
+                return data
+    except Exception:
+        pass
+    return {}
+
+
+_PREV_STATE = _load_prev_state()   # Panel import edilirken yükle
 
 # ── Resource Pool ─────────────────────────────────────────────
 # resource_pool.py'deki ResourcePool singleton kullanılır.
@@ -783,9 +815,13 @@ def get_jvm_args():
     # 512MB bütçe: Python ~120MB + JVM Xmx + JVM meta/code/stack ~100MB ≤ 512
     # UserSwap varsa JVM taşması dosyaya → Xmx=300 güvenli
     # UserSwap yoksa: 512 - 120(py) - 100(jvm_overhead) - 20(buf) = 272MB
+    # 512MB bütçe: Python ~100MB + JVM Xmx + JVM meta/code/stack ~110MB ≤ 512
+    # SerialGC ile G1GC'ye kıyasla ~25-30MB non-heap tasarruf sağlanır.
+    # UserSwap varsa JVM heap taşması dosyaya → Xmx=200 güvenli (bootstrap için UserSwap şart)
+    # UserSwap yoksa: 512 - 100(py) - 110(jvm_overhead) - 20(buf) = 282MB → 250 güvenli
     userswap_ok = os.path.exists(USERSWAP_SO)
-    xmx_mb = 300 if userswap_ok else 272
-    xms_mb = 48
+    xmx_mb = 200 if userswap_ok else 250
+    xms_mb = 32   # 48→32: JVM daha az önceden ayırır
 
     userswap_ok = os.path.exists(USERSWAP_SO)
     swap_label  = f"UserSwap(4GB)" if userswap_ok else "NoSwap"
@@ -800,35 +836,24 @@ def get_jvm_args():
 
     return java_cmd + [
         f"-Xms{xms_mb}M", f"-Xmx{xmx_mb}M",
-        # ── Bellek alanları (UserSwap ile taşma dosyaya gider) ──
-        # Meta + Code + Class + Stack ≈ 162MB sabit
-        # Fiziksel peak ≈ 320(heap) + 162(meta/etc) + 130(python) = 612MB → ~100MB UserSwap'a
-        "-XX:MaxMetaspaceSize=96m",
-        "-XX:CompressedClassSpaceSize=24m",
-        "-XX:ReservedCodeCacheSize=28m",
-        "-Xss256k",
-        # ── DirectBuffer: SINIR YOK ──
-        # Paper MC Netty için 32-128MB DirectBuffer gerekir.
-        # MaxDirectMemorySize=32m CRASH yaratır (OOM: Cannot reserve direct buffer).
-        # Sınır belirtilmezse JVM varsayılan = Xmx (220MB) olur → yeterli.
-        # ── GC: G1 ──
-        "-XX:+UseG1GC",
-        "-XX:+ParallelRefProcEnabled",
-        "-XX:MaxGCPauseMillis=100",
-        "-XX:ConcGCThreads=1",
-        "-XX:ParallelGCThreads=1",
-        "-XX:+UnlockExperimentalVMOptions",
-        "-XX:+DisableExplicitGC",
-        "-XX:G1NewSizePercent=20",
-        "-XX:G1MaxNewSizePercent=40",
-        "-XX:G1HeapRegionSize=2m",
-        "-XX:G1ReservePercent=10",
-        "-XX:InitiatingHeapOccupancyPercent=15",
+        # ── Bellek alanları ──────────────────────────────────────────────
+        "-XX:MaxMetaspaceSize=80m",         # 96→80: sınırlı class sayısı
+        "-XX:CompressedClassSpaceSize=16m", # 24→16
+        "-XX:ReservedCodeCacheSize=24m",    # 28→24
+        "-Xss192k",                         # 256→192: thread başına stack
+        # ── GC: SerialGC — en düşük non-heap footprint (<512MB için ideal) ──
+        # G1GC: remembered-set + card-table + thread buffer → +30MB overhead
+        # SerialGC: tek thread, sıfır ek yapı → Xmx=200MB ortamda daha güvenli
+        "-XX:+UseSerialGC",
+        "-XX:SurvivorRatio=4",
+        "-XX:NewRatio=2",                   # Young:Old = 1:2
+        "-XX:MaxHeapFreeRatio=40",          # GC sonrası heap küçülsün
+        "-XX:MinHeapFreeRatio=10",
         "-XX:SoftRefLRUPolicyMSPerMB=0",
-        "-XX:+UseStringDeduplication",
         "-XX:+UseCompressedOops",
         "-XX:+OptimizeStringConcat",
-        # ── Diğer ──
+        "-XX:+UseStringDeduplication",
+        # ── Diğer ──────────────────────────────────────────────────────
         "-Djava.net.preferIPv4Stack=true",
         "-Dfile.encoding=UTF-8",
         "-Dcom.mojang.eula.agree=true",
@@ -858,26 +883,10 @@ def start_server():
     socketio.emit("players_update", [])
     jvm = get_jvm_args()
     log(f"[Panel] 🚀 Server başlatılıyor...")
-
-    def _preexec_jvm():
-        """
-        JVM subprocess fork sonrası, exec öncesi çalışır.
-        Panel'in RLIMIT_AS soft limitini sıfırlar → JVM heap rezervasyonu başarılı olur.
-        Hard limit RLIM_INFINITY olduğundan yükseltmek mümkündür.
-        (Düzeltme: Eskiden hard limit de 480MB yapılıyordu → JVM başlatılamıyordu)
-        """
-        try:
-            import resource as _r
-            _s, _h = _r.getrlimit(_r.RLIMIT_AS)
-            _r.setrlimit(_r.RLIMIT_AS, (_h, _h))  # Soft → Hard (∞) yükselt
-        except Exception:
-            pass
-
     try:
         mc_process = subprocess.Popen(
             jvm, cwd=str(MC_DIR),
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            preexec_fn=_preexec_jvm,
         )
     except Exception as e:
         log(f"[Panel] ❌ Başlatma hatası: {e}")
@@ -937,45 +946,87 @@ def send_command(cmd: str) -> bool:
     return False
 
 
+def _container_ram_used_mb() -> int:
+    """
+    Render container'ın gerçek RAM kullanımını döndürür.
+    psutil.virtual_memory() HOST'u okur (yanıltıcı) — cgroup dosyasını kullan.
+    """
+    for path in ["/sys/fs/cgroup/memory.current",
+                 "/sys/fs/cgroup/memory/memory.usage_in_bytes"]:
+        try:
+            val = int(open(path).read().strip())
+            return val // 1024 // 1024
+        except Exception:
+            pass
+    # Fallback: bu process + çocuk process RSS toplamı
+    try:
+        import psutil as _ps
+        proc = _ps.Process(os.getpid())
+        total = proc.memory_info().rss
+        for child in proc.children(recursive=True):
+            try:
+                total += child.memory_info().rss
+            except Exception:
+                pass
+        return total // 1024 // 1024
+    except Exception:
+        return 0
+
+
 def _ram_watchdog():
-    import psutil
-    _pressure_count = 0
+    """
+    Container RAM'ini izler.
+    • 440MB → save-all + save_state (dünya verisi korunur)
+    • 480MB → save-all + save_state + MC graceful stop
+              (Render SIGKILL gelmeden önce temiz kapat → restart sonrası devam)
+    """
+    WARN_MB  = 440   # save-all eşiği
+    CRIT_MB  = 480   # graceful stop eşiği (512MB limit öncesi güvenlik payı)
+    _warn_streak = 0
+    _crit_fired  = False
+
     while True:
         eventlet.sleep(8)
         try:
-            mem = psutil.virtual_memory()
-            swp = psutil.swap_memory()
-            used_mb  = int(mem.used  / 1024 / 1024)
-            total_mb = int(mem.total / 1024 / 1024)
-            swap_pct = swp.percent if swp.total > 0 else 0
+            used_mb = _container_ram_used_mb()
+            if used_mb == 0:
+                continue
 
-            # Render free = 512MB. Python ~150MB kullanıyor.
-            # MC 280MB kullanıyorsa toplam ~430MB → %84 → uyar
-            pressure = used_mb > (total_mb * 0.85) or swap_pct > 80
+            is_mc_alive = mc_process and mc_process.poll() is None
 
-            if pressure:
-                _pressure_count += 1
-                try: open("/proc/sys/vm/drop_caches","w").write("3")
-                except: pass
+            if used_mb >= CRIT_MB and not _crit_fired:
+                _crit_fired = True
+                log(f"[Panel] 🚨 RAM KRİTİK ({used_mb}MB/512MB) → kayıt + temiz kapanış başlıyor...")
+                _save_state()   # Restart sonrası devam için durum kaydet
+                if is_mc_alive:
+                    send_command("save-all")   # Dünya verisini koru
+                    time.sleep(2)
+                    send_command("stop")       # Graceful MC kapat (SIGKILL öncesi)
+                # Caches temizle → Python RAM küçülsün
+                try:
+                    open("/proc/sys/vm/drop_caches", "w").write("3")
+                except Exception:
+                    pass
 
-                if _pressure_count >= 2:
-                    # Hafif MC temizliği
-                    send_command("kill @e[type=item]")
-                    send_command("kill @e[type=experience_orb]")
-
-                if _pressure_count >= 3:
-                    # Ağır baskı: kaydet + agent'a region offload tetikle
-                    send_command("save-all")
-                    log(f"[Panel] ⚠️  RAM Baskısı! Kullanılan={used_mb}MB/{total_mb}MB Swap=%{swap_pct:.0f}")
-                    # Agent'a eski region'ları taşı
-                    threading.Thread(
-                        target=lambda: _auto_archive_old_regions(older_than_days=2),
-                        daemon=True
-                    ).start()
-                    _pressure_count = 0
+            elif used_mb >= WARN_MB:
+                _warn_streak += 1
+                if _warn_streak == 1:
+                    log(f"[Panel] ⚠️  RAM yüksek ({used_mb}MB/512MB) → save-all + durum kaydediliyor")
+                    _save_state()
+                    if is_mc_alive:
+                        send_command("save-all")
+                        send_command("kill @e[type=item]")
+                        send_command("kill @e[type=experience_orb]")
+                    try:
+                        open("/proc/sys/vm/drop_caches", "w").write("3")
+                    except Exception:
+                        pass
             else:
-                _pressure_count = max(0, _pressure_count - 1)
-        except: pass
+                _warn_streak = 0
+                _crit_fired  = False   # RAM düştü → eşik sıfırla
+
+        except Exception:
+            pass
 
 
 # ══════════════════════════════════════════════════════════════
@@ -2449,12 +2500,37 @@ init();
 #  BAŞLATMA
 # ══════════════════════════════════════════════════════════════
 
-threading.Thread(target=_ram_monitor,        daemon=True).start()
-threading.Thread(target=_ram_watchdog,       daemon=True).start()
+def _state_persist_loop():
+    """Her 30 saniyede durumu diske kaydet → OOM restart sonrası devam."""
+    while True:
+        time.sleep(30)
+        _save_state()
+
+
+def _auto_resume_if_needed():
+    """
+    Önceki oturum OOM kill ile kesilmişse MC'yi otomatik başlat.
+    (Kullanıcı paneli açıp 'Başlat'a basmak zorunda kalmaz.)
+    """
+    if not _PREV_STATE.get("was_running"):
+        return
+    log("[Panel] ♻️  Önceki oturum tespit edildi → 8sn içinde MC otomatik başlatılıyor...")
+    time.sleep(8)   # Panel + socket hazır olsun
+    ok, msg = start_server()
+    if ok:
+        log("[Panel] ✅ OOM-restart sonrası MC otomatik başlatıldı")
+    else:
+        log(f"[Panel] ⚠️  Otomatik başlatma: {msg}")
+
+
+threading.Thread(target=_ram_monitor,          daemon=True).start()
+threading.Thread(target=_ram_watchdog,         daemon=True).start()
+threading.Thread(target=_state_persist_loop,   daemon=True).start()   # OOM restart için
+threading.Thread(target=_auto_resume_if_needed, daemon=True).start()  # OOM restart için
 # _pool_health_watchdog KALDIRILDI: resource_pool.health_monitor() zaten arka planda çalışıyor
-threading.Thread(target=_pool_auto_optimize,  daemon=True).start()
-threading.Thread(target=_world_backup_loop,   daemon=True).start()  # Agent disk doldur
-threading.Thread(target=_ram_cache_warm_loop, daemon=True).start()  # Agent RAM doldur
+threading.Thread(target=_pool_auto_optimize,   daemon=True).start()
+threading.Thread(target=_world_backup_loop,    daemon=True).start()   # Agent disk doldur
+threading.Thread(target=_ram_cache_warm_loop,  daemon=True).start()   # Agent RAM doldur
 _pool.set_logger(log)   # Panel log fonksiyonunu pool'a inject et
 
 if __name__ == "__main__":

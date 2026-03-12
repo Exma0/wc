@@ -188,6 +188,28 @@ def start_panel():
 
 
 def auto_start_sequence():
+    # Önceki OOM kill state'i var mı kontrol et
+    _state_path = "/agent_data/panel_state.json"
+    _prev_running = False
+    try:
+        import json as _json
+        _d = _json.loads(open(_state_path).read())
+        _age = time.time() - _d.get("saved_at", 0)
+        if _age < 300 and _d.get("was_running"):
+            _prev_running = True
+    except Exception:
+        pass
+
+    if _prev_running:
+        # mc_panel._auto_resume_if_needed() zaten 8sn sonra MC başlatacak.
+        # Bu fonksiyon tekrar /api/start çağırmasın → çift başlatma olur.
+        print("  ♻️  Önceki oturum var → MC panel otomatik başlatacak, bu sekans atlanıyor.")
+        _panel_log("[Sistem] ♻️  OOM-restart: MC panel otomatik devam ettiriyor...")
+        if wait_port(MC_PORT, 300):
+            _panel_log("[Sistem] ✅ MC Server yeniden hazır!")
+        _start_mc_tunnel()
+        return
+
     time.sleep(4)
     _panel_log("[Sistem] 🟢 v10.0 başladı — MC başlatılıyor...")
     try:
