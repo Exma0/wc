@@ -161,7 +161,7 @@ def _build_userswap():
         # gcc yok → apt ile kur
         r = subprocess.run("apt-get install -y gcc 2>/dev/null", shell=True, capture_output=True)
         if not shutil.which("gcc"):
-            log("[UserSwap] ⚠️  gcc bulunamadı — userswap devre dışı")
+            return False  # gcc yok — sessiz
             return False
     try:
         src_path = Path("/tmp/userswap.c")
@@ -174,10 +174,10 @@ def _build_userswap():
             log(f"[UserSwap] ✅ userswap.so derlendi → {USERSWAP_SO}")
             return True
         else:
-            log(f"[UserSwap] ⚠️  Derleme hatası: {r.stderr.decode()[:120]}")
+            pass  # userswap isteğe bağlı — JVM sadece jemalloc ile çalışır
             return False
     except Exception as e:
-        log(f"[UserSwap] ⚠️  {e}")
+        pass  # userswap isteğe bağlı
         return False
 
 import gc as _gc_module
@@ -352,16 +352,16 @@ def _auto_archive_old_regions(older_than_days: int = 0):
         import shutil as _shu2
         # Render limitini baz al (18GB) - ana sunucu gerçek kullanımı
         render_limit_gb  = float(os.environ.get("RENDER_DISK_LIMIT_GB", "18.0"))
-        # /minecraft altındaki dosyaları say
+        # Gerçek disk kullanımı — df ile ölç
+        import shutil as _shu
         try:
-            mc_used_gb = sum(
-                f.stat().st_size for f in MC_DIR.rglob("*") if f.is_file()
-            ) / 1e9
+            _du = _shu.disk_usage("/")
+            total_used_gb = _du.used / 1e9
+            free_gb = _du.free / 1e9
         except:
-            mc_used_gb = 0.0
-        # OS + Python + image tabanı ~4GB
-        total_used_gb = 4.0 + mc_used_gb
-        force_all = total_used_gb > (render_limit_gb * 0.7)  # %70 dolu → zorla arşivle
+            total_used_gb = 10.0
+            free_gb = 8.0
+        force_all = free_gb < 4.0  # 4GB altındaysa zorla arşivle
 
         for rf in sorted(dim_dir.glob("*.mca"), key=lambda f: f.stat().st_mtime):
             age_days = (now - rf.stat().st_mtime) / 86400
@@ -557,16 +557,17 @@ def _ram_cache_warm_loop():
     Tüm agent cache'lerini paralel doldur.
     Her 5 dakikada bir yeni region'ları ve yeni agentları güncelle.
     """
-    # MC JAR + en az 1 agent hazır olana kadar bekle (max 15 dk)
-    for _ in range(900):
-        if MC_JAR.exists() and _pool.agent_count() > 0:
+    # MC JAR + world dosyaları + en az 1 agent hazır olana kadar bekle (max 20 dk)
+    for _ in range(1200):
+        world_ready = (MC_DIR / "world" / "level.dat").exists()
+        if MC_JAR.exists() and _pool.agent_count() > 0 and world_ready:
             break
         time.sleep(1)
     else:
-        log("[Pool] ⚠️  Cache warm: JAR veya agent 15dk içinde hazır olmadı")
+        log("[Pool] ⚠️  Cache warm: JAR/world/agent 20dk içinde hazır olmadı")
         return
 
-    time.sleep(10)  # MC başlasın + world dosyaları oluşsun
+    time.sleep(30)  # MC tam stabil olsun
 
     def _fill_all_agents():
         agents = _pool.get_agents()
@@ -640,31 +641,32 @@ def _pool_auto_optimize():
     render_limit_gb = float(os.environ.get("RENDER_DISK_LIMIT_GB", "18.0"))
 
     def _render_disk_used_gb():
-        """Gerçek Render disk kullanımı: /minecraft + swap dosyaları."""
-        mc_gb = 0.0
+        """Gerçek disk kullanımı — df ile ölç."""
+        import shutil as _shu2
         try:
-            mc_gb = sum(
-                f.stat().st_size for f in MC_DIR.rglob("*") if f.is_file()
-            ) / 1e9
-        except: pass
-        swap_gb = sum(
-            os.path.getsize(f) for f in ["/swapfile", "/swapfile_mmap"]
-            if os.path.exists(f)
-        ) / 1e9
-        return 4.0 + mc_gb + swap_gb  # 4GB OS/image tabanı
+            return _shu2.disk_usage("/").used / 1e9
+        except:
+            return 10.0
 
     # İlk arşiv
     try:
-        used_gb = _render_disk_used_gb()
+        import shutil as _shu4
+        used_gb = _shu4.disk_usage("/").used / 1e9
         # Disk %70+ dolu = acil (days=0), değilse 3 günden eski regionları arşivle
         # (7 gün çok uzun — agentlar boşta kalır)
-        days = 0 if used_gb > render_limit_gb * 0.70 else 3
-        log(f"[Pool] 📊 Render disk: ~{used_gb:.1f}GB / {render_limit_gb}GB → eşik:{days}gün")
+        import shutil as _shu3
+        _real_free_gb = _shu3.disk_usage("/").free / 1e9
+        days = 0 if _real_free_gb < 3.0 else 3
+        log(f"[Pool] 📊 Disk: {_real_free_gb:.1f}GB boş → eşik:{days}gün")
         result = _auto_archive_old_regions(older_than_days=days)
         if result and result[0]:
             log(f"[Pool] 📦 İlk arşiv: {result[0]} region, {result[1]:.0f}MB (≥{days}gün)")
         else:
-            log(f"[Pool] ℹ️  Arşiv: region yok veya hepsi yeni (eşik:{days}gün, disk:{used_gb:.1f}GB)")
+            _shu5_free = __import__("shutil").disk_usage("/").free / 1e9
+        if _shu5_free > 5.0:
+            log(f"[Pool] ✅ Arşiv gerekmez: {_shu5_free:.1f}GB disk boş")
+        else:
+            log(f"[Pool] ℹ️  Arşiv: yeni regionlar bekleniyor (eşik:{days}gün, boş:{_shu5_free:.1f}GB)")
         socketio.emit("pool_update", _pool_summary())
     except Exception as e:
         log(f"[Pool] ⚠️  İlk arşiv hatası: {e}")
@@ -1056,10 +1058,12 @@ def get_jvm_args():
 
     # UserSwap varsa bootstrap fazlası (maks ~60MB) dosyaya gider → 270MB güvenli
     # UserSwap yoksa 240MB → 512-75(python)-100(non-heap)-240(heap) = 97MB tampon
-    xmx_mb = 270 if userswap_ok else 240
-    xms_mb = 64   # Küçük başla, GC gerektiğinde büyüt
+    # userswap kaldırıldı → güvenli heap
+    xmx_mb = 256
+    xms_mb = 32   # Küçük başla, GC gerektiğinde büyüt
+    userswap_ok = False   # devre dışı
 
-    swap_label = "UserSwap(4GB)" if userswap_ok else "NoSwap"
+    swap_label = f"Swap({psutil.swap_memory().total//1024//1024}MB)"
     log(f"[Panel] 🧠 Container={container_ram_mb}MB {swap_label} Agents={agent_count} "
         f"→ Xms={xms_mb}M Xmx={xmx_mb}M [Aikar+jemalloc]")
 
@@ -1082,12 +1086,11 @@ def get_jvm_args():
             log(f"[Panel] ✅ jemalloc aktif: {jp}")
             break
 
+    # Sadece jemalloc LD_PRELOAD — userswap.so JVM startup'ı çökertiyor
+    jemalloc = next((p for p in preloads if "jemalloc" in p), None)
     java_cmd = []
-    if preloads:
-        java_cmd = ["env", f"LD_PRELOAD={':'.join(preloads)}"]
-    else:
-        log("[Panel] ⚠️  userswap.so yok — LD_PRELOAD atlandı")
-
+    if jemalloc:
+        java_cmd = ["env", f"LD_PRELOAD={jemalloc}"]
     java_cmd.append("java")
 
     return java_cmd + [
@@ -1108,7 +1111,7 @@ def get_jvm_args():
         "-XX:MaxGCPauseMillis=200",
         "-XX:+UnlockExperimentalVMOptions",
         "-XX:+DisableExplicitGC",        # System.gc() çağrılarını yoksay
-        "-XX:+AlwaysPreTouch",           # Başlangıçta heap'i ısıt → runtime'da sıfır page fault
+        # AlwaysPreTouch KALDIRILDI → 512MB container'da OOM crash yapıyor
         "-XX:G1NewSizePercent=30",
         "-XX:G1MaxNewSizePercent=40",
         "-XX:G1HeapRegionSize=4m",       # 270MB heap için optimal (67 region)
