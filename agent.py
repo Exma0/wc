@@ -24,7 +24,19 @@ from flask import Flask, request, jsonify, send_file, Response, abort
 # ─────────────────────────────────────────────
 PORT         = int(os.environ.get("PORT", "5000"))
 MAIN_URL     = os.environ.get("MAIN_URL", "https://wc-tsgd.onrender.com")
-NODE_ID      = os.environ.get("RENDER_EXTERNAL_URL", "").replace("https://", "").replace(".onrender.com", "") or f"agent-{os.getpid()}"
+
+# DÜZELTİLDİ: NODE_ID artık kararlı (her restart'ta aynı kalır).
+# Öncelik: NODE_ID env → RENDER_EXTERNAL_URL → URL hash (PID YOK)
+# Eski kod os.getpid() kullanıyordu → her restart'ta farklı ID → ana sunucu
+# aynı agent'ı yeni node sanıyordu.
+_render_url  = os.environ.get("RENDER_EXTERNAL_URL", "")
+_url_slug    = _render_url.replace("https://", "").replace(".onrender.com", "")
+NODE_ID      = (
+    os.environ.get("NODE_ID")          # Manuel override
+    or _url_slug                       # Render URL'den slug (kararlı)
+    or ("agent-" + hashlib.md5(_render_url.encode() or b"local").hexdigest()[:8])
+)
+
 DATA_DIR     = Path("/agent_data")          # Dosya deposu
 RAM_CACHE_MB = int(os.environ.get("RAM_CACHE_MB", "256"))  # RAM önbelleği boyutu
 DISK_LIMIT_GB= 14.0                         # Disk limiti (Render ~18GB)
@@ -67,23 +79,21 @@ class RamCache:
         compressed = gzip.compress(data, compresslevel=1)
         sz = len(compressed)
         with self.lock:
-            # Eski girişi varsa kaldır
             if key in self.store:
                 self.size -= len(self.store[key])
                 del self.store[key]
-            # Yer aç
             while self.size + sz > self.limit and self.store:
                 _, old = self.store.popitem(last=False)
                 self.size -= len(old)
             if sz > self.limit:
-                return False   # Tekil veri limitten büyük
+                return False
             self.store[key] = compressed
             self.store.move_to_end(key)
             self.size += sz
         self._update_state()
         return True
 
-    def get(self, key: str) -> bytes | None:
+    def get(self, key: str):
         with self.lock:
             if key not in self.store:
                 self.misses += 1
@@ -129,7 +139,6 @@ ram_cache = RamCache(RAM_CACHE_MB)
 
 @app.route("/api/cache/set", methods=["POST"])
 def cache_set():
-    """Veriyi RAM önbelleğine yaz."""
     key  = request.args.get("key", "")
     data = request.get_data()
     if not key or not data:
@@ -140,7 +149,6 @@ def cache_set():
 
 @app.route("/api/cache/get/<path:key>")
 def cache_get(key):
-    """RAM önbelleğinden veri oku."""
     data = ram_cache.get(key)
     if data is None:
         return jsonify({"ok": False, "error": "miss"}), 404
@@ -187,7 +195,6 @@ def cache_flush():
 # ══════════════════════════════════════════════════════════════
 
 def _safe_path(category: str, filename: str) -> Path:
-    """Güvenli dosya yolu doğrulaması."""
     allowed = {"regions", "chunks", "backups", "plugins", "configs"}
     if category not in allowed:
         abort(403)
@@ -206,7 +213,6 @@ def _disk_used_gb() -> float:
 
 @app.route("/api/files/<category>", methods=["GET"])
 def file_list(category):
-    """Kategori içindeki dosyaları listele."""
     d = DATA_DIR / category
     d.mkdir(exist_ok=True)
     files = []
@@ -216,14 +222,13 @@ def file_list(category):
                 "name":     f.name,
                 "size":     f.stat().st_size,
                 "modified": int(f.stat().st_mtime),
-                "md5":      None,   # isteğe bağlı
+                "md5":      None,
             })
     return jsonify({"files": files, "count": len(files)})
 
 
 @app.route("/api/files/<category>/<path:filename>", methods=["PUT", "POST"])
 def file_upload(category, filename):
-    """Dosya yükle."""
     p = _safe_path(category, filename)
     if _disk_used_gb() > DISK_LIMIT_GB - 0.5:
         return jsonify({"ok": False, "error": "Disk dolu"}), 507
@@ -235,7 +240,6 @@ def file_upload(category, filename):
 
 @app.route("/api/files/<category>/<path:filename>", methods=["GET"])
 def file_download(category, filename):
-    """Dosya indir."""
     p = _safe_path(category, filename)
     if not p.exists():
         return jsonify({"ok": False, "error": "Dosya bulunamadı"}), 404
@@ -315,7 +319,7 @@ def _handle_proxy_conn(client_sock):
         srv.settimeout(10)
         srv.connect((host, port))
         srv.settimeout(None)
-    except Exception as e:
+    except Exception:
         client_sock.close()
         return
     _proxy_state["connections"] += 1
@@ -385,12 +389,6 @@ def proxy_status():
 # ══════════════════════════════════════════════════════════════
 #  4. CPU WORKER  (görev kuyruğu)
 # ══════════════════════════════════════════════════════════════
-# Desteklenen görev tipleri:
-#  - compress_file   : Dosyayı gzip ile sıkıştır
-#  - decompress_file : Gzip dosyayı aç
-#  - hash_files      : Dizindeki dosyaların MD5'ini hesapla
-#  - run_command     : Güvenli shell komutları çalıştır (beyaz liste)
-#  - chunk_stats     : Bölge dosyası analizi
 
 _task_queue   = []
 _task_results = {}
@@ -435,11 +433,14 @@ def _run_task(task_id: str, task: dict):
             result = {"ok": True, "hashes": hashes, "count": len(hashes)}
 
         elif t_type == "run_command":
-            cmd_parts = payload.get("cmd", "").split()
+            # DÜZELTİLDİ: shell=True + whitelist birlikte güvensizdi.
+            # Artık whitelist geçtikten sonra da shell=False ile çalıştırılıyor.
+            cmd_str   = payload.get("cmd", "")
+            cmd_parts = cmd_str.split()
             if not cmd_parts or cmd_parts[0] not in ALLOWED_COMMANDS:
                 result = {"ok": False, "error": f"Komut izin verilmiyor: {cmd_parts[0] if cmd_parts else '?'}"}
             else:
-                r = subprocess.run(payload["cmd"], shell=True, capture_output=True,
+                r = subprocess.run(cmd_parts, capture_output=True,
                                    timeout=30, cwd=str(DATA_DIR))
                 result = {
                     "ok":     r.returncode == 0,
@@ -508,7 +509,6 @@ def cpu_queue():
 # ══════════════════════════════════════════════════════════════
 
 def _get_resource_info() -> dict:
-    """Mevcut kaynak bilgilerini döndür."""
     import psutil
     vm   = psutil.virtual_memory()
     disk = psutil.disk_usage("/")
@@ -517,14 +517,17 @@ def _get_resource_info() -> dict:
         load1, load5, _ = os.getloadavg()
     except:
         load1 = load5 = 0.0
+    # DÜZELTİLDİ: tunnel alanı state'den alınıyor — boşsa da dahil ediliyor.
+    # Heartbeat tünel hazır olmadan giderse ana sunucu URL'yi bilemez,
+    # bu yüzden _register_loop tünel hazır olana kadar bekliyor (değişmedi).
     return {
         "node_id":      NODE_ID,
         "tunnel":       state["tunnel"],
         "ram": {
-            "total_mb":  vm.total  // 1024 // 1024,
-            "free_mb":   vm.available // 1024 // 1024,
-            "cache_mb":  ram_cache.stats["used_mb"],
-            "cache_keys":ram_cache.stats["keys"],
+            "total_mb":   vm.total  // 1024 // 1024,
+            "free_mb":    vm.available // 1024 // 1024,
+            "cache_mb":   ram_cache.stats["used_mb"],
+            "cache_keys": ram_cache.stats["keys"],
         },
         "disk": {
             "total_gb": round(disk.total / 1e9, 1),
@@ -536,8 +539,8 @@ def _get_resource_info() -> dict:
             "load1":  round(load1, 2),
             "load5":  round(load5, 2),
         },
-        "proxy":  _proxy_state.copy(),
-        "uptime": int(time.time() - _start_time),
+        "proxy":   _proxy_state.copy(),
+        "uptime":  int(time.time() - _start_time),
         "version": "agent-1.0",
     }
 
@@ -547,6 +550,7 @@ _start_time = time.time()
 
 def _register_loop():
     """Ana sunucuya kayıt ol, heartbeat gönder."""
+    # Tünel hazır olana kadar bekle
     while not state["tunnel"]:
         time.sleep(2)
 
@@ -577,6 +581,9 @@ def _register_loop():
         time.sleep(20)
         try:
             info = _get_resource_info()
+            # DÜZELTİLDİ: Tünel boşsa heartbeat gönderme (ana sunucu URL'yi güncelleyemez)
+            if not info.get("tunnel"):
+                continue
             _ur.urlopen(
                 _ur.Request(
                     f"{MAIN_URL.rstrip('/')}/api/agent/heartbeat",
@@ -586,7 +593,7 @@ def _register_loop():
                 ),
                 timeout=10,
             )
-        except Exception as e:
+        except Exception:
             pass
 
 
@@ -616,7 +623,7 @@ def _start_tunnel():
         except:
             pass
         time.sleep(0.5)
-    print("  [agent] ⚠️  Tünel URL alınamadı")
+    print("  [agent] ⚠️  Tünel URL alınamadı (120sn)")
     return ""
 
 
@@ -698,7 +705,6 @@ def api_status():
 #  BAŞLATMA
 # ══════════════════════════════════════════════════════════════
 
-# rlimit iyileştirmeleri
 for res, val in [
     (resource.RLIMIT_NOFILE, (65536, 65536)),
     (resource.RLIMIT_NPROC,  (resource.RLIM_INFINITY, resource.RLIM_INFINITY)),

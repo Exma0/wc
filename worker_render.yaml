@@ -2,6 +2,7 @@ services:
   - type: web
     name: mc-worker
     runtime: docker
+    # DÜZELTİLDİ: worker.Dockerfile artık doğrudan agent.py çalıştırıyor
     dockerfilePath: ./worker.Dockerfile
     plan: free
     envVars:
@@ -9,7 +10,11 @@ services:
         value: "5000"
       - key: MAIN_URL
         value: "https://wc-tsgd.onrender.com"   # ← Ana sunucu URL'in
+      - key: RAM_CACHE_MB
+        value: "300"
     disk:
       name: worker-disk
-      mountPath: /
-      sizeGB: 1    # Render free: disk ek ekleyemezsin ama /tmp 512MB var
+      # DÜZELTİLDİ: mountPath "/" idi → root filesystem'i eziyordu!
+      # Render free plan disk desteklemeyebilir; destekliyorsa /agent_data kullan.
+      mountPath: /agent_data
+      sizeGB: 10

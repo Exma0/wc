@@ -4,7 +4,6 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV HOME=/root
 ENV LANG=en_US.UTF-8
 ENV LC_ALL=en_US.UTF-8
-ENV PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 # ── ADIM 1: Temel araçlar ───────────────────────────────────
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -21,34 +20,26 @@ RUN curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg \
     && apt-get update && apt-get install -y cloudflared \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# ── ADIM 3: Python + NBD araçları ───────────────────────────
-# kmod      : modprobe komutu
-# nbd-server: NBD disk sunucu
-# nbd-client: nbd bağlantı testi için
-# socat     : TCP fallback için
+# ── ADIM 3: Python + bağımlılıklar ──────────────────────────
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 python3-pip \
-    kmod \
-    nbd-server \
-    nbd-client \
-    socat \
     net-tools procps \
     && pip3 install --no-cache-dir flask psutil \
     && pip3 cache purge \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# nbd modülünü önceden tanıt
-RUN mkdir -p /etc/modules-load.d \
-    && echo "nbd" >> /etc/modules-load.d/nbd.conf
-
 # ── ADIM 4: Uygulama ─────────────────────────────────────────
-# worker.Dockerfile artık main.py'yi destek modunda çalıştırır.
-# IS_MAIN = False → RENDER_EXTERNAL_URL != MAIN_SERVER_URL
-# Bu sayede tek kod tabanı: nbd-server + WS köprüsü + cloudflared HTTP tüneli
+# DÜZELTİLDİ: Önceden main.py + mc_panel.py kopyalanıyordu,
+# ama run_agent_mode() /app/agent.py'yi çalıştırmaya çalışıyordu
+# ve bulamayınca stub Flask sunucusu devreye giriyordu.
+# Artık doğrudan agent.py kopyalanıp çalıştırılıyor.
 WORKDIR /app
-COPY main.py     /app/main.py
-COPY mc_panel.py /app/mc_panel.py
+COPY agent.py /app/agent.py
+
+# Veri dizinleri
+RUN mkdir -p /agent_data/regions /agent_data/chunks /agent_data/backups \
+             /agent_data/plugins /agent_data/configs
 
 EXPOSE 5000
 
-CMD ["python3", "/app/main.py"]
+CMD ["python3", "/app/agent.py"]
