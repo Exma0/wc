@@ -261,8 +261,16 @@ def write_server_config():
 
 
 def get_jvm_args():
+    import psutil
+    total_mb = int(psutil.virtual_memory().total / 1024 / 1024)
+    xmx_mb   = max(256, int(total_mb * 0.85))   # toplam RAM'in %85'i
+    xms_mb   = max(256, int(xmx_mb   * 0.50))   # Xmx'in yarısı
+    xmx = f"{xmx_mb}M"
+    xms = f"{xms_mb}M"
+    log(f"[Panel] 🧠 Sistem RAM: {total_mb}MB → Xms={xms} Xmx={xmx}")
     return [
         "java",
+        f"-Xms{xms}", f"-Xmx{xmx}",
         "-XX:+UseG1GC",
         "-XX:+ParallelRefProcEnabled",
         "-XX:MaxGCPauseMillis=200",
