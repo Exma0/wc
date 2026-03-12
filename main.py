@@ -1,13 +1,40 @@
 """
-⛏️  Minecraft Server Boot — RENDER BYPASS v5.0
+⛏️  Minecraft Server Boot — RENDER BYPASS v6.0
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Render kısıtlamaları:
-  - 512MB fiziksel RAM cgroup limiti  → cgroup memsw sınırı kaldır
-  - 18GB disk limiti                  → swap MAX 8GB (güvenli)
-  - Swap kurul → SONRA JVM başlat     → OOM yok
+OTOMATİK MOD TESPİTİ:
+  - https://wc-tsgd.onrender.com → ANA SUNUCU  (Minecraft Panel)
+  - Diğer tüm URL'ler           → DESTEK MODU  (Disk/RAM sağlayıcı)
+
+DESTEK MODU:
+  - MC Panel açılmaz
+  - 14GB blok dosya oluşturur → NBD ile paylaşır
+  - Cloudflared TCP tüneli → Ana sunucuya bildirim
+  - Ana sunucu bu diski swap olarak kullanır (+14GB bellek)
 """
 
 import os, sys, subprocess, time, socket, resource, threading, re, glob
+
+# ══════════════════════════════════════════════════════════════
+#  ANA SUNUCU TESPİTİ
+# ══════════════════════════════════════════════════════════════
+
+MAIN_SERVER_URL = "https://wc-tsgd.onrender.com"
+
+# Render bu env var'ı otomatik olarak set eder (örn: https://mc-worker-abc.onrender.com)
+MY_URL = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/").rstrip("/")
+
+# FORCE_MAIN=1 ile her zaman ana sunucu modunda çalıştırılabilir
+IS_MAIN = (
+    MY_URL == MAIN_SERVER_URL
+    or MY_URL == ""
+    or os.environ.get("FORCE_MAIN", "") == "1"
+)
+
+print("\n" + "━"*52)
+print("  ⛏️   Minecraft Server — RENDER BYPASS v6.0")
+print(f"      URL: {MY_URL or '(belirlenemedi)'}")
+print(f"      MOD: {'🟢 ANA SUNUCU' if IS_MAIN else '🔵 DESTEK SUNUCUSU'}")
+print("━"*52 + "\n")
 
 PORT    = int(os.environ.get("PORT", "5000"))
 MC_PORT = 25565
@@ -52,14 +79,12 @@ def wait_port(port, timeout=60):
 
 
 # ══════════════════════════════════════════════════════════════
-#  AŞAMA 1 — CGROUP BYPASS (privileged=true ile çalışır)
+#  ORTAK: CGROUP BYPASS + SWAP + KERNEL OPTİMİZASYONU
 # ══════════════════════════════════════════════════════════════
 
 def bypass_cgroups():
     print("  [cgroup] Limitler kaldırılıyor...")
     n = 0
-
-    # cgroup v2
     for path, val in [
         ("/sys/fs/cgroup/memory.max",      "max"),
         ("/sys/fs/cgroup/memory.swap.max", "max"),
@@ -74,7 +99,6 @@ def bypass_cgroups():
                       ("memory.high","max"),("cpu.max","max"),("pids.max","max")]:
             w(cg + fn, v)
 
-    # cgroup v1
     for path, val in [
         ("/sys/fs/cgroup/memory/memory.limit_in_bytes",       "-1"),
         ("/sys/fs/cgroup/memory/memory.memsw.limit_in_bytes", "-1"),
@@ -92,7 +116,6 @@ def bypass_cgroups():
         w(cg + "memory.swappiness",           "100")
         w(cg + "memory.oom_control",          "0")
 
-    # OOM koruması — bu process öldürülmesin
     w("/proc/sys/vm/oom_kill_allocating_task", "0")
     w("/proc/sys/vm/panic_on_oom",             "0")
     try:
@@ -103,19 +126,12 @@ def bypass_cgroups():
     print(f"  ✅ cgroup → {n} limit kaldırıldı")
 
 
-# ══════════════════════════════════════════════════════════════
-#  AŞAMA 2 — SWAP KURULUMU (MAX 8GB — 18GB disk limitine uygun)
-# ══════════════════════════════════════════════════════════════
-
 def setup_swap():
     print("  [swap] Disk → Swap dönüşümü...")
     import psutil
 
-    # Render disk limiti: 18GB toplam
-    # Güvenli swap hedefi: 8GB (server.jar+world+log için 10GB bırak)
     disk     = psutil.disk_usage("/")
     free_gb  = disk.free / 1024 / 1024 / 1024
-    # Max 8GB, ama diskin %50'sini de geçme
     swap_gb  = min(8, int(free_gb * 0.50))
     swap_gb  = max(2, swap_gb)
     swap_mb  = swap_gb * 1024
@@ -127,16 +143,14 @@ def setup_swap():
     else:
         print(f"  📊 Disk boş: {free_gb:.1f}GB → Swap: {swap_gb}GB oluşturuluyor...")
 
-        # Varsa kaldır
         if os.path.exists(swap_file):
             sh(f"swapoff {swap_file} 2>/dev/null")
             try: os.remove(swap_file)
             except: pass
 
-        # Oluştur
         ret = sh(f"fallocate -l {swap_mb}M {swap_file}")
         if ret.returncode != 0:
-            sh(f"dd if=/dev/zero of={swap_file} bs=64M count={swap_mb//64} status=none")
+            sh(f"dd if=/dev/zero of={swap_file} bs=64M count={max(1,swap_mb//64)} status=none")
 
         sh(f"chmod 600 {swap_file}")
         sh(f"mkswap -f {swap_file}")
@@ -147,16 +161,15 @@ def setup_swap():
         else:
             print(f"  ⚠️  swapon: {ret2.stderr.decode().strip()}")
 
-    # zram — RAM'i sıkıştır (yüksek öncelik)
+    # zram
     sh("modprobe zram num_devices=1 2>/dev/null")
     mem_mb  = psutil.virtual_memory().total // 1024 // 1024
     zram_mb = min(2048, mem_mb // 2)
     w("/sys/block/zram0/comp_algorithm", "lz4")
     if w("/sys/block/zram0/disksize", f"{zram_mb}M"):
         if sh("mkswap /dev/zram0 && swapon -p 100 /dev/zram0").returncode == 0:
-            print(f"  ✅ zram: {zram_mb}MB sıkıştırılmış RAM (öncelikli swap)")
+            print(f"  ✅ zram: {zram_mb}MB sıkıştırılmış RAM")
 
-    # Kernel swap davranışı
     for path, val in [
         ("/proc/sys/vm/swappiness",             "100"),
         ("/proc/sys/vm/vfs_cache_pressure",     "200"),
@@ -171,91 +184,46 @@ def setup_swap():
     swp2 = psutil.swap_memory()
     mem  = psutil.virtual_memory()
     total_mb = (mem.total + swp2.total) // 1024 // 1024
-    print(f"  🎯 RAM={mem.total//1024//1024}MB + Swap={swp2.total//1024//1024}MB = {total_mb}MB kullanılabilir")
+    print(f"  🎯 RAM={mem.total//1024//1024}MB + Swap={swp2.total//1024//1024}MB = {total_mb}MB")
     return total_mb
 
 
-# ══════════════════════════════════════════════════════════════
-#  AŞAMA 3 — KERNEL OPTİMİZASYONU
-# ══════════════════════════════════════════════════════════════
-
 def optimize_kernel():
     print("  [kernel] Parametreler ayarlanıyor...")
-
     params = {
         "/proc/sys/kernel/pid_max":                  "4194304",
         "/proc/sys/kernel/threads-max":              "4194304",
         "/proc/sys/kernel/sched_rt_runtime_us":      "-1",
-        "/proc/sys/kernel/sched_latency_ns":         "4000000",
-        "/proc/sys/kernel/sched_min_granularity_ns": "500000",
-        "/proc/sys/kernel/perf_event_paranoid":      "-1",
-        "/proc/sys/kernel/kptr_restrict":            "0",
-        "/proc/sys/kernel/dmesg_restrict":           "0",
-        "/proc/sys/kernel/yama/ptrace_scope":        "0",
-        "/proc/sys/kernel/nmi_watchdog":             "0",
-        "/proc/sys/kernel/randomize_va_space":       "0",
         "/proc/sys/fs/file-max":                     "2097152",
         "/proc/sys/fs/nr_open":                      "2097152",
-        "/proc/sys/fs/inotify/max_user_watches":     "524288",
-        "/proc/sys/net/core/rmem_max":               "134217728",
-        "/proc/sys/net/core/wmem_max":               "134217728",
         "/proc/sys/net/core/somaxconn":              "65535",
         "/proc/sys/net/ipv4/tcp_tw_reuse":           "1",
         "/proc/sys/net/ipv4/tcp_fin_timeout":        "10",
-        "/proc/sys/net/ipv4/tcp_fastopen":           "3",
-        "/proc/sys/net/ipv4/tcp_max_syn_backlog":    "65536",
-        "/proc/sys/net/ipv4/ip_local_port_range":    "1024 65535",
-        "/proc/sys/user/max_user_namespaces":        "65536",
     }
     ok = sum(w(p, v) for p, v in params.items())
 
-    # ulimits
     for res, val in [
         (resource.RLIMIT_NOFILE,  (1048576, 1048576)),
         (resource.RLIMIT_NPROC,   (INF, INF)),
         (resource.RLIMIT_STACK,   (INF, INF)),
-        (resource.RLIMIT_CORE,    (INF, INF)),
         (resource.RLIMIT_MEMLOCK, (INF, INF)),
     ]:
         try: resource.setrlimit(res, val)
         except Exception: pass
 
-    # CPU governor
-    govs = glob.glob("/sys/devices/system/cpu/cpu*/cpufreq/scaling_governor")
-    gc = sum(w(g, "performance") for g in govs)
-
-    # I/O scheduler
-    for dev in glob.glob("/sys/block/*/queue/scheduler"):
-        for s in ["none", "mq-deadline", "noop"]:
-            if w(dev, s): break
-    for dev in glob.glob("/sys/block/*/queue/nr_requests"):   w(dev, "256")
-    for dev in glob.glob("/sys/block/*/queue/read_ahead_kb"): w(dev, "1024")
-
-    # HugePage
     w("/sys/kernel/mm/transparent_hugepage/enabled", "madvise")
-    w("/sys/kernel/mm/transparent_hugepage/defrag",  "defer+madvise")
+    print(f"  ✅ {ok}/{len(params)} parametre ayarlandı")
 
-    print(f"  ✅ {ok}/{len(params)} parametre | CPU gov: {gc} çekirdek | HugePage aktif")
-
-
-# ══════════════════════════════════════════════════════════════
-#  ANA OPTİMİZASYON — SIRALAMASI ÖNEMLİ
-# ══════════════════════════════════════════════════════════════
 
 def optimize_all():
     print("\n" + "═"*52)
     print("  🔓 RENDER BYPASS — TÜM LİMİTLER KALDIRILIYOR")
     print("═"*52 + "\n")
 
-    # 1. Önce cgroup bypass (RAM limiti kaldır)
     bypass_cgroups()
     print()
-
-    # 2. Swap kur (cgroup kaldırıldıktan SONRA — yoksa swapon engellenir)
     total_mb = setup_swap()
     print()
-
-    # 3. Kernel optimize
     optimize_kernel()
 
     import psutil
@@ -273,8 +241,12 @@ def optimize_all():
 
 
 # ══════════════════════════════════════════════════════════════
-#  PANEL + MC + TUNNEL
+#  ANA SUNUCU: Panel + MC + Tunnel
 # ══════════════════════════════════════════════════════════════
+
+_worker_registered = threading.Event()
+_worker_info       = {}
+
 
 def start_panel():
     print(f"\n🚀 [2/4] Panel başlatılıyor (:{PORT})...")
@@ -309,7 +281,7 @@ def auto_start_sequence():
     if wait_port(MC_PORT, 300):
         print("  ✅ MC Server hazır!")
     else:
-        print("  ⚠️  MC portu zaman aşımı — tunnel yine de açılıyor")
+        print("  ⚠️  MC portu zaman aşımı")
 
     print("\n🌐 [4/4] Cloudflare Tunnel...")
     log_file = "/tmp/cf_mc.log"
@@ -349,32 +321,10 @@ def auto_start_sequence():
     print("  ⚠️  Tunnel URL alınamadı")
 
 
-# ══════════════════════════════════════════════════════════════
-#  MAIN
-# ══════════════════════════════════════════════════════════════
-
-
-# ══════════════════════════════════════════════════════════════
-#  WORKER NBD — 2. Render hesabının diskini swap olarak bağla
-# ══════════════════════════════════════════════════════════════
-# render.yaml'a WORKER_HOST=xxx.trycloudflare.com ekle
-# VEYA worker servisi otomatik olarak /api/worker/register'a bildirir.
-
-_worker_registered = threading.Event()
-_worker_info       = {}
-
-
 def connect_worker_nbd(host: str, local_port: int = 10810, nbd_dev: str = "/dev/nbd0"):
-    """
-    1. cloudflared access TCP → yerel port aç
-    2. nbd-client → /dev/nbd0
-    3. mkswap + swapon (öncelik 5)
-    """
     print(f"\n  [worker-nbd] Bağlanılıyor: {host}...")
-
     sh("modprobe nbd max_part=0 2>/dev/null")
 
-    # cloudflared access TCP tüneli → yerel port
     cf_proc = subprocess.Popen([
         "cloudflared", "access", "tcp",
         "--hostname", host,
@@ -382,7 +332,6 @@ def connect_worker_nbd(host: str, local_port: int = 10810, nbd_dev: str = "/dev/
     ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     time.sleep(4)
 
-    # nbd-client
     ret = sh(f"nbd-client localhost {local_port} {nbd_dev} -N disk -b 4096 -t 60")
     if ret.returncode != 0:
         print(f"  ⚠️  nbd-client başarısız: {ret.stderr.decode().strip()}")
@@ -390,7 +339,7 @@ def connect_worker_nbd(host: str, local_port: int = 10810, nbd_dev: str = "/dev/
         return False
 
     sh(f"mkswap {nbd_dev}")
-    ret2 = sh(f"swapon -p 5 {nbd_dev}")   # öncelik 5 > yerel disk (0) < zram (100)
+    ret2 = sh(f"swapon -p 5 {nbd_dev}")
     if ret2.returncode == 0:
         import psutil as _p
         swp = _p.swap_memory()
@@ -406,7 +355,6 @@ def connect_worker_nbd(host: str, local_port: int = 10810, nbd_dev: str = "/dev/
 
 
 def try_connect_worker():
-    """Env'den WORKER_HOST varsa bağlan, yoksa bildirim bekle (90sn)."""
     host = os.environ.get("WORKER_HOST", "").strip()
     if host:
         print(f"  [worker] WORKER_HOST env: {host}")
@@ -421,21 +369,276 @@ def try_connect_worker():
         print("  [worker] Timeout — worker yok, lokal swap ile devam")
 
 
-print("\n" + "━"*52)
-print("  ⛏️   Minecraft Server — RENDER BYPASS v5.0")
-print(f"      PORT={PORT}  |  MC_RAM={MC_RAM}")
-print("━"*52)
+# ══════════════════════════════════════════════════════════════
+#  DESTEK SUNUCUSU: Disk Paylaşımı
+# ══════════════════════════════════════════════════════════════
 
-print("\n⚡ [1/4] Limit bypass + Optimizasyon...")
+SUPPORT_NBD_GB   = 14
+SUPPORT_NBD_PORT = 10809
+SUPPORT_NBD_FILE = "/nbd_disk.img"
+SUPPORT_NODE_ID  = MY_URL.replace("https://", "").replace(".onrender.com", "")
+
+
+def support_create_disk():
+    size_mb = SUPPORT_NBD_GB * 1024
+    if os.path.exists(SUPPORT_NBD_FILE):
+        gb = os.path.getsize(SUPPORT_NBD_FILE) / 1024**3
+        if gb >= SUPPORT_NBD_GB * 0.9:
+            print(f"  [destek] ✅ Blok dosya zaten var: {gb:.1f}GB")
+            return
+    print(f"  [destek] 💾 {SUPPORT_NBD_GB}GB blok dosya oluşturuluyor...")
+    ret = sh(f"fallocate -l {size_mb}M {SUPPORT_NBD_FILE}")
+    if ret.returncode != 0:
+        for i in range(SUPPORT_NBD_GB):
+            sh(f"dd if=/dev/zero of={SUPPORT_NBD_FILE} bs=64M count=16 seek={i*1024} 2>/dev/null")
+            print(f"  [destek] {i+1}/{SUPPORT_NBD_GB}GB...")
+    gb = os.path.getsize(SUPPORT_NBD_FILE) / 1024**3
+    print(f"  [destek] ✅ Blok dosya hazır: {gb:.1f}GB")
+
+
+def support_start_nbd():
+    sh("modprobe nbd max_part=0 2>/dev/null")
+    os.makedirs("/etc/nbd-server", exist_ok=True)
+    open("/etc/nbd-server/config", "w").write(f"""
+[generic]
+    port = {SUPPORT_NBD_PORT}
+    allowlist = true
+[disk]
+    exportname = {SUPPORT_NBD_FILE}
+    readonly = false
+    flush = true
+""")
+    print(f"  [destek] 🔌 nbd-server başlatılıyor...")
+    proc = subprocess.Popen(
+        ["nbd-server", "-C", "/etc/nbd-server/config"],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT
+    )
+    time.sleep(2)
+    if proc.poll() is None:
+        print(f"  [destek] ✅ nbd-server aktif (port {SUPPORT_NBD_PORT})")
+        return True
+    print("  [destek] ⚠️  nbd-server yok → socat fallback...")
+    subprocess.Popen([
+        "socat", f"TCP-LISTEN:{SUPPORT_NBD_PORT},reuseaddr,fork",
+        f"FILE:{SUPPORT_NBD_FILE},rdwr,creat"
+    ])
+    time.sleep(1)
+    return True
+
+
+def support_start_tunnel_and_register():
+    log = "/tmp/cf_support.log"
+    print(f"  [destek] 🌐 Cloudflare TCP tüneli açılıyor...")
+    subprocess.Popen([
+        "cloudflared", "tunnel",
+        "--url", f"tcp://localhost:{SUPPORT_NBD_PORT}",
+        "--no-autoupdate", "--loglevel", "info",
+    ], stdout=open(log, "w"), stderr=subprocess.STDOUT)
+
+    for _ in range(120):
+        try:
+            content = open(log).read()
+            urls = re.findall(r'https://[a-z0-9-]+\.trycloudflare\.com', content)
+            if urls:
+                url  = urls[0]
+                host = url.replace("https://", "")
+                print(f"\n  [destek] ╔══════════════════════════════════════╗")
+                print(f"  [destek] ║  ✅ DESTEK SUNUCU HAZIR               ║")
+                print(f"  [destek] ║  Host: {host:<30}║")
+                print(f"  [destek] ╚══════════════════════════════════════╝\n")
+
+                # Ana sunucuya kayıt ol
+                _support_register(url, host)
+                # Periyodik heartbeat
+                threading.Thread(target=_support_heartbeat,
+                                 args=(host,), daemon=True).start()
+                return url
+        except Exception:
+            pass
+        time.sleep(0.5)
+    print("  [destek] ⚠️  Tünel URL alınamadı")
+    return ""
+
+
+def _support_register(url, host):
+    import urllib.request, json as _j, psutil as _p
+    try:
+        mem  = _p.virtual_memory()
+        disk = _p.disk_usage("/")
+        data = _j.dumps({
+            "worker_host": host,
+            "worker_url":  url,
+            "nbd_gb":      SUPPORT_NBD_GB,
+            "node_id":     SUPPORT_NODE_ID,
+            "ram_mb":      mem.total // 1024 // 1024,
+            "disk_free_gb": disk.free // 1024 // 1024 // 1024,
+        }).encode()
+        req = urllib.request.Request(
+            f"{MAIN_SERVER_URL}/api/worker/register",
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+        resp = urllib.request.urlopen(req, timeout=15)
+        print(f"  [destek] ✅ Ana sunucuya kayıt tamamlandı: {MAIN_SERVER_URL}")
+    except Exception as e:
+        print(f"  [destek] ⚠️  Kayıt hatası: {e}")
+        print(f"  [destek]    Ana sunucu: {MAIN_SERVER_URL}")
+
+
+def _support_heartbeat(host):
+    import urllib.request, json as _j, psutil as _p
+    while True:
+        time.sleep(30)
+        try:
+            mem  = _p.virtual_memory()
+            disk = _p.disk_usage("/")
+            data = _j.dumps({
+                "node_id":     SUPPORT_NODE_ID,
+                "ram_mb":      mem.available // 1024 // 1024,
+                "disk_free_gb": disk.free // 1024 // 1024 // 1024,
+            }).encode()
+            req = urllib.request.Request(
+                f"{MAIN_SERVER_URL}/api/worker/heartbeat",
+                data=data,
+                headers={"Content-Type": "application/json"},
+                method="POST"
+            )
+            urllib.request.urlopen(req, timeout=10)
+        except Exception:
+            pass
+
+
+def run_support_mode():
+    """
+    DESTEK MODU — MC Panel açılmaz.
+    Disk paylaşır, ana sunucuya destek verir.
+    Flask sağlık endpoint'i tutar.
+    """
+    from flask import Flask, jsonify
+    import psutil
+
+    print("\n" + "═"*52)
+    print("  🔵 DESTEK MODU — MC Panel kapalı")
+    print(f"  Ana sunucu: {MAIN_SERVER_URL}")
+    print("═"*52 + "\n")
+
+    # 1. Blok dosya
+    support_create_disk()
+    # 2. NBD server
+    support_start_nbd()
+    # 3. Tünel + kayıt (arka planda)
+    threading.Thread(target=support_start_tunnel_and_register, daemon=True).start()
+
+    # 4. Sağlık paneli (Render uyuma yapmasın)
+    support_app = Flask(__name__)
+
+    @support_app.route("/")
+    @support_app.route("/health")
+    def health():
+        mem  = psutil.virtual_memory()
+        disk = psutil.disk_usage("/")
+        swp  = psutil.swap_memory()
+        return SUPPORT_HTML.format(
+            main_url=MAIN_SERVER_URL,
+            node_id=SUPPORT_NODE_ID,
+            nbd_gb=SUPPORT_NBD_GB,
+            ram_total=mem.total//1024//1024,
+            ram_free=mem.available//1024//1024,
+            disk_total=disk.total//1024//1024//1024,
+            disk_free=disk.free//1024//1024//1024,
+            swap_total=swp.total//1024//1024,
+        )
+
+    @support_app.route("/api/worker/status")
+    def status():
+        mem  = psutil.virtual_memory()
+        disk = psutil.disk_usage("/")
+        return jsonify({
+            "mode":    "support",
+            "node_id": SUPPORT_NODE_ID,
+            "main":    MAIN_SERVER_URL,
+            "nbd_gb":  SUPPORT_NBD_GB,
+            "ram_mb":  mem.total // 1024 // 1024,
+            "disk_free_gb": disk.free // 1024 // 1024 // 1024,
+        })
+
+    print(f"[Destek] Flask sağlık paneli :{PORT}...")
+    support_app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
+
+
+SUPPORT_HTML = """<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>🔵 Destek Sunucusu</title>
+<style>
+* {{ box-sizing: border-box; margin: 0; padding: 0; }}
+body {{ background: #0a0b12; color: #eef0f8; font-family: 'Segoe UI', sans-serif; min-height: 100vh;
+  display: flex; align-items: center; justify-content: center; }}
+.card {{ background: #0f1120; border: 1px solid rgba(124,106,255,.3); border-radius: 16px;
+  padding: 36px 44px; max-width: 520px; width: 90%; text-align: center; }}
+.icon {{ font-size: 56px; margin-bottom: 16px; }}
+h1 {{ font-size: 22px; font-weight: 700; margin-bottom: 8px; color: #7c6aff; }}
+.sub {{ font-size: 13px; color: #8892a4; margin-bottom: 28px; }}
+.stat {{ display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 24px; }}
+.s {{ background: rgba(255,255,255,.04); border: 1px solid rgba(255,255,255,.07);
+  border-radius: 10px; padding: 14px; }}
+.sv {{ font-size: 22px; font-weight: 700; color: #00e5ff; font-family: monospace; }}
+.sl {{ font-size: 11px; color: #8892a4; margin-top: 3px; }}
+.link {{ display: inline-block; margin-top: 8px; padding: 10px 24px;
+  background: linear-gradient(135deg,#7c6aff,#00e5ff); color: #000;
+  border-radius: 9px; font-weight: 700; text-decoration: none; font-size: 13px; }}
+.badge {{ display: inline-flex; align-items: center; gap: 6px; padding: 4px 12px;
+  border-radius: 20px; font-size: 11px; font-weight: 700;
+  background: rgba(124,106,255,.12); border: 1px solid rgba(124,106,255,.3); color: #7c6aff;
+  margin-bottom: 20px; }}
+.dot {{ width: 8px; height: 8px; border-radius: 50%; background: #7c6aff;
+  box-shadow: 0 0 6px #7c6aff; animation: blink 1.5s infinite; }}
+@keyframes blink {{ 0%,100%{{opacity:1}} 50%{{opacity:.3}} }}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="icon">🔵</div>
+  <div class="badge"><div class="dot"></div> DESTEK MODU AKTIF</div>
+  <h1>Destek Sunucusu</h1>
+  <div class="sub">Bu sunucu MC Panel açmaz.<br>Ana sunucuya disk ve RAM desteği sağlar.</div>
+  <div class="stat">
+    <div class="s"><div class="sv">{nbd_gb}GB</div><div class="sl">💾 Paylaşılan Disk</div></div>
+    <div class="s"><div class="sv">{ram_free}MB</div><div class="sl">🧠 Boş RAM</div></div>
+    <div class="s"><div class="sv">{disk_free}GB</div><div class="sl">📦 Disk Boş</div></div>
+    <div class="s"><div class="sv">{swap_total}MB</div><div class="sl">⚡ Swap</div></div>
+  </div>
+  <div style="font-size:12px;color:#3d4558;margin-bottom:16px">
+    Node: <span style="color:#7c6aff;font-family:monospace">{node_id}</span>
+  </div>
+  <a class="link" href="{main_url}" target="_blank">→ Ana Sunucuya Git</a>
+</div>
+</body>
+</html>"""
+
+
+# ══════════════════════════════════════════════════════════════
+#  BAŞLAT
+# ══════════════════════════════════════════════════════════════
+
+print("\n⚡ Limit bypass + Optimizasyon...")
 optimize_all()
 
-panel_proc = start_panel()
-threading.Thread(target=auto_start_sequence, daemon=True).start()
-threading.Thread(target=try_connect_worker, daemon=True).start()
+if IS_MAIN:
+    # ── ANA SUNUCU MODU ────────────────────────────────────────
+    print(f"\n{'━'*52}")
+    print(f"  🟢 ANA SUNUCU MODU")
+    print(f"  Panel: http://0.0.0.0:{PORT}")
+    print(f"{'━'*52}\n")
 
-print(f"\n{'━'*52}")
-print(f"  Panel: http://0.0.0.0:{PORT}")
-print(f"{'━'*52}\n")
+    panel_proc = start_panel()
+    threading.Thread(target=auto_start_sequence, daemon=True).start()
+    threading.Thread(target=try_connect_worker,  daemon=True).start()
 
-panel_proc.wait()
-
+    panel_proc.wait()
+else:
+    # ── DESTEK SUNUCUSU MODU ───────────────────────────────────
+    run_support_mode()

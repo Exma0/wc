@@ -41,6 +41,8 @@ server_state = {
     "max_players": 20,
     "online_players": 0,
 }
+# Worker/destek sunucuları listesi
+support_nodes = {}   # {node_id: {host, nbd_gb, ram_mb, connected_at, ...}}
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = "mc-panel-secret"
@@ -256,10 +258,6 @@ def write_server_config():
 
 
 def _setup_swap():
-    """
-    Tüm cgroup/bellek limitleri kaldır + disk → swap.
-    main.py zaten boot'ta yapıyor; panel yeniden başlarsa diye burada da çalışır.
-    """
     import psutil, subprocess, os, glob
 
     def _w(path, val):
@@ -295,17 +293,9 @@ def _setup_swap():
             ("/sys/fs/cgroup/pids/pids.max",                      "max"),
         ]:
             _w(path, val)
-        for cg_dir in glob.glob("/sys/fs/cgroup/memory/*/"):
-            _w(cg_dir + "memory.limit_in_bytes",       "-1")
-            _w(cg_dir + "memory.memsw.limit_in_bytes", "-1")
-            _w(cg_dir + "memory.swappiness",           "100")
-            _w(cg_dir + "memory.oom_control",          "0")
-        for cg_dir in glob.glob("/sys/fs/cgroup/cpu/*/"):
-            _w(cg_dir + "cpu.cfs_quota_us", "-1")
 
         log("[Panel] 🔓 cgroup tüm limitler kaldırıldı")
 
-        # ── Swap zaten yeterliyse atla ─────────────────────────
         swp = psutil.swap_memory()
         disk = psutil.disk_usage("/")
         free_gb = disk.free / 1024 / 1024 / 1024
@@ -336,28 +326,23 @@ def _setup_swap():
 
             subprocess.run(["chmod", "600", swap_file], capture_output=True)
             subprocess.run(["mkswap", "-f", swap_file], capture_output=True)
-            subprocess.run(["swapon", "-p", "0", swap_file], capture_output=True)
-
-            # zram
-            subprocess.run(["modprobe", "zram", "num_devices=1"], capture_output=True)
-            zram_mb = min(4096, psutil.virtual_memory().total // 1024 // 1024)
-            _w("/sys/block/zram0/comp_algorithm", "lz4")
-            if _w("/sys/block/zram0/disksize", f"{zram_mb}M"):
-                subprocess.run(["mkswap", "/dev/zram0"], capture_output=True)
-                subprocess.run(["swapon", "-p", "100", "/dev/zram0"], capture_output=True)
+            r2 = subprocess.run(["swapon", "-p", "0", swap_file], capture_output=True)
+            if r2.returncode == 0:
+                log(f"[Panel] ✅ Swap dosyası aktif: {swap_mb}MB")
+            else:
+                log(f"[Panel] ⚠️  Swap/cgroup hatası: {r2.stderr.decode().strip()}")
 
         # ── VM ayarları ────────────────────────────────────────
         for path, val in [
-            ("/proc/sys/vm/swappiness",             "200"),
-            ("/proc/sys/vm/vfs_cache_pressure",     "500"),
+            ("/proc/sys/vm/swappiness",             "100"),
+            ("/proc/sys/vm/vfs_cache_pressure",     "200"),
             ("/proc/sys/vm/overcommit_memory",      "1"),
             ("/proc/sys/vm/overcommit_ratio",       "100"),
             ("/proc/sys/vm/page-cluster",           "0"),
             ("/proc/sys/vm/watermark_boost_factor", "0"),
             ("/proc/sys/vm/drop_caches",            "3"),
         ]:
-            if not _w(path, val) and "swappiness" in path:
-                _w(path, "100")
+            _w(path, val)
 
         swp2 = psutil.swap_memory()
         mem  = psutil.virtual_memory()
@@ -369,11 +354,6 @@ def _setup_swap():
 
 
 def _ram_watchdog():
-    """
-    RAM + Swap watchdog.
-    cgroup limiti kaldırıldı, swap aktif → 512MB kısıtı yok.
-    Sadece toplam boş alan azaldığında entity temizle.
-    """
     import psutil
     last_warn = 0
 
@@ -383,10 +363,8 @@ def _ram_watchdog():
             mem  = psutil.virtual_memory()
             swp  = psutil.swap_memory()
             avail_mb = int((mem.available + swp.free) / 1024 / 1024)
-            import time
 
             if avail_mb < 512:
-                # Kritik: 512MB'den az boş → agresif temizlik
                 try:
                     with open("/proc/sys/vm/drop_caches", "w") as f:
                         f.write("3")
@@ -398,7 +376,6 @@ def _ram_watchdog():
                 send_command("save-all")
 
             elif avail_mb < 1024:
-                # Uyarı: 1GB'dan az kaldı
                 now = time.time()
                 if now - last_warn > 60:
                     send_command("kill @e[type=item]")
@@ -411,11 +388,8 @@ def _ram_watchdog():
 
 def get_jvm_args():
     """
+    ✅ DÜZELTİLDİ: G1PeriodicGCSysLoadThreshold kaldırıldı (Java 21 uyumsuz)
     Strateji: Fiziksel RAM (RSS) düşük tut → Render 512MB limitini aşma.
-    Ama swap üzerinden büyük heap kullan → Minecraft rahat çalışsın.
-    - Xms=64M  → JVM başlangıçta az fiziksel RAM alır
-    - Xmx=büyük → heap swap'a taşabilir
-    - PeriodicGC → JVM heap'i OS'a geri verir → RSS düşer
     """
     import psutil
     mem      = psutil.virtual_memory()
@@ -423,10 +397,9 @@ def get_jvm_args():
     total_mb = int(mem.total / 1024 / 1024)
     swap_mb  = int(swp.total / 1024 // 1024)
 
-    # Xmx = fiziksel RAM'in %50'si + swap'ın %70'i, max 12GB
     xmx_mb = min(12288, int(total_mb * 0.50) + int(swap_mb * 0.70))
     xmx_mb = max(512, xmx_mb)
-    xms_mb = 64   # KÜÇÜK başlat — fiziksel RAM önceden ayrılmaz
+    xms_mb = 64
 
     xmx = f"{xmx_mb}M"
     xms = f"{xms_mb}M"
@@ -440,16 +413,16 @@ def get_jvm_args():
         "-XX:CompressedClassSpaceSize=128m",
         "-XX:MaxMetaspaceSize=256m",
 
-        # ── G1GC + Heap'i OS'a geri ver (kritik!) ─────────────
+        # ── G1GC + Heap'i OS'a geri ver ───────────────────────
         "-XX:+UseG1GC",
         "-XX:+ParallelRefProcEnabled",
         "-XX:MaxGCPauseMillis=200",
         "-XX:+UnlockExperimentalVMOptions",
         "-XX:+DisableExplicitGC",
 
+        # ✅ G1PeriodicGCSysLoadThreshold KALDIRILDI (Java 21 desteklemiyor)
         # Periyodik GC: boş heap sayfalarını OS'a geri ver → RSS düşer
         "-XX:G1PeriodicGCInterval=15000",
-        "-XX:G1PeriodicGCSysLoadThreshold=0.0",
         "-XX:+G1PeriodicGCInvokesConcurrent",
 
         # Heap bölge boyutu
@@ -484,8 +457,6 @@ def start_server():
         return False, "Server zaten çalışıyor"
 
     MC_DIR.mkdir(parents=True, exist_ok=True)
-
-    # ── Swap kurulumu — disk alanını RAM'e çevir ──────────────
     _setup_swap()
 
     if not MC_JAR.exists():
@@ -581,7 +552,8 @@ def api_restart():
 def api_status():
     return jsonify({**server_state,
                     "players": _players_list(),
-                    "tunnel": tunnel_info})
+                    "tunnel": tunnel_info,
+                    "support_nodes": list(support_nodes.values())})
 
 
 @app.route("/api/command", methods=["POST"])
@@ -612,19 +584,33 @@ def api_tunnel():
     return jsonify(tunnel_info)
 
 
+# ── Worker / Destek Sunucusu API ──────────────────────────────
+
 @app.route("/api/worker/register", methods=["POST"])
 def api_worker_register():
     """
-    Worker servisi başladığında buraya bildirim gönderir.
-    main.py'deki _worker_registered event'ini tetikler → NBD bağlantısı kurulur.
+    Destek sunucusu başladığında buraya bildirim gönderir.
+    Otomatik olarak NBD bağlantısı kurulur.
     """
     import sys as _sys
     d = request.json or {}
     host    = d.get("worker_host", "")
     nbd_gb  = d.get("nbd_gb", 0)
-    log(f"[Panel] ⚙️  Worker bildirildi: {host} ({nbd_gb}GB)")
+    node_id = d.get("node_id", host)
 
-    # main.py'deki event'i tetikle (aynı process'te çalışıyor)
+    log(f"[Panel] ⚙️  Destek düğümü bağlandı: {host} ({nbd_gb}GB)")
+
+    # Destek sunucusunu kaydet
+    support_nodes[node_id] = {
+        "node_id":      node_id,
+        "host":         host,
+        "nbd_gb":       nbd_gb,
+        "connected_at": time.time(),
+        "status":       "connecting",
+    }
+    socketio.emit("support_nodes_update", list(support_nodes.values()))
+
+    # main.py'deki event'i tetikle
     main_mod = _sys.modules.get("__main__")
     if main_mod:
         info = getattr(main_mod, "_worker_info", {})
@@ -635,7 +621,23 @@ def api_worker_register():
             ev.set()
 
     socketio.emit("worker_update", {"host": host, "nbd_gb": nbd_gb})
-    return jsonify({"ok": True, "message": f"Worker {host} kaydedildi"})
+    return jsonify({"ok": True, "message": f"Destek düğümü {host} kaydedildi"})
+
+
+@app.route("/api/worker/heartbeat", methods=["POST"])
+def api_worker_heartbeat():
+    """Destek sunucusu periyodik ping gönderir."""
+    d = request.json or {}
+    node_id = d.get("node_id", "")
+    if node_id in support_nodes:
+        support_nodes[node_id].update({
+            "last_ping": time.time(),
+            "ram_mb":    d.get("ram_mb", 0),
+            "disk_free_gb": d.get("disk_free_gb", 0),
+            "status":    "connected",
+        })
+        socketio.emit("support_nodes_update", list(support_nodes.values()))
+    return jsonify({"ok": True})
 
 
 @app.route("/api/worker/status")
@@ -645,8 +647,13 @@ def api_worker_status():
     info = {}
     if main_mod:
         info = getattr(main_mod, "_worker_info", {})
-    return jsonify(info)
+    return jsonify({
+        "nodes": list(support_nodes.values()),
+        "legacy": info
+    })
 
+
+# ── Oyuncu yönetimi ───────────────────────────────────────────
 
 @app.route("/api/players")
 def api_players():
@@ -869,19 +876,9 @@ def api_plugins():
     pdir.mkdir(exist_ok=True)
     result = []
     for jar in sorted(pdir.glob("*.jar")):
-        result.append({
-            "name":    jar.stem,
-            "file":    jar.name,
-            "size":    jar.stat().st_size,
-            "enabled": True,
-        })
+        result.append({"name": jar.stem, "file": jar.name, "size": jar.stat().st_size, "enabled": True})
     for jar in sorted(pdir.glob("*.jar.disabled")):
-        result.append({
-            "name":    jar.name.replace(".jar.disabled", ""),
-            "file":    jar.name,
-            "size":    jar.stat().st_size,
-            "enabled": False,
-        })
+        result.append({"name": jar.name.replace(".jar.disabled", ""), "file": jar.name, "size": jar.stat().st_size, "enabled": False})
     return jsonify(result)
 
 
@@ -895,8 +892,7 @@ def api_plugin_upload():
             dest = pdir / f.filename
             f.save(str(dest))
             uploaded.append(f.filename)
-    return jsonify({"ok": True, "uploaded": uploaded,
-                    "msg": f"{len(uploaded)} plugin yüklendi. Yeniden başlatın."})
+    return jsonify({"ok": True, "uploaded": uploaded, "msg": f"{len(uploaded)} plugin yüklendi. Yeniden başlatın."})
 
 
 @app.route("/api/plugins/delete", methods=["POST"])
@@ -924,20 +920,17 @@ def api_plugin_toggle():
 def api_plugin_search():
     q = request.args.get("q", "")
     try:
-        r = requests.get(
-            f"https://hangar.papermc.io/api/v1/projects?q={q}&limit=12",
-            timeout=10
-        )
+        r = requests.get(f"https://hangar.papermc.io/api/v1/projects?q={q}&limit=12", timeout=10)
         data = r.json()
         out  = []
         for p in data.get("result", []):
             ns = p.get("namespace", {})
             out.append({
-                "name":      p.get("name", ""),
+                "name":        p.get("name", ""),
                 "description": p.get("description", "")[:120],
-                "downloads": p.get("stats", {}).get("downloads", 0),
-                "url": f"https://hangar.papermc.io/{ns.get('owner','')}/{p.get('name','')}",
-                "owner":     ns.get("owner", ""),
+                "downloads":   p.get("stats", {}).get("downloads", 0),
+                "url":  f"https://hangar.papermc.io/{ns.get('owner','')}/{p.get('name','')}",
+                "owner":       ns.get("owner", ""),
             })
         return jsonify(out)
     except Exception as e:
@@ -986,11 +979,7 @@ def api_worlds():
     for d in MC_DIR.iterdir():
         if d.is_dir() and (d / "level.dat").exists():
             size = sum(f.stat().st_size for f in d.rglob("*") if f.is_file())
-            worlds.append({
-                "name":     d.name,
-                "size":     size,
-                "modified": int(d.stat().st_mtime),
-            })
+            worlds.append({"name": d.name, "size": size, "modified": int(d.stat().st_mtime)})
     return jsonify(worlds)
 
 
@@ -1013,9 +1002,7 @@ def api_world_backup():
                 z.write(fp, fp.relative_to(MC_DIR))
     send_command("save-on")
     size = dest.stat().st_size
-    return jsonify({"ok": True,
-                    "file": str(dest.relative_to(MC_DIR)),
-                    "size": size})
+    return jsonify({"ok": True, "file": str(dest.relative_to(MC_DIR)), "size": size})
 
 
 @app.route("/api/worlds/delete", methods=["POST"])
@@ -1036,12 +1023,8 @@ def api_backups():
     bdir.mkdir(exist_ok=True)
     items = []
     for f in sorted(bdir.glob("*.zip"), key=lambda x: x.stat().st_mtime, reverse=True):
-        items.append({
-            "name":    f.name,
-            "path":    str(f.relative_to(MC_DIR)),
-            "size":    f.stat().st_size,
-            "created": int(f.stat().st_mtime),
-        })
+        items.append({"name": f.name, "path": str(f.relative_to(MC_DIR)),
+                      "size": f.stat().st_size, "created": int(f.stat().st_mtime)})
     return jsonify(items)
 
 
@@ -1053,16 +1036,15 @@ def api_performance():
         import psutil
         cpu = psutil.cpu_percent(0.2)
         vm  = psutil.virtual_memory()
+        swp = psutil.swap_memory()
         dk  = psutil.disk_usage("/")
         procs = []
         if mc_process and mc_process.poll() is None:
             try:
                 proc = psutil.Process(mc_process.pid)
-                procs = [{
-                    "cpu": round(proc.cpu_percent(), 1),
-                    "ram": int(proc.memory_info().rss / 1024 / 1024),
-                    "threads": proc.num_threads(),
-                }]
+                procs = [{"cpu": round(proc.cpu_percent(), 1),
+                          "ram": int(proc.memory_info().rss / 1024 / 1024),
+                          "threads": proc.num_threads()}]
             except Exception:
                 pass
         return jsonify({
@@ -1071,6 +1053,8 @@ def api_performance():
             "ram_used_mb":  int(vm.used    / 1024 / 1024),
             "ram_total_mb": int(vm.total   / 1024 / 1024),
             "ram_free_mb":  int(vm.available/1024 / 1024),
+            "swap_total_mb":int(swp.total  / 1024 / 1024),
+            "swap_free_mb": int(swp.free   / 1024 / 1024),
             "disk_pct":     round(dk.percent, 1),
             "disk_used_gb": round(dk.used  / 1e9, 1),
             "disk_total_gb":round(dk.total / 1e9, 1),
@@ -1079,6 +1063,7 @@ def api_performance():
             "tps":          server_state["tps"],
             "tps5":         server_state["tps5"],
             "tps15":        server_state["tps15"],
+            "support_nodes": len(support_nodes),
         })
     except Exception as e:
         return jsonify({"error": str(e)})
@@ -1092,6 +1077,7 @@ def on_connect():
     emit("server_status",   server_state)
     emit("players_update",  _players_list())
     emit("tunnel_update",   tunnel_info)
+    emit("support_nodes_update", list(support_nodes.values()))
 
 
 @socketio.on("send_command")
@@ -1133,87 +1119,54 @@ PANEL_HTML = r"""<!DOCTYPE html>
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 html, body { height: 100%; background: var(--bg); color: var(--t1); font-family: var(--font); overflow: hidden; }
 .layout { display: flex; height: 100vh; }
-.sidebar {
-  width: var(--sidebar); background: var(--s1);
-  border-right: 1px solid rgba(255,255,255,.06);
-  display: flex; flex-direction: column; flex-shrink: 0; overflow-y: auto;
-}
+.sidebar { width: var(--sidebar); background: var(--s1); border-right: 1px solid rgba(255,255,255,.06); display: flex; flex-direction: column; flex-shrink: 0; overflow-y: auto; }
 .sb-head { padding: 18px 16px 14px; border-bottom: 1px solid rgba(255,255,255,.06); }
 .sb-head h2 { font-size: 15px; font-weight: 700; display: flex; align-items: center; gap: 8px; }
 .sb-ver { font-size: 10px; color: var(--t2); font-family: var(--mono); margin-top: 4px; }
-.sb-status {
-  margin: 10px 10px 0;
-  background: rgba(255,255,255,.03); border-radius: 9px;
-  padding: 9px 12px; display: flex; align-items: center; gap: 8px; font-size: 12px;
-}
+.sb-status { margin: 10px 10px 0; background: rgba(255,255,255,.03); border-radius: 9px; padding: 9px 12px; display: flex; align-items: center; gap: 8px; font-size: 12px; }
 .dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
 .dot-green  { background: var(--green);  box-shadow: 0 0 6px var(--green); }
 .dot-red    { background: var(--red);    box-shadow: 0 0 6px var(--red); }
 .dot-yellow { background: var(--yellow); box-shadow: 0 0 6px var(--yellow); animation: blink 1s infinite; }
 @keyframes blink { 0%,100%{opacity:1} 50%{opacity:.3} }
 .nav { padding: 10px; flex: 1; }
-.nav-sec { font-size: 9px; font-weight: 700; color: var(--t3); text-transform: uppercase;
-  letter-spacing: .12em; padding: 10px 6px 5px; }
-.nav-item {
-  display: flex; align-items: center; gap: 9px;
-  padding: 8px 10px; border-radius: 9px; cursor: pointer;
-  transition: all .15s; font-size: 13px; color: var(--t2); margin-bottom: 1px;
-}
+.nav-sec { font-size: 9px; font-weight: 700; color: var(--t3); text-transform: uppercase; letter-spacing: .12em; padding: 10px 6px 5px; }
+.nav-item { display: flex; align-items: center; gap: 9px; padding: 8px 10px; border-radius: 9px; cursor: pointer; transition: all .15s; font-size: 13px; color: var(--t2); margin-bottom: 1px; }
 .nav-item:hover { background: rgba(255,255,255,.05); color: var(--t1); }
 .nav-item.active { background: rgba(0,229,255,.09); color: var(--a1); font-weight: 600; }
 .nav-item .ico { font-size: 15px; width: 18px; text-align: center; }
 .sb-ctrl { padding: 12px 10px; border-top: 1px solid rgba(255,255,255,.06); }
-.ctrl-btn {
-  width: 100%; padding: 8px; border-radius: 9px; font-size: 12px; font-weight: 600;
-  border: none; cursor: pointer; font-family: var(--font); transition: all .15s;
-  margin-bottom: 6px; display: flex; align-items: center; justify-content: center; gap: 6px;
-}
+.ctrl-btn { width: 100%; padding: 8px; border-radius: 9px; font-size: 12px; font-weight: 600; border: none; cursor: pointer; font-family: var(--font); transition: all .15s; margin-bottom: 6px; display: flex; align-items: center; justify-content: center; gap: 6px; }
 .cb-start   { background: linear-gradient(135deg, #2ed573, #00a550); color: #000; }
 .cb-restart { background: rgba(255,165,2,.12); color: var(--yellow); border: 1px solid rgba(255,165,2,.25); }
 .cb-stop    { background: rgba(255,71,87,.12); color: var(--red);    border: 1px solid rgba(255,71,87,.25); }
 .ctrl-btn:hover { transform: translateY(-1px); filter: brightness(1.1); }
 .main { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
-.topbar {
-  height: 50px; background: var(--s1); border-bottom: 1px solid rgba(255,255,255,.06);
-  display: flex; align-items: center; padding: 0 18px; gap: 14px; flex-shrink: 0;
-}
+.topbar { height: 50px; background: var(--s1); border-bottom: 1px solid rgba(255,255,255,.06); display: flex; align-items: center; padding: 0 18px; gap: 14px; flex-shrink: 0; }
 .page-title { font-size: 14px; font-weight: 700; flex: 1; }
 .top-stats { display: flex; gap: 18px; font-size: 11px; color: var(--t2); font-family: var(--mono); }
 .ts { display: flex; align-items: center; gap: 4px; }
 .ts-v { color: var(--t1); font-weight: 600; }
-.mc-addr-bar {
-  background: linear-gradient(90deg, rgba(0,255,170,.08), rgba(0,229,255,.06));
-  border-bottom: 1px solid rgba(0,255,170,.15);
-  padding: 7px 18px; display: flex; align-items: center; gap: 10px;
-  font-size: 12px; flex-shrink: 0;
-}
+.mc-addr-bar { background: linear-gradient(90deg, rgba(0,255,170,.08), rgba(0,229,255,.06)); border-bottom: 1px solid rgba(0,255,170,.15); padding: 7px 18px; display: flex; align-items: center; gap: 10px; font-size: 12px; flex-shrink: 0; }
 .mc-addr-bar .lbl { color: var(--t2); }
 .mc-addr-bar .addr { color: var(--a3); font-family: var(--mono); font-weight: 600; }
 .mc-addr-bar.hidden { display: none; }
+.support-bar { background: linear-gradient(90deg, rgba(124,106,255,.1), rgba(0,229,255,.06)); border-bottom: 1px solid rgba(124,106,255,.2); padding: 6px 18px; display: flex; align-items: center; gap: 12px; font-size: 11px; flex-shrink: 0; }
+.support-bar.hidden { display: none; }
 .pages { flex: 1; overflow: hidden; }
 .page  { display: none; height: 100%; overflow-y: auto; padding: 18px; }
 .page.active { display: block; }
-.card {
-  background: var(--s1); border: 1px solid rgba(255,255,255,.06);
-  border-radius: var(--r); padding: 18px; margin-bottom: 14px;
-}
-.card-hd {
-  font-size: 11px; font-weight: 700; color: var(--t2); text-transform: uppercase;
-  letter-spacing: .1em; margin-bottom: 14px; display: flex; align-items: center; gap: 8px;
-}
+.card { background: var(--s1); border: 1px solid rgba(255,255,255,.06); border-radius: var(--r); padding: 18px; margin-bottom: 14px; }
+.card-hd { font-size: 11px; font-weight: 700; color: var(--t2); text-transform: uppercase; letter-spacing: .1em; margin-bottom: 14px; display: flex; align-items: center; gap: 8px; }
 .card-hd::before { content:''; width: 3px; height: 11px; border-radius: 2px; background: var(--a1); }
 .g2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
 .g3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 14px; }
 .g4 { display: grid; grid-template-columns: repeat(4,1fr); gap: 12px; }
 .sc { background: var(--s2); border: 1px solid rgba(255,255,255,.05); border-radius: 10px; padding: 16px; text-align: center; }
-.sc-val { font-size: 26px; font-weight: 700; font-family: var(--mono);
-  background: linear-gradient(135deg, var(--a1), var(--a2));
-  -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+.sc-val { font-size: 26px; font-weight: 700; font-family: var(--mono); background: linear-gradient(135deg, var(--a1), var(--a2)); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
 .sc-lbl { font-size: 11px; color: var(--t2); margin-top: 4px; }
 .tbl { width: 100%; border-collapse: collapse; font-size: 12px; }
-.tbl th { padding: 8px 10px; text-align: left; font-size: 10px; font-weight: 700;
-  color: var(--t2); text-transform: uppercase; letter-spacing: .08em;
-  border-bottom: 1px solid rgba(255,255,255,.06); }
+.tbl th { padding: 8px 10px; text-align: left; font-size: 10px; font-weight: 700; color: var(--t2); text-transform: uppercase; letter-spacing: .08em; border-bottom: 1px solid rgba(255,255,255,.06); }
 .tbl td { padding: 9px 10px; border-bottom: 1px solid rgba(255,255,255,.04); }
 .tbl tr:hover td { background: rgba(255,255,255,.02); }
 .tbl tr:last-child td { border: none; }
@@ -1222,28 +1175,20 @@ html, body { height: 100%; background: var(--bg); color: var(--t1); font-family:
 .br  { background: rgba(255,71,87,.1);   border: 1px solid rgba(255,71,87,.25);   color: var(--red); }
 .bb  { background: rgba(0,229,255,.08);  border: 1px solid rgba(0,229,255,.2);    color: var(--a1); }
 .by  { background: rgba(255,165,2,.1);   border: 1px solid rgba(255,165,2,.25);   color: var(--yellow); }
-.bo  { background: rgba(255,107,53,.1);  border: 1px solid rgba(255,107,53,.25);  color: var(--orange); }
-.btn {
-  padding: 6px 14px; border-radius: 7px; font-size: 12px; font-weight: 600;
-  border: none; cursor: pointer; font-family: var(--font); transition: all .15s;
-  display: inline-flex; align-items: center; gap: 5px; text-decoration: none; white-space: nowrap;
-}
+.bp  { background: rgba(124,106,255,.1); border: 1px solid rgba(124,106,255,.25); color: var(--a2); }
+.btn { padding: 6px 14px; border-radius: 7px; font-size: 12px; font-weight: 600; border: none; cursor: pointer; font-family: var(--font); transition: all .15s; display: inline-flex; align-items: center; gap: 5px; text-decoration: none; white-space: nowrap; }
 .btn:hover { transform: translateY(-1px); }
 .btn-sm  { padding: 4px 10px; font-size: 11px; }
 .btn-lg  { padding: 10px 22px; font-size: 13px; }
 .b-prim  { background: linear-gradient(135deg, var(--a1), var(--a2)); color: #000; }
 .b-prim:hover { box-shadow: 0 6px 20px rgba(0,229,255,.3); }
 .b-dang  { background: rgba(255,71,87,.12);  color: var(--red);    border: 1px solid rgba(255,71,87,.25); }
-.b-dang:hover { background: rgba(255,71,87,.25); }
 .b-warn  { background: rgba(255,165,2,.1);   color: var(--yellow); border: 1px solid rgba(255,165,2,.25); }
 .b-succ  { background: rgba(46,213,115,.1);  color: var(--green);  border: 1px solid rgba(46,213,115,.25); }
 .b-ghost { background: rgba(255,255,255,.05); color: var(--t2);    border: 1px solid rgba(255,255,255,.1); }
+.b-purp  { background: rgba(124,106,255,.12); color: var(--a2);   border: 1px solid rgba(124,106,255,.25); }
 .con-wrap { height: calc(100% - 42px); display: flex; flex-direction: column; }
-.con-out {
-  flex: 1; background: #000; border-radius: 10px; padding: 12px; overflow-y: auto;
-  font-family: var(--mono); font-size: 11.5px; line-height: 1.65;
-  border: 1px solid rgba(255,255,255,.06);
-}
+.con-out { flex: 1; background: #000; border-radius: 10px; padding: 12px; overflow-y: auto; font-family: var(--mono); font-size: 11.5px; line-height: 1.65; border: 1px solid rgba(255,255,255,.06); }
 .con-out::-webkit-scrollbar { width: 5px; }
 .con-out::-webkit-scrollbar-thumb { background: rgba(255,255,255,.1); border-radius: 3px; }
 .cl-info  { color: #9cdcfe; }
@@ -1251,55 +1196,30 @@ html, body { height: 100%; background: var(--bg); color: var(--t1); font-family:
 .cl-err   { color: #f44747; }
 .cl-panel { color: #00e5ff; }
 .cl-def   { color: #d4d4d4; }
-.cl-cmd   { color: #b5cea8; }
 .con-in   { display: flex; gap: 8px; margin-top: 8px; }
-.con-input {
-  flex: 1; background: rgba(255,255,255,.05); border: 1px solid rgba(255,255,255,.1);
-  color: var(--t1); border-radius: 8px; padding: 9px 12px; font-family: var(--mono);
-  font-size: 12px; outline: none;
-}
+.con-input { flex: 1; background: rgba(255,255,255,.05); border: 1px solid rgba(255,255,255,.1); color: var(--t1); border-radius: 8px; padding: 9px 12px; font-family: var(--mono); font-size: 12px; outline: none; }
 .con-input:focus { border-color: rgba(0,229,255,.4); }
-.con-send {
-  padding: 9px 20px; background: linear-gradient(135deg, var(--a1), var(--a2));
-  color: #000; border: none; border-radius: 8px; font-weight: 700;
-  cursor: pointer; font-family: var(--font); transition: all .15s;
-}
+.con-send { padding: 9px 20px; background: linear-gradient(135deg, var(--a1), var(--a2)); color: #000; border: none; border-radius: 8px; font-weight: 700; cursor: pointer; font-family: var(--font); transition: all .15s; }
 .con-send:hover { transform: translateY(-1px); box-shadow: 0 4px 15px rgba(0,229,255,.3); }
 .fm { display: flex; gap: 12px; height: calc(100vh - 160px); }
-.fm-tree { width: 280px; flex-shrink: 0; display: flex; flex-direction: column;
-  background: var(--s1); border: 1px solid rgba(255,255,255,.06); border-radius: var(--r); overflow: hidden; }
-.fm-toolbar { padding: 10px 12px; border-bottom: 1px solid rgba(255,255,255,.06);
-  display: flex; gap: 6px; align-items: center; }
+.fm-tree { width: 280px; flex-shrink: 0; display: flex; flex-direction: column; background: var(--s1); border: 1px solid rgba(255,255,255,.06); border-radius: var(--r); overflow: hidden; }
+.fm-toolbar { padding: 10px 12px; border-bottom: 1px solid rgba(255,255,255,.06); display: flex; gap: 6px; align-items: center; }
 .fm-bread { font-size: 11px; color: var(--t2); font-family: var(--mono); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .fm-list { flex: 1; overflow-y: auto; }
-.fm-item {
-  display: flex; align-items: center; gap: 8px; padding: 7px 12px;
-  cursor: pointer; border-bottom: 1px solid rgba(255,255,255,.03);
-  transition: background .1s; font-size: 12px;
-}
+.fm-item { display: flex; align-items: center; gap: 8px; padding: 7px 12px; cursor: pointer; border-bottom: 1px solid rgba(255,255,255,.03); transition: background .1s; font-size: 12px; }
 .fm-item:hover { background: rgba(255,255,255,.04); }
 .fm-item.sel   { background: rgba(0,229,255,.07); border-left: 2px solid var(--a1); }
 .fm-ico  { font-size: 14px; width: 18px; text-align: center; }
 .fm-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .fm-size { font-size: 10px; color: var(--t3); font-family: var(--mono); }
-.fm-editor { flex: 1; display: flex; flex-direction: column;
-  background: var(--s1); border: 1px solid rgba(255,255,255,.06); border-radius: var(--r); overflow: hidden; }
-.fm-etool { padding: 9px 12px; border-bottom: 1px solid rgba(255,255,255,.06);
-  display: flex; gap: 6px; align-items: center; }
+.fm-editor { flex: 1; display: flex; flex-direction: column; background: var(--s1); border: 1px solid rgba(255,255,255,.06); border-radius: var(--r); overflow: hidden; }
+.fm-etool { padding: 9px 12px; border-bottom: 1px solid rgba(255,255,255,.06); display: flex; gap: 6px; align-items: center; }
 .fm-fname { font-family: var(--mono); font-size: 11px; color: var(--t2); flex: 1; }
-.fm-area {
-  flex: 1; background: #1e1e1e; color: #d4d4d4; font-family: var(--mono);
-  font-size: 12px; border: none; outline: none; padding: 14px; resize: none;
-  line-height: 1.6;
-}
+.fm-area { flex: 1; background: #1e1e1e; color: #d4d4d4; font-family: var(--mono); font-size: 12px; border: none; outline: none; padding: 14px; resize: none; line-height: 1.6; }
 .set-grid { display: grid; grid-template-columns: repeat(3,1fr); gap: 10px; }
 .set-item { background: var(--s2); border: 1px solid rgba(255,255,255,.05); border-radius: 9px; padding: 12px; }
 .set-lbl  { font-size: 10px; color: var(--t2); margin-bottom: 5px; text-transform: uppercase; letter-spacing: .06em; }
-.set-inp  {
-  width: 100%; background: rgba(255,255,255,.06); border: 1px solid rgba(255,255,255,.1);
-  color: var(--t1); border-radius: 7px; padding: 7px 9px; font-family: var(--mono);
-  font-size: 12px; outline: none;
-}
+.set-inp  { width: 100%; background: rgba(255,255,255,.06); border: 1px solid rgba(255,255,255,.1); color: var(--t1); border-radius: 7px; padding: 7px 9px; font-family: var(--mono); font-size: 12px; outline: none; }
 .set-inp:focus { border-color: rgba(0,229,255,.4); }
 select.set-inp option { background: #1e1e1e; }
 .prog { height: 5px; background: rgba(255,255,255,.06); border-radius: 3px; overflow: hidden; margin-top: 5px; }
@@ -1307,30 +1227,13 @@ select.set-inp option { background: #1e1e1e; }
 .pf-cpu  { background: linear-gradient(90deg, var(--a1), var(--a2)); }
 .pf-ram  { background: linear-gradient(90deg, var(--a3), var(--a1)); }
 .pf-disk { background: linear-gradient(90deg, var(--a2), var(--orange)); }
-.inp {
-  background: rgba(255,255,255,.05); border: 1px solid rgba(255,255,255,.1);
-  color: var(--t1); border-radius: 8px; padding: 8px 12px; font-family: var(--font);
-  font-size: 12px; outline: none;
-}
+.inp { background: rgba(255,255,255,.05); border: 1px solid rgba(255,255,255,.1); color: var(--t1); border-radius: 8px; padding: 8px 12px; font-family: var(--font); font-size: 12px; outline: none; }
 .inp:focus { border-color: rgba(0,229,255,.4); }
 .inp-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
-.modal-bg { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.75); z-index: 100;
-  align-items: center; justify-content: center; }
-.modal-bg.open { display: flex; }
-.modal { background: var(--s1); border: 1px solid rgba(255,255,255,.1); border-radius: 16px;
-  padding: 24px; min-width: 360px; max-width: 500px; width: 90%; }
-.modal h3 { font-size: 15px; font-weight: 700; margin-bottom: 14px; }
-.modal-btns { display: flex; gap: 8px; justify-content: flex-end; margin-top: 14px; }
-.m-inp { width: 100%; background: rgba(255,255,255,.06); border: 1px solid rgba(255,255,255,.12);
-  color: var(--t1); border-radius: 8px; padding: 9px 12px; font-family: var(--mono);
-  font-size: 12px; outline: none; margin-bottom: 8px; }
-.m-inp:focus { border-color: rgba(0,229,255,.4); }
-.upzone { border: 2px dashed rgba(255,255,255,.12); border-radius: 10px; padding: 20px;
-  text-align: center; cursor: pointer; color: var(--t2); font-size: 13px; transition: all .2s; }
-.upzone:hover, .upzone.drag { border-color: rgba(0,229,255,.4); background: rgba(0,229,255,.04); }
+.node-card { background: var(--s2); border: 1px solid rgba(124,106,255,.2); border-radius: 10px; padding: 14px; margin-bottom: 10px; }
+.node-header { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
 .notif-wrap { position: fixed; top: 14px; right: 14px; z-index: 200; display: flex; flex-direction: column; gap: 8px; }
-.notif { padding: 10px 16px; border-radius: 10px; font-size: 12px; font-weight: 600; max-width: 300px;
-  animation: slide-in .3s ease; }
+.notif { padding: 10px 16px; border-radius: 10px; font-size: 12px; font-weight: 600; max-width: 300px; animation: slide-in .3s ease; }
 @keyframes slide-in { from { transform: translateX(120px); opacity: 0; } to { transform: none; opacity: 1; } }
 .n-ok   { background: rgba(46,213,115,.15);  border: 1px solid rgba(46,213,115,.3);  color: var(--green); }
 .n-err  { background: rgba(255,71,87,.15);   border: 1px solid rgba(255,71,87,.3);   color: var(--red); }
@@ -1368,6 +1271,7 @@ input[type=file] { display: none; }
     <div class="nav-item" data-page="settings"><span class="ico">⚙️</span>Ayarlar</div>
     <div class="nav-sec">İzleme</div>
     <div class="nav-item" data-page="perf"><span class="ico">📈</span>Performans</div>
+    <div class="nav-item" data-page="support"><span class="ico">🔗</span>Destek Düğümleri <span id="node-count" style="background:rgba(124,106,255,.2);color:var(--a2);border-radius:20px;padding:1px 6px;font-size:10px;margin-left:auto">0</span></div>
   </nav>
   <div class="sb-ctrl">
     <button class="ctrl-btn cb-start"   onclick="srvAction('start')">▶ Başlat</button>
@@ -1379,6 +1283,7 @@ input[type=file] { display: none; }
   <div class="topbar">
     <div class="page-title" id="page-title">📊 Dashboard</div>
     <div class="top-stats">
+      <div class="ts">🔗 <span class="ts-v" id="tb-nodes">0</span> destek</div>
       <div class="ts">👥 <span class="ts-v" id="tb-pl">0</span></div>
       <div class="ts">⚡ <span class="ts-v" id="tb-tps">20.0</span> TPS</div>
       <div class="ts">🧠 <span class="ts-v" id="tb-ram">— MB</span></div>
@@ -1389,13 +1294,19 @@ input[type=file] { display: none; }
     <span class="addr" id="mc-addr-text">bekleniyor...</span>
     <button class="btn btn-sm b-ghost" onclick="copyAddr()">📋 Kopyala</button>
   </div>
+  <div class="support-bar hidden" id="support-bar">
+    <span style="color:var(--a2)">🔗 Destek Düğümleri:</span>
+    <span id="support-bar-text" style="color:var(--t2);font-size:11px">bağlı düğüm yok</span>
+  </div>
   <div class="pages">
+
+  <!-- DASHBOARD -->
   <div class="page active" id="page-dashboard">
     <div class="g4" style="margin-bottom:14px">
       <div class="sc"><div class="sc-val" id="d-pl">0</div><div class="sc-lbl">👥 Online Oyuncu</div></div>
       <div class="sc"><div class="sc-val" id="d-tps">20.0</div><div class="sc-lbl">⚡ TPS (1dk)</div></div>
       <div class="sc"><div class="sc-val" id="d-ram">—</div><div class="sc-lbl">🧠 MC RAM (MB)</div></div>
-      <div class="sc"><div class="sc-val" id="d-up">—</div><div class="sc-lbl">⏱ Çalışma Süresi</div></div>
+      <div class="sc"><div class="sc-val" id="d-nodes">0</div><div class="sc-lbl">🔗 Destek Düğümü</div></div>
     </div>
     <div class="g2">
       <div class="card">
@@ -1403,10 +1314,9 @@ input[type=file] { display: none; }
         <table class="tbl">
           <tr><td style="color:var(--t2)">Durum</td><td><span class="badge bg" id="d-status">—</span></td></tr>
           <tr><td style="color:var(--t2)">Versiyon</td><td id="d-ver">—</td></tr>
-          <tr><td style="color:var(--t2)">MC RAM Limiti</td><td id="d-maxram">—</td></tr>
           <tr><td style="color:var(--t2)">TPS (1m/5m/15m)</td><td id="d-tps3">—</td></tr>
-          <tr><td style="color:var(--t2)">Max Oyuncu</td><td id="d-maxpl">20</td></tr>
           <tr><td style="color:var(--t2)">Bağlantı</td><td><span id="d-addr" style="font-family:var(--mono);font-size:11px;color:var(--a3)">—</span></td></tr>
+          <tr><td style="color:var(--t2)">Destek Düğümleri</td><td id="d-nodeinfo" style="color:var(--a2)">0 bağlı</td></tr>
         </table>
       </div>
       <div class="card">
@@ -1422,13 +1332,14 @@ input[type=file] { display: none; }
       <div id="d-log" style="font-family:var(--mono);font-size:11px;max-height:200px;overflow-y:auto;line-height:1.7;color:#9cdcfe"></div>
     </div>
   </div>
+
+  <!-- KONSOL -->
   <div class="page" id="page-console" style="height:100%;display:none;flex-direction:column;padding:14px">
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
       <div class="card-hd" style="margin:0">💻 Gerçek Zamanlı Konsol</div>
       <div style="display:flex;gap:6px">
         <button class="btn btn-sm b-ghost" onclick="conClear()">🗑 Temizle</button>
         <button class="btn btn-sm b-ghost" onclick="conBottom()">↓ En Alta</button>
-        <button class="btn btn-sm b-ghost" onclick="conSearch()">🔍 Ara</button>
       </div>
     </div>
     <div class="con-wrap" style="flex:1">
@@ -1439,6 +1350,8 @@ input[type=file] { display: none; }
       </div>
     </div>
   </div>
+
+  <!-- OYUNCULAR -->
   <div class="page" id="page-players">
     <div class="card" style="margin-bottom:14px">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
@@ -1448,27 +1361,20 @@ input[type=file] { display: none; }
           <button class="btn btn-sm b-ghost" onclick="refreshPlayers()">↺ Yenile</button>
         </div>
       </div>
-      <table class="tbl">
-        <thead><tr><th>Oyuncu</th><th>Durum</th><th>İşlemler</th></tr></thead>
-        <tbody id="pl-body"></tbody>
-      </table>
+      <table class="tbl"><thead><tr><th>Oyuncu</th><th>Durum</th><th>İşlemler</th></tr></thead><tbody id="pl-body"></tbody></table>
     </div>
     <div class="g2">
       <div class="card">
         <div class="card-hd">⚡ Hızlı İşlem</div>
-        <div class="inp-row">
-          <input class="inp" id="pl-name" placeholder="Oyuncu adı" style="flex:1">
-        </div>
+        <div class="inp-row"><input class="inp" id="pl-name" placeholder="Oyuncu adı" style="flex:1"></div>
         <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px">
           <button class="btn btn-sm b-dang" onclick="plAct('kick')">👢 Kick</button>
           <button class="btn btn-sm b-dang" onclick="plAct('ban')">🔨 Ban</button>
           <button class="btn btn-sm b-succ" onclick="plAct('op')">⭐ OP</button>
           <button class="btn btn-sm b-warn" onclick="plAct('deop')">✕ DeOP</button>
-          <button class="btn btn-sm b-ghost" onclick="plAct('tp')">🚀 TP</button>
-          <button class="btn btn-sm b-succ" onclick="plAct('heal')">❤️ Heal</button>
+          <button class="btn btn-sm b-ghost" onclick="plAct('heal')">❤️ Heal</button>
           <button class="btn btn-sm b-dang" onclick="plAct('kill')">💀 Kill</button>
         </div>
-        <div style="font-size:11px;color:var(--t2);margin-bottom:6px">Oyun Modu:</div>
         <div style="display:flex;flex-wrap:wrap;gap:6px">
           <button class="btn btn-sm b-ghost" onclick="setGM('survival')">⚔️ Survival</button>
           <button class="btn btn-sm b-ghost" onclick="setGM('creative')">🎨 Creative</button>
@@ -1489,6 +1395,8 @@ input[type=file] { display: none; }
       </div>
     </div>
   </div>
+
+  <!-- BEYAZ LİSTE -->
   <div class="page" id="page-whitelist">
     <div class="card">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
@@ -1497,13 +1405,14 @@ input[type=file] { display: none; }
           <input class="inp" id="wl-name" placeholder="Oyuncu adı" style="width:160px">
           <button class="btn btn-sm b-succ" onclick="wlAdd()">+ Ekle</button>
           <button class="btn btn-sm b-ghost" onclick="api('/api/whitelist/toggle',{on:true});notify('Beyaz liste açıldı','ok')">Aç</button>
-          <button class="btn btn-sm b-ghost" onclick="api('/api/whitelist/toggle',{on:false});notify('Beyaz liste kapatıldı','ok')">Kapat</button>
+          <button class="btn btn-sm b-ghost" onclick="api('/api/whitelist/toggle',{on:false});notify('Kapatıldı','ok')">Kapat</button>
         </div>
       </div>
-      <table class="tbl"><thead><tr><th>Oyuncu</th><th>UUID</th><th>İşlem</th></tr></thead>
-        <tbody id="wl-body"></tbody></table>
+      <table class="tbl"><thead><tr><th>Oyuncu</th><th>UUID</th><th>İşlem</th></tr></thead><tbody id="wl-body"></tbody></table>
     </div>
   </div>
+
+  <!-- BAN LİSTESİ -->
   <div class="page" id="page-banlist">
     <div class="card">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
@@ -1514,10 +1423,11 @@ input[type=file] { display: none; }
           <button class="btn btn-sm b-dang" onclick="banPlayer()">🔨 Ban Et</button>
         </div>
       </div>
-      <table class="tbl"><thead><tr><th>Oyuncu</th><th>Sebep</th><th>Tarih</th><th>İşlem</th></tr></thead>
-        <tbody id="ban-body"></tbody></table>
+      <table class="tbl"><thead><tr><th>Oyuncu</th><th>Sebep</th><th>Tarih</th><th>İşlem</th></tr></thead><tbody id="ban-body"></tbody></table>
     </div>
   </div>
+
+  <!-- PLUGİNLER -->
   <div class="page" id="page-plugins">
     <div class="g2" style="height:calc(100vh - 150px)">
       <div class="card" style="display:flex;flex-direction:column;overflow:hidden">
@@ -1530,16 +1440,11 @@ input[type=file] { display: none; }
           </div>
         </div>
         <div style="flex:1;overflow-y:auto">
-          <table class="tbl" id="plug-tbl">
-            <thead><tr><th>Plugin</th><th>Boyut</th><th>Durum</th><th>İşlem</th></tr></thead>
-            <tbody id="plug-body"></tbody>
-          </table>
+          <table class="tbl"><thead><tr><th>Plugin</th><th>Boyut</th><th>Durum</th><th>İşlem</th></tr></thead><tbody id="plug-body"></tbody></table>
         </div>
         <div style="padding-top:10px;flex-shrink:0">
-          <div class="upzone" id="plug-zone"
-            ondragover="event.preventDefault();this.classList.add('drag')"
-            ondragleave="this.classList.remove('drag')"
-            ondrop="dropPlugin(event)">
+          <div style="border: 2px dashed rgba(255,255,255,.12); border-radius: 10px; padding: 20px; text-align: center; cursor: pointer; color: var(--t2); font-size: 13px;"
+            ondragover="event.preventDefault()" ondrop="dropPlugin(event)">
             📦 Plugin .jar dosyasını buraya sürükleyin
           </div>
         </div>
@@ -1547,21 +1452,23 @@ input[type=file] { display: none; }
       <div class="card" style="display:flex;flex-direction:column;overflow:hidden">
         <div class="card-hd">🔍 Plugin Market (Hangar)</div>
         <div style="display:flex;gap:6px;margin-bottom:12px;flex-shrink:0">
-          <input class="inp" id="plug-q" placeholder="Ara: EssentialsX, WorldEdit, Vault..." style="flex:1">
+          <input class="inp" id="plug-q" placeholder="Ara: EssentialsX, WorldEdit..." style="flex:1">
           <button class="btn b-prim" onclick="searchPlugins()">Ara</button>
         </div>
         <div id="plug-results" style="flex:1;overflow-y:auto"></div>
       </div>
     </div>
   </div>
+
+  <!-- DOSYA YÖNETİCİSİ -->
   <div class="page" id="page-files" style="height:100%;padding:14px">
     <div class="fm">
       <div class="fm-tree">
         <div class="fm-toolbar">
           <span class="fm-bread" id="fm-bread">/</span>
-          <button class="btn btn-sm b-ghost" onclick="fmUp()" title="Üst dizin">↑</button>
-          <button class="btn btn-sm b-ghost" onclick="fmRefresh()" title="Yenile">↺</button>
-          <button class="btn btn-sm b-prim"  onclick="fmNewModal()" title="Yeni">+</button>
+          <button class="btn btn-sm b-ghost" onclick="fmUp()">↑</button>
+          <button class="btn btn-sm b-ghost" onclick="fmRefresh()">↺</button>
+          <button class="btn btn-sm b-prim"  onclick="fmNewModal()">+</button>
         </div>
         <div class="fm-list" id="fm-list"></div>
       </div>
@@ -1570,17 +1477,15 @@ input[type=file] { display: none; }
           <span class="fm-fname" id="fm-fname">Dosya seçin...</span>
           <button class="btn btn-sm b-prim"  id="fm-save" onclick="fmSave()" disabled>💾 Kaydet</button>
           <button class="btn btn-sm b-ghost" onclick="fmDownload()">⬇ İndir</button>
-          <label class="btn btn-sm b-ghost" style="cursor:pointer" title="Yükle">
-            ⬆ Yükle <input type="file" multiple onchange="fmUpload(this)">
-          </label>
+          <label class="btn btn-sm b-ghost" style="cursor:pointer">⬆ Yükle <input type="file" multiple onchange="fmUpload(this)"></label>
           <button class="btn btn-sm b-dang"  onclick="fmDelete()">🗑 Sil</button>
         </div>
-        <textarea class="fm-area" id="fm-area"
-          placeholder="Düzenlemek için sol panelden bir dosya seçin..."
-          oninput="document.getElementById('fm-save').disabled=false"></textarea>
+        <textarea class="fm-area" id="fm-area" placeholder="Düzenlemek için sol panelden bir dosya seçin..." oninput="document.getElementById('fm-save').disabled=false"></textarea>
       </div>
     </div>
   </div>
+
+  <!-- DÜNYALAR -->
   <div class="page" id="page-worlds">
     <div class="card" style="margin-bottom:14px">
       <div class="card-hd">🌍 Dünya Listesi</div>
@@ -1591,62 +1496,55 @@ input[type=file] { display: none; }
       <div style="display:flex;flex-wrap:wrap;gap:8px">
         <button class="btn b-ghost" onclick="cmd('time set day')">☀️ Gündüz</button>
         <button class="btn b-ghost" onclick="cmd('time set night')">🌙 Gece</button>
-        <button class="btn b-ghost" onclick="cmd('time set noon')">🌤️ Öğlen</button>
         <button class="btn b-ghost" onclick="cmd('weather clear')">⛅ Açık</button>
         <button class="btn b-ghost" onclick="cmd('weather rain')">🌧️ Yağmur</button>
         <button class="btn b-ghost" onclick="cmd('weather thunder')">⛈️ Fırtına</button>
         <button class="btn b-ghost" onclick="cmd('difficulty peaceful')">😊 Peaceful</button>
-        <button class="btn b-ghost" onclick="cmd('difficulty easy')">🟢 Easy</button>
         <button class="btn b-ghost" onclick="cmd('difficulty normal')">🟡 Normal</button>
         <button class="btn b-ghost" onclick="cmd('difficulty hard')">🔴 Hard</button>
-        <button class="btn b-ghost" onclick="cmd('gamerule doDaylightCycle false')">🔒 Zaman Dondur</button>
-        <button class="btn b-ghost" onclick="cmd('gamerule doWeatherCycle false')">🔒 Hava Dondur</button>
         <button class="btn b-ghost" onclick="cmd('save-all')">💾 Kaydet</button>
         <button class="btn b-ghost" onclick="cmd('kill @e[type=!player]')">⚡ Mob Temizle</button>
-        <button class="btn b-ghost" onclick="cmd('kill @e[type=item]')">🧹 Drop Temizle</button>
       </div>
     </div>
   </div>
+
+  <!-- YEDEKLER -->
   <div class="page" id="page-backups">
     <div class="card">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
         <div class="card-hd" style="margin:0">💾 Yedek Dosyaları</div>
         <button class="btn b-prim" onclick="loadBackups()">↺ Yenile</button>
       </div>
-      <table class="tbl">
-        <thead><tr><th>Dosya</th><th>Boyut</th><th>Tarih</th><th>İşlem</th></tr></thead>
-        <tbody id="backup-body"></tbody>
-      </table>
+      <table class="tbl"><thead><tr><th>Dosya</th><th>Boyut</th><th>Tarih</th><th>İşlem</th></tr></thead><tbody id="backup-body"></tbody></table>
     </div>
   </div>
+
+  <!-- AYARLAR -->
   <div class="page" id="page-settings">
     <div class="card">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
         <div class="card-hd" style="margin:0">⚙️ server.properties</div>
         <button class="btn b-prim btn-lg" onclick="saveSettings()">💾 Kaydet & Yeniden Başlat</button>
       </div>
-      <div class="set-grid" id="settings-grid">
-        <div style="color:var(--t2);padding:10px">Yükleniyor...</div>
-      </div>
+      <div class="set-grid" id="settings-grid"><div style="color:var(--t2);padding:10px">Yükleniyor...</div></div>
     </div>
   </div>
+
+  <!-- PERFORMANS -->
   <div class="page" id="page-perf">
     <div class="g2" style="margin-bottom:14px">
       <div class="card">
         <div class="card-hd">💻 Sistem Kaynakları</div>
         <div style="margin-bottom:12px">
-          <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--t2);margin-bottom:3px">
-            <span>CPU</span><span id="p-cpu">—</span></div>
+          <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--t2);margin-bottom:3px"><span>CPU</span><span id="p-cpu">—</span></div>
           <div class="prog"><div class="prog-f pf-cpu" id="pb-cpu" style="width:0%"></div></div>
         </div>
         <div style="margin-bottom:12px">
-          <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--t2);margin-bottom:3px">
-            <span>RAM</span><span id="p-ram">—</span></div>
+          <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--t2);margin-bottom:3px"><span>RAM</span><span id="p-ram">—</span></div>
           <div class="prog"><div class="prog-f pf-ram" id="pb-ram" style="width:0%"></div></div>
         </div>
         <div>
-          <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--t2);margin-bottom:3px">
-            <span>Disk</span><span id="p-disk">—</span></div>
+          <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--t2);margin-bottom:3px"><span>Disk</span><span id="p-disk">—</span></div>
           <div class="prog"><div class="prog-f pf-disk" id="pb-disk" style="width:0%"></div></div>
         </div>
       </div>
@@ -1655,54 +1553,62 @@ input[type=file] { display: none; }
         <table class="tbl">
           <tr><td style="color:var(--t2)">MC RAM</td><td id="p-mcram">—</td></tr>
           <tr><td style="color:var(--t2)">MC CPU</td><td id="p-mccpu">—</td></tr>
-          <tr><td style="color:var(--t2)">MC Thread</td><td id="p-mcthr">—</td></tr>
-          <tr><td style="color:var(--t2)">TPS (1m)</td><td id="p-tps1">—</td></tr>
-          <tr><td style="color:var(--t2)">TPS (5m)</td><td id="p-tps5">—</td></tr>
-          <tr><td style="color:var(--t2)">TPS (15m)</td><td id="p-tps15">—</td></tr>
-          <tr><td style="color:var(--t2)">Oyuncu</td><td id="p-pls">—</td></tr>
+          <tr><td style="color:var(--t2)">TPS (1m/5m/15m)</td><td id="p-tps1">—</td></tr>
+          <tr><td style="color:var(--t2)">Swap Kullanımı</td><td id="p-swap">—</td></tr>
+          <tr><td style="color:var(--t2)">Destek Düğümleri</td><td id="p-nodes">—</td></tr>
         </table>
         <button class="btn b-ghost" style="margin-top:10px;width:100%" onclick="cmd('tps')">📊 TPS Sorgula</button>
       </div>
     </div>
+  </div>
+
+  <!-- DESTEK DÜĞÜMLERİ -->
+  <div class="page" id="page-support">
+    <div class="card" style="margin-bottom:14px">
+      <div class="card-hd">🔗 Bağlı Destek Düğümleri</div>
+      <p style="font-size:12px;color:var(--t2);margin-bottom:14px">
+        Diğer Render hesaplarında çalışan destek servisleri buraya otomatik bağlanır. 
+        Her destek sunucusu ekstra disk ve RAM sağlar.
+      </p>
+      <div id="nodes-list"><div style="color:var(--t2);text-align:center;padding:20px">Henüz bağlı destek düğümü yok.<br><span style="font-size:11px">Başka bir Render hesabına aynı kodu yükleyin — otomatik bağlanır.</span></div></div>
+    </div>
     <div class="card">
-      <div class="card-hd">⚡ JVM Optimizasyonları</div>
-      <div style="font-family:var(--mono);font-size:11px;color:var(--t2);line-height:1.8">
-        G1GC · ParallelRefProc · MaxGCPause=200ms · CompressedClassSpace=32MB ·
-        MaxMetaspace=128MB · G1NewSize=20% · G1MaxNew=35% · G1HeapRegion=4M
+      <div class="card-hd">📋 Nasıl Çalışır?</div>
+      <div style="font-size:12px;color:var(--t2);line-height:1.8">
+        <div style="margin-bottom:8px">1️⃣ Başka bir Render hesabına aynı kodu deploy edin</div>
+        <div style="margin-bottom:8px">2️⃣ O hesabın servisi otomatik olarak bu ana sunucuyu bulur</div>
+        <div style="margin-bottom:8px">3️⃣ Diskini NBD üzerinden swap olarak paylaşır</div>
+        <div style="margin-bottom:8px">4️⃣ Ana sunucu ekstra disk alanını swap olarak kullanır</div>
+        <div style="margin-bottom:8px">5️⃣ Her destek sunucusu +14GB ekstra bellek sağlar</div>
       </div>
     </div>
   </div>
-  </div>
-</div>
-</div>
-<div class="modal-bg" id="modal">
-  <div class="modal">
-    <h3 id="m-title">—</h3>
-    <div id="m-body"></div>
-    <div class="modal-btns">
-      <button class="btn b-ghost" onclick="closeModal()">İptal</button>
-      <button class="btn b-prim"  id="m-ok">Tamam</button>
-    </div>
-  </div>
-</div>
+
+  </div><!-- /pages -->
+</div><!-- /main -->
+</div><!-- /layout -->
+
 <div class="notif-wrap" id="notif-wrap"></div>
+
 <script>
 const socket = io({ transports: ['websocket', 'polling'] });
-let curPage='dashboard', curFile=null, curDir='', mcAddr='', srvRunning=false;
+let curPage='dashboard', curFile=null, curDir='', mcAddr='', allNodes=[];
 
-socket.on('connect',        ()   => notify('Panele bağlandı', 'ok'));
-socket.on('disconnect',     ()   => notify('Bağlantı kesildi', 'err'));
-socket.on('console_line',   data => addLine(data));
-socket.on('console_history',lines=> { document.getElementById('con-out').innerHTML=''; lines.forEach(l=>addLine(l,false)); conBottom(); });
-socket.on('server_status',  data => updateStatus(data));
-socket.on('players_update', list => updatePlayers(list));
-socket.on('stats_update',   data => updateStats(data));
-socket.on('tunnel_update',  data => setTunnel(data));
-socket.on('download_progress', d => notify(`⬇ İndiriliyor: %${d.pct}`, 'info'));
+socket.on('connect',              ()   => notify('Panele bağlandı', 'ok'));
+socket.on('disconnect',           ()   => notify('Bağlantı kesildi', 'err'));
+socket.on('console_line',         data => addLine(data));
+socket.on('console_history',      lines=> { document.getElementById('con-out').innerHTML=''; lines.forEach(l=>addLine(l,false)); conBottom(); });
+socket.on('server_status',        data => updateStatus(data));
+socket.on('players_update',       list => updatePlayers(list));
+socket.on('stats_update',         data => updateStats(data));
+socket.on('tunnel_update',        data => setTunnel(data));
+socket.on('support_nodes_update', list => updateNodes(list));
+socket.on('download_progress',    d    => notify(`⬇ İndiriliyor: %${d.pct}`, 'info'));
 
 document.querySelectorAll('.nav-item').forEach(el => {
   el.addEventListener('click', () => { const p=el.dataset.page; if(p) navTo(p,el); });
 });
+
 function navTo(page, el) {
   document.querySelectorAll('.page').forEach(p=>{p.classList.remove('active');p.style.display='';});
   document.querySelectorAll('.nav-item').forEach(n=>n.classList.remove('active'));
@@ -1714,14 +1620,15 @@ function navTo(page, el) {
   const titles={dashboard:'📊 Dashboard',console:'💻 Konsol',players:'👥 Oyuncular',
     whitelist:'📋 Beyaz Liste',banlist:'🔨 Ban Listesi',plugins:'🔌 Pluginler',
     files:'📁 Dosya Yöneticisi',worlds:'🌍 Dünyalar',backups:'💾 Yedekler',
-    settings:'⚙️ Ayarlar',perf:'📈 Performans'};
+    settings:'⚙️ Ayarlar',perf:'📈 Performans',support:'🔗 Destek Düğümleri'};
   document.getElementById('page-title').textContent=titles[page]||page;
   curPage=page;
   const loaders={players:refreshPlayers,whitelist:loadWhitelist,banlist:loadBanlist,
     plugins:loadPlugins,files:()=>fmLoad(curDir),worlds:loadWorlds,backups:loadBackups,
-    settings:loadSettings,perf:loadPerf};
+    settings:loadSettings,perf:loadPerf,support:()=>renderNodes(allNodes)};
   if(loaders[page]) loaders[page]();
 }
+
 function addLine(data,scroll=true) {
   const el=document.getElementById('con-out');
   const div=document.createElement('div');
@@ -1738,14 +1645,13 @@ function addLine(data,scroll=true) {
   if(dl){const s=document.createElement('div');s.textContent=div.textContent;s.className=cls;
     dl.appendChild(s);while(dl.children.length>25)dl.removeChild(dl.firstChild);dl.scrollTop=dl.scrollHeight;}
 }
+
 function conClear(){document.getElementById('con-out').innerHTML='';}
 function conBottom(){const e=document.getElementById('con-out');e.scrollTop=e.scrollHeight;}
-function conSearch(){const q=prompt('Ara:');if(!q)return;document.querySelectorAll('#con-out div').forEach(d=>{d.style.background=d.textContent.toLowerCase().includes(q.toLowerCase())?'rgba(0,229,255,.15)':''});}
 function conSend(){const inp=document.getElementById('con-inp');const c=inp.value.trim();if(!c)return;socket.emit('send_command',{cmd:c});inp.value='';}
 document.addEventListener('DOMContentLoaded',()=>{document.getElementById('con-inp').addEventListener('keydown',e=>{if(e.key==='Enter')conSend();});});
 
 function updateStatus(data) {
-  srvRunning=data.status==='running';
   const map={stopped:['dot-red','Durduruldu','br'],starting:['dot-yellow','Başlıyor...','by'],
     downloading:['dot-yellow','İndiriliyor..','by'],running:['dot-green','Çalışıyor','bg'],stopping:['dot-yellow','Duruyor...','by']};
   const [dc,label,bc]=map[data.status]||map.stopped;
@@ -1758,13 +1664,53 @@ function updateStatus(data) {
   const dvEl=document.getElementById('d-ver');
   if(dvEl) dvEl.textContent=data.version||'—';
 }
+
 function updateStats(data) {
   if(data.ram_mb!==undefined){document.getElementById('d-ram').textContent=data.ram_mb;document.getElementById('tb-ram').textContent=data.ram_mb+' MB';}
   if(data.tps!==undefined){document.getElementById('d-tps').textContent=data.tps;document.getElementById('tb-tps').textContent=data.tps;document.getElementById('d-tps3').textContent=`${data.tps} / ${data.tps5||'—'} / ${data.tps15||'—'}`;}
-  if(data.uptime!==undefined) document.getElementById('d-up').textContent=fmtUp(data.uptime);
   if(data.online_players!==undefined){document.getElementById('d-pl').textContent=data.online_players;document.getElementById('tb-pl').textContent=data.online_players;}
 }
+
+function updateNodes(list) {
+  allNodes = list || [];
+  const count = allNodes.length;
+  document.getElementById('d-nodes').textContent=count;
+  document.getElementById('tb-nodes').textContent=count;
+  document.getElementById('d-nodeinfo').textContent=count+' destek düğümü bağlı';
+  document.getElementById('node-count').textContent=count;
+  const bar=document.getElementById('support-bar');
+  const barTxt=document.getElementById('support-bar-text');
+  if(count>0){
+    bar.classList.remove('hidden');
+    barTxt.textContent=allNodes.map(n=>`${n.host||n.node_id} (${n.nbd_gb||0}GB)`).join(' · ');
+  } else {
+    bar.classList.add('hidden');
+  }
+  if(curPage==='support') renderNodes(allNodes);
+}
+
+function renderNodes(list) {
+  const el=document.getElementById('nodes-list');
+  if(!el) return;
+  if(!list||!list.length){el.innerHTML='<div style="color:var(--t2);text-align:center;padding:20px">Henüz bağlı destek düğümü yok.<br><span style="font-size:11px">Başka bir Render hesabına aynı kodu yükleyin — otomatik bağlanır.</span></div>';return;}
+  el.innerHTML=list.map(n=>`
+    <div class="node-card">
+      <div class="node-header">
+        <div class="dot ${n.status==='connected'?'dot-green':'dot-yellow'}"></div>
+        <strong style="font-size:13px">${n.host||n.node_id}</strong>
+        <span class="badge bp" style="margin-left:auto">${n.nbd_gb||0} GB</span>
+        <span class="badge ${n.status==='connected'?'bg':'by'}">${n.status==='connected'?'Bağlı':'Bağlanıyor'}</span>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;font-size:11px;color:var(--t2)">
+        <div>💾 Disk: <span style="color:var(--t1)">${n.nbd_gb||0}GB</span></div>
+        <div>🧠 RAM: <span style="color:var(--t1)">${n.ram_mb||0}MB</span></div>
+        <div>🕐 Bağlandı: <span style="color:var(--t1)">${n.connected_at?new Date(n.connected_at*1000).toLocaleTimeString('tr'):'—'}</span></div>
+      </div>
+    </div>`).join('');
+}
+
 async function srvAction(action){const r=await api('/api/'+action,{});notify(r.msg||action+' yapıldı',r.ok?'ok':'err');}
+
 function setTunnel(data){
   if(!data.host&&!data.url)return;
   mcAddr=data.host||data.url.replace('https://','');
@@ -1777,6 +1723,7 @@ function setTunnel(data){
   notify('📌 MC Adres: '+mcAddr,'ok');
 }
 function copyAddr(){if(mcAddr){navigator.clipboard.writeText(mcAddr);notify('Adres kopyalandı!','ok');}}
+
 function updatePlayers(list){
   document.getElementById('d-pl').textContent=list.length;
   document.getElementById('tb-pl').textContent=list.length;
@@ -1801,21 +1748,23 @@ function setGM(mode,player){const p=player||document.getElementById('pl-name').v
 function sendMsg(){const p=document.getElementById('msg-pl').value.trim();const m=document.getElementById('msg-txt').value.trim();if(!p||!m)return notify('Oyuncu ve mesaj gerekli','err');api('/api/players/msg',{player:p,message:m});notify('Mesaj gönderildi','ok');}
 function giveItem(){const player=document.getElementById('pl-name').value.trim()||'@a';const item=document.getElementById('give-item').value.trim();const count=document.getElementById('give-count').value||1;if(!item)return notify('Item adı girin','err');api('/api/players/give',{player,item,count});notify(`Give: ${count}x ${item} → ${player}`,'ok');}
 function broadcast(){const msg=prompt('Duyuru mesajı:');if(msg){cmd('say '+msg);notify('Duyuru gönderildi','ok');}}
+
 async function loadWhitelist(){const d=await fetch('/api/whitelist').then(r=>r.json());const tb=document.getElementById('wl-body');tb.innerHTML=d.length?d.map(p=>`<tr><td>${p.name||p}</td><td style="font-family:var(--mono);font-size:10px;color:var(--t2)">${p.uuid||'—'}</td><td><button class="btn btn-sm b-dang" onclick="wlRemove('${p.name||p}')">Kaldır</button></td></tr>`).join(''):'<tr><td colspan="3" style="color:var(--t2);text-align:center;padding:12px">Beyaz liste boş</td></tr>';}
 async function wlAdd(){const p=document.getElementById('wl-name').value.trim();if(!p)return;await api('/api/whitelist/add',{player:p});notify(p+' eklendi','ok');loadWhitelist();}
 async function wlRemove(p){await api('/api/whitelist/remove',{player:p});notify(p+' kaldırıldı','ok');loadWhitelist();}
 async function loadBanlist(){const d=await fetch('/api/banlist').then(r=>r.json());const tb=document.getElementById('ban-body');tb.innerHTML=d.length?d.map(p=>`<tr><td>${p.name}</td><td style="color:var(--t2);font-size:11px">${p.reason||'—'}</td><td style="font-size:10px;color:var(--t3)">${(p.created||'').slice(0,10)}</td><td><button class="btn btn-sm b-succ" onclick="pardon('${p.name}')">Affet</button></td></tr>`).join(''):'<tr><td colspan="4" style="color:var(--t2);text-align:center;padding:12px">Ban listesi boş</td></tr>';}
 async function banPlayer(){const p=document.getElementById('ban-name').value.trim();const r=document.getElementById('ban-reason').value.trim()||'Banned by admin';if(!p)return;await api('/api/players/ban',{player:p,reason:r});notify(p+' banlandı','ok');loadBanlist();}
 async function pardon(p){await api('/api/players/pardon',{player:p});notify(p+' affedildi','ok');loadBanlist();}
+
 async function loadPlugins(){const d=await fetch('/api/plugins').then(r=>r.json());const tb=document.getElementById('plug-body');tb.innerHTML=d.length?d.map(p=>`<tr><td><strong>${p.name}</strong></td><td style="font-size:10px;color:var(--t2)">${fmtSize(p.size)}</td><td><span class="badge ${p.enabled?'bg':'br'}">${p.enabled?'Aktif':'Devre Dışı'}</span></td><td style="display:flex;gap:4px"><button class="btn btn-sm b-warn" onclick="togglePlugin('${p.file}')">${p.enabled?'Kapat':'Aç'}</button><button class="btn btn-sm b-dang" onclick="deletePlugin('${p.file}')">🗑</button></td></tr>`).join(''):'<tr><td colspan="4" style="color:var(--t2);text-align:center;padding:12px">Plugin yok.</td></tr>';}
 async function uploadPlugin(input){const fd=new FormData();for(const f of input.files)fd.append(f.name,f);const r=await fetch('/api/plugins/upload',{method:'POST',body:fd});const d=await r.json();notify(d.msg||'Yüklendi','ok');loadPlugins();}
-function dropPlugin(e){e.preventDefault();document.getElementById('plug-zone').classList.remove('drag');const fd=new FormData();for(const f of e.dataTransfer.files)if(f.name.endsWith('.jar'))fd.append(f.name,f);fetch('/api/plugins/upload',{method:'POST',body:fd}).then(r=>r.json()).then(d=>{notify(d.msg||'Yüklendi','ok');loadPlugins();});}
+function dropPlugin(e){e.preventDefault();const fd=new FormData();for(const f of e.dataTransfer.files)if(f.name.endsWith('.jar'))fd.append(f.name,f);fetch('/api/plugins/upload',{method:'POST',body:fd}).then(r=>r.json()).then(d=>{notify(d.msg||'Yüklendi','ok');loadPlugins();});}
 async function deletePlugin(file){if(!confirm(file+' silinsin mi?'))return;await api('/api/plugins/delete',{file});notify('Plugin silindi','ok');loadPlugins();}
 async function togglePlugin(file){await api('/api/plugins/toggle',{file});loadPlugins();}
 async function searchPlugins(){const q=document.getElementById('plug-q').value.trim();if(!q)return;const res=document.getElementById('plug-results');res.innerHTML='<div style="color:var(--t2);padding:10px">Aranıyor...</div>';const d=await fetch('/api/plugins/search?q='+encodeURIComponent(q)).then(r=>r.json());if(!d.length||d.error){res.innerHTML='<div style="color:var(--t2);padding:10px">Sonuç bulunamadı</div>';return;}res.innerHTML=d.map(p=>`<div style="display:flex;justify-content:space-between;align-items:flex-start;padding:10px 0;border-bottom:1px solid rgba(255,255,255,.05)"><div><div style="font-size:13px;font-weight:600">${p.name}</div><div style="font-size:11px;color:var(--t2);margin-top:2px;max-width:320px">${p.description}</div><div style="font-size:10px;color:var(--t3);margin-top:2px">👤 ${p.owner} · ⬇ ${(p.downloads||0).toLocaleString()}</div></div><a class="btn btn-sm b-prim" href="${p.url}" target="_blank">🔗 Aç</a></div>`).join('');}
-async function fmLoad(path=''){curDir=path;document.getElementById('fm-bread').textContent='/'+path;const items=await fetch('/api/files?path='+encodeURIComponent(path)).then(r=>r.json());const el=document.getElementById('fm-list');el.innerHTML=items.map(f=>`<div class="fm-item" onclick="fmClick('${f.path}','${f.type}','${escQ(f.name)}')"><span class="fm-ico">${f.type==='dir'?'📁':fmIco(f.ext)}</span><span class="fm-name">${f.name}</span><span class="fm-size">${f.type==='dir'?'':fmtSize(f.size)}</span></div>`).join('')||'<div style="padding:12px;color:var(--t2);font-size:12px">Klasör boş</div>';}
-function escQ(s){return s.replace(/'/g,"\\'");}
-function fmIco(ext){const m={'.properties':'⚙️','.json':'📋','.yml':'📋','.yaml':'📋','.jar':'☕','.txt':'📄','.log':'📜','.sh':'🖥️','.zip':'📦','.png':'🖼️','.jpg':'🖼️','.dat':'🗃️','.conf':'⚙️','.toml':'⚙️'};return m[ext]||'📄';}
+
+async function fmLoad(path=''){curDir=path;document.getElementById('fm-bread').textContent='/'+path;const items=await fetch('/api/files?path='+encodeURIComponent(path)).then(r=>r.json());const el=document.getElementById('fm-list');el.innerHTML=items.map(f=>`<div class="fm-item" onclick="fmClick('${f.path}','${f.type}','${f.name.replace(/'/g,"\\'")}')"><span class="fm-ico">${f.type==='dir'?'📁':fmIco(f.ext)}</span><span class="fm-name">${f.name}</span><span class="fm-size">${f.type==='dir'?'':fmtSize(f.size)}</span></div>`).join('')||'<div style="padding:12px;color:var(--t2);font-size:12px">Klasör boş</div>';}
+function fmIco(ext){const m={'.properties':'⚙️','.json':'📋','.yml':'📋','.yaml':'📋','.jar':'☕','.txt':'📄','.log':'📜','.sh':'🖥️','.zip':'📦','.png':'🖼️','.dat':'🗃️','.conf':'⚙️','.toml':'⚙️'};return m[ext]||'📄';}
 function fmUp(){const parts=curDir.split('/').filter(Boolean);parts.pop();fmLoad(parts.join('/'));}
 function fmRefresh(){fmLoad(curDir);}
 async function fmClick(path,type,name){document.querySelectorAll('.fm-item').forEach(i=>i.classList.remove('sel'));event.currentTarget.classList.add('sel');curFile=path;if(type==='dir'){fmLoad(path);return;}document.getElementById('fm-fname').textContent=name;const textExts=['.properties','.json','.yml','.yaml','.txt','.log','.sh','.conf','.toml','.cfg','.xml','.md','.java','.py','.js'];const ext='.'+name.split('.').pop().toLowerCase();if(textExts.includes(ext)){const d=await fetch('/api/files/read?path='+encodeURIComponent(path)).then(r=>r.json());document.getElementById('fm-area').value=d.content||'';document.getElementById('fm-save').disabled=false;}else{document.getElementById('fm-area').value='(Bu dosya türü metin editöründe açılamaz)';document.getElementById('fm-save').disabled=true;}}
@@ -1823,25 +1772,26 @@ async function fmSave(){if(!curFile)return;const content=document.getElementById
 function fmDownload(){if(curFile)window.open('/api/files/download?path='+encodeURIComponent(curFile));}
 async function fmDelete(){if(!curFile||!confirm(curFile+' silinsin mi?'))return;await api('/api/files/delete',{path:curFile});notify('Silindi','ok');fmLoad(curDir);curFile=null;document.getElementById('fm-area').value='';document.getElementById('fm-fname').textContent='Dosya seçin...';}
 async function fmUpload(input){const fd=new FormData();fd.append('path',curDir);for(const f of input.files)fd.append(f.name,f);await fetch('/api/files/upload',{method:'POST',body:fd});notify('Yüklendi','ok');fmLoad(curDir);}
-function fmNewModal(){showModal('Yeni Dosya / Klasör','<input class="m-inp" id="nf-n" placeholder="isim.txt veya klasör-adı">',async()=>{const n=document.getElementById('nf-n').value.trim();if(!n)return;if(n.includes('.'))await api('/api/files/write',{path:curDir+'/'+n,content:''});else await api('/api/files/mkdir',{path:curDir+'/'+n});fmLoad(curDir);closeModal();});}
+function fmNewModal(){const name=prompt('Dosya veya klasör adı:');if(!name)return;if(name.includes('.'))api('/api/files/write',{path:curDir+'/'+name,content:''}).then(()=>fmLoad(curDir));else api('/api/files/mkdir',{path:curDir+'/'+name}).then(()=>fmLoad(curDir));}
+
 async function loadWorlds(){const d=await fetch('/api/worlds').then(r=>r.json());const el=document.getElementById('worlds-list');el.innerHTML=d.length?d.map(w=>`<div style="display:flex;justify-content:space-between;align-items:center;padding:12px 0;border-bottom:1px solid rgba(255,255,255,.05)"><div><div style="font-weight:600">🌍 ${w.name}</div><div style="font-size:11px;color:var(--t2);margin-top:2px">Boyut: ${fmtSize(w.size)}</div></div><div style="display:flex;gap:8px"><button class="btn btn-sm b-prim" onclick="backupWorld('${w.name}')">💾 Yedekle</button><button class="btn btn-sm b-dang" onclick="deleteWorld('${w.name}')">🗑 Sil</button></div></div>`).join(''):'<div style="color:var(--t2)">Dünya bulunamadı</div>';}
-async function backupWorld(name){notify('Yedekleniyor...','info');const d=await api('/api/worlds/backup',{world:name});notify(d.ok?`Yedeklendi: ${d.file} (${fmtSize(d.size)})`:'Hata',d.ok?'ok':'err');loadBackups();}
-async function deleteWorld(name){if(!confirm(name+' dünyası kalıcı olarak silinsin mi?'))return;const d=await api('/api/worlds/delete',{world:name});notify(d.ok?'Dünya silindi':d.error,d.ok?'ok':'err');loadWorlds();}
+async function backupWorld(name){notify('Yedekleniyor...','info');const d=await api('/api/worlds/backup',{world:name});notify(d.ok?`Yedeklendi: ${d.file}`:'Hata',d.ok?'ok':'err');loadBackups();}
+async function deleteWorld(name){if(!confirm(name+' silinsin mi?'))return;const d=await api('/api/worlds/delete',{world:name});notify(d.ok?'Silindi':d.error,d.ok?'ok':'err');loadWorlds();}
 async function loadBackups(){const d=await fetch('/api/backups').then(r=>r.json());const tb=document.getElementById('backup-body');tb.innerHTML=d.length?d.map(b=>`<tr><td>${b.name}</td><td style="font-size:11px;color:var(--t2)">${fmtSize(b.size)}</td><td style="font-size:11px;color:var(--t3)">${new Date(b.created*1000).toLocaleString('tr')}</td><td><a class="btn btn-sm b-prim" href="/api/files/download?path=${encodeURIComponent(b.path)}">⬇ İndir</a></td></tr>`).join(''):'<tr><td colspan="4" style="color:var(--t2);text-align:center;padding:12px">Yedek yok</td></tr>';}
-const SET_LABELS={'server-port':'Sunucu Portu','max-players':'Max Oyuncu','online-mode':'Online Mode','gamemode':'Oyun Modu','difficulty':'Zorluk','motd':'Sunucu Adı (MOTD)','view-distance':'Görüş Mesafesi','simulation-distance':'Simülasyon Mesafesi','spawn-protection':'Spawn Koruması','allow-flight':'Uçuşa İzin','white-list':'Beyaz Liste','enable-command-block':'Komut Bloğu','pvp':'PvP','allow-nether':'Nether Boyutu','level-name':'Dünya Adı','level-seed':'Dünya Seed','max-tick-time':'Max Tick Süresi (ms)','sync-chunk-writes':'Chunk Sync Yazma','generate-structures':'Yapı Oluştur'};
+
+const SET_LABELS={'server-port':'Sunucu Portu','max-players':'Max Oyuncu','online-mode':'Online Mode','gamemode':'Oyun Modu','difficulty':'Zorluk','motd':'Sunucu Adı (MOTD)','view-distance':'Görüş Mesafesi','simulation-distance':'Simülasyon Mesafesi','spawn-protection':'Spawn Koruması','allow-flight':'Uçuşa İzin','white-list':'Beyaz Liste','enable-command-block':'Komut Bloğu','pvp':'PvP','allow-nether':'Nether Boyutu','level-name':'Dünya Adı','max-tick-time':'Max Tick Süresi (ms)'};
 async function loadSettings(){const d=await fetch('/api/settings').then(r=>r.json());const el=document.getElementById('settings-grid');el.innerHTML=Object.entries(d).map(([k,v])=>`<div class="set-item"><div class="set-lbl">${SET_LABELS[k]||k}</div>${v==='true'||v==='false'?`<select class="set-inp" id="s-${k}"><option value="true" ${v==='true'?'selected':''}>true</option><option value="false" ${v==='false'?'selected':''}>false</option></select>`:`<input class="set-inp" id="s-${k}" value="${v.replace(/</g,'&lt;')}">`}</div>`).join('');}
 async function saveSettings(){const d=await fetch('/api/settings').then(r=>r.json());const updated={};for(const k of Object.keys(d)){const el=document.getElementById('s-'+k);if(el)updated[k]=el.value;}const r=await api('/api/settings',updated);notify(r.msg||'Kaydedildi','ok');setTimeout(()=>srvAction('restart'),1500);}
-async function loadPerf(){const d=await fetch('/api/performance').then(r=>r.json());if(d.cpu!==undefined){document.getElementById('p-cpu').textContent=d.cpu+'%';document.getElementById('pb-cpu').style.width=d.cpu+'%';}if(d.ram_pct!==undefined){document.getElementById('p-ram').textContent=`${d.ram_used_mb}MB / ${d.ram_total_mb}MB`;document.getElementById('pb-ram').style.width=d.ram_pct+'%';}if(d.disk_pct!==undefined){document.getElementById('p-disk').textContent=`${d.disk_used_gb}GB / ${d.disk_total_gb}GB`;document.getElementById('pb-disk').style.width=d.disk_pct+'%';}if(d.mc&&d.mc.ram){document.getElementById('p-mcram').textContent=d.mc.ram+' MB';document.getElementById('p-mccpu').textContent=d.mc.cpu+'%';document.getElementById('p-mcthr').textContent=d.mc.threads;}document.getElementById('p-tps1').textContent=d.tps||'—';document.getElementById('p-tps5').textContent=d.tps5||'—';document.getElementById('p-tps15').textContent=d.tps15||'—';document.getElementById('p-pls').textContent=document.getElementById('tb-pl').textContent;}
+
+async function loadPerf(){const d=await fetch('/api/performance').then(r=>r.json());if(d.cpu!==undefined){document.getElementById('p-cpu').textContent=d.cpu+'%';document.getElementById('pb-cpu').style.width=d.cpu+'%';}if(d.ram_pct!==undefined){document.getElementById('p-ram').textContent=`${d.ram_used_mb}MB / ${d.ram_total_mb}MB`;document.getElementById('pb-ram').style.width=d.ram_pct+'%';}if(d.disk_pct!==undefined){document.getElementById('p-disk').textContent=`${d.disk_used_gb}GB / ${d.disk_total_gb}GB`;document.getElementById('pb-disk').style.width=d.disk_pct+'%';}if(d.mc&&d.mc.ram){document.getElementById('p-mcram').textContent=d.mc.ram+' MB';document.getElementById('p-mccpu').textContent=d.mc.cpu+'%';}document.getElementById('p-tps1').textContent=`${d.tps||'—'} / ${d.tps5||'—'} / ${d.tps15||'—'}`;document.getElementById('p-swap').textContent=`${d.swap_total_mb||0}MB toplam, ${d.swap_free_mb||0}MB boş`;document.getElementById('p-nodes').textContent=`${d.support_nodes||0} düğüm bağlı`;}
 setInterval(()=>{if(curPage==='perf')loadPerf();},5000);
+
 function cmd(c){socket.emit('send_command',{cmd:c});notify('→ '+c,'info');}
 async function api(url,body={}){const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});return r.json();}
 function fmtSize(b){if(b>1e9)return(b/1e9).toFixed(2)+'GB';if(b>1e6)return(b/1e6).toFixed(1)+'MB';if(b>1e3)return(b/1e3).toFixed(0)+'KB';return b+'B';}
-function fmtUp(s){const h=Math.floor(s/3600),m=Math.floor((s%3600)/60),sec=s%60;return `${h}s ${m}d ${sec}sn`;}
 function notify(msg,type='ok'){const wrap=document.getElementById('notif-wrap');const div=document.createElement('div');div.className='notif n-'+type;div.textContent=msg;wrap.appendChild(div);setTimeout(()=>div.remove(),3500);}
-function showModal(title,body,onok){document.getElementById('m-title').textContent=title;document.getElementById('m-body').innerHTML=body;document.getElementById('m-ok').onclick=onok;document.getElementById('modal').classList.add('open');setTimeout(()=>{const inp=document.querySelector('#m-body input');if(inp)inp.focus();},50);}
-function closeModal(){document.getElementById('modal').classList.remove('open');}
-document.getElementById('modal').addEventListener('click',e=>{if(e.target===document.getElementById('modal'))closeModal();});
-async function init(){const d=await fetch('/api/status').then(r=>r.json()).catch(()=>({}));updateStatus(d);updateStats(d);if(d.players)updatePlayers(d.players);if(d.tunnel&&d.tunnel.host)setTunnel(d.tunnel);}
+
+async function init(){const d=await fetch('/api/status').then(r=>r.json()).catch(()=>({}));updateStatus(d);updateStats(d);if(d.players)updatePlayers(d.players);if(d.tunnel&&d.tunnel.host)setTunnel(d.tunnel);if(d.support_nodes)updateNodes(d.support_nodes);}
 init();
 </script>
 </body>
