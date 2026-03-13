@@ -7,9 +7,13 @@ services:
     envVars:
       - key: PORT
         value: "5000"
-      - key: MC_RAM
-        value: "300M"
       - key: RENDER_DISK_LIMIT_GB
-        value: "18.0"  # Render free plan disk kotası — psutil host değerini sınırlar
+        value: "18.0"
+      - key: FORCE_MAIN
+        value: "1"
     healthCheckPath: /api/ping
+    disk:
+      name: minecraft-disk
+      mountPath: /minecraft
+      sizeGB: 18
     numInstances: 1

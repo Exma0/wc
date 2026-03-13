@@ -23,6 +23,18 @@ from pathlib import Path
 import eventlet
 eventlet.monkey_patch()
 
+# ── 512MB process limiti ──────────────────────────────────────────────────────
+# Panel (Python) + JVM birlikte 512MB. Python adres alanını 480MB ile kısıtla.
+# JVM ayrı subprocess, UserSwap ile kendi sınırını yönetiyor.
+import resource as _resource
+try:
+    _PANEL_LIMIT = 480 * 1024 * 1024
+    _s, _h = _resource.getrlimit(_resource.RLIMIT_AS)
+    if _h == _resource.RLIM_INFINITY or _h > _PANEL_LIMIT:
+        _resource.setrlimit(_resource.RLIMIT_AS, (_PANEL_LIMIT, _PANEL_LIMIT))
+except Exception:
+    pass
+
 from flask import Flask, request, jsonify, send_file, abort, Response
 from cluster import vcluster, cluster_api
 from flask_socketio import SocketIO, emit
@@ -51,12 +63,20 @@ server_state = {
 _agents: dict = {}
 _agents_lock  = threading.Lock()
 
+import gc as _gc_mod
+
 app = Flask(__name__)
 app.config["SECRET_KEY"] = "mc-panel-secret"
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet",
                     ping_timeout=60, ping_interval=25)
 if cluster_api: app.register_blueprint(cluster_api)
 vcluster.set_socketio(socketio)
+
+@app.after_request
+def _gc_after(resp):
+    """Her response sonrası gen0 GC — panel RAM sürünmesini önle."""
+    _gc_mod.collect(0)
+    return resp
 
 
 # ══════════════════════════════════════════════════════════════
@@ -121,11 +141,27 @@ def _tps_monitor():
 
 def _stdout_reader():
     global mc_process
+    _remap_in_progress = False
+    _remap_done        = False
     while mc_process and mc_process.poll() is None:
         try:
             line = mc_process.stdout.readline()
-            if line:
-                log(line.decode("utf-8", errors="replace"))
+            if not line:
+                continue
+            txt = line.decode("utf-8", errors="replace")
+            log(txt)
+            # Remap tespiti
+            if "Remapping server" in txt and not _remap_in_progress:
+                _remap_in_progress = True
+                log("[Panel] 🔄 ReobfServer remapping başladı — UserSwap karşılıyor...")
+            if _remap_in_progress and not _remap_done:
+                if "Applying patches" in txt or "Loading libraries" in txt or "[00:00:" in txt:
+                    _remap_done        = True
+                    _remap_in_progress = False
+                    log("[Panel] ✅ Remapping tamamlandı — cache agent'lara yedekleniyor...")
+                    threading.Thread(
+                        target=vcluster.memory.save_remap_cache, daemon=True
+                    ).start()
         except Exception:
             break
     server_state["status"] = "stopped"
@@ -486,6 +522,17 @@ def start_server():
             socketio.emit("server_status", server_state)
             return False, "Jar indirilemedi"
     write_server_config()
+
+    # ── Remap cache: agent'lardan geri yükle (remap atlanır) ────────────────
+    if vcluster.agent_count() > 0:
+        log("[Panel] 🔍 Remap cache kontrol ediliyor...")
+        if vcluster.memory.restore_remap_cache():
+            log("[Panel] ✅ Remap cache yüklendi — Paper remapping ATLANABİLİR")
+        else:
+            log("[Panel] ℹ️  Remap cache yok — ilk başlatmada remap yapılacak")
+    else:
+        log("[Panel] ℹ️  Agent bağlı değil — remap cache atlandı")
+
     server_state.update({"status": "starting", "online_players": 0})
     players.clear()
     socketio.emit("server_status", server_state)
@@ -543,21 +590,36 @@ def send_command(cmd: str) -> bool:
 def _ram_watchdog():
     """
     Bellek baskısını sürekli izle.
-    512MB fiziksel limit aşılmadan swap'a geçilmesini sağla.
+    Process RSS ile ölç (psutil.virtual_memory() HOST RAM okur → yanıltıcı).
+    Remap sırasında (status=starting) tamamen sus.
     """
     import psutil
     _consecutive_low = 0
     while True:
         eventlet.sleep(4)
         try:
-            mem  = psutil.virtual_memory()
-            swp  = psutil.swap_memory()
-            # Gerçek kullanılabilir = fiziksel boş + swap boş
-            phys_avail_mb = mem.available  // 1024 // 1024
-            swap_free_mb  = swp.free       // 1024 // 1024
+            # Process RSS: panel + JVM gerçek kullanımı
+            try:
+                _panel_rss = int(psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024)
+            except Exception:
+                _panel_rss = 200
+            _jvm_rss = 0
+            if mc_process and mc_process.poll() is None:
+                try:
+                    _jvm_rss = int(psutil.Process(mc_process.pid).memory_info().rss / 1024 / 1024)
+                except Exception:
+                    pass
+            phys_avail_mb = max(0, 512 - _panel_rss - _jvm_rss)
+            swp           = psutil.swap_memory()
+            swap_free_mb  = swp.free // 1024 // 1024
 
-            # Fiziksel RAM kritik eşikte (<80MB) — agresif temizlik
-            if phys_avail_mb < 80:
+            # Remap sırasında sessiz kal (RAM spike normal)
+            if server_state.get("status") == "starting":
+                _consecutive_low = 0
+                continue
+
+            # Kritik eşik: panel+jvm > 480MB
+            if phys_avail_mb < 32:
                 _consecutive_low += 1
                 # Kernel sayfa cache'ini boşalt
                 try: open("/proc/sys/vm/drop_caches","w").write("1")

@@ -6,16 +6,15 @@ services:
     plan: free
     envVars:
       - key: PORT
-        value: "5000"
+        value: "8080"
       - key: MAIN_URL
         value: "https://wc-tsgd.onrender.com"
       - key: RAM_CACHE_MB
-        value: "400"   # 512MB toplam - 112MB overhead = 400MB cache
-        # Agent Flask+OS ~110MB kullanır, geri kalanı tümüyle cache'e ver
-      - key: RAM_LIMIT_MB
-        value: "512"   # Render free plan RAM kotası — psutil host değerini sınırlar
+        value: "380"
+        # 512MB toplam - 80MB (Flask+OS) - 36MB buffer = 396MB → 380MB güvenli
       - key: DISK_LIMIT_GB
-        value: "10.0"  # Render free plan disk kotası (agent_data dahil)
+        value: "10.0"
+    healthCheckPath: /health
     disk:
       name: agent-disk
       mountPath: /agent_data
