@@ -1016,76 +1016,146 @@ def _patch_cuberite_data():
         except Exception as _e:
             log(f"[Panel] cubeset patch hatası: {_e}")
 
-    # ── 4: PlayerSave Lua plugin — her zaman taze yaz ──────────────
-    # HOOK_LOGIN (player entity oluşmadan önce) ile stats dosyasını hazırlar.
-    # Cuberite {"stats":{}} formatını bekler — {} veya eksik dosya iostream hatası verir.
+    # ── 4: PlayerSave Lua plugin v4.0 — her zaman taze yaz ──────────
+    # Kaynak: forum.cuberite.org + ClientHandle.cpp araştırması
+    # v4.0: cUUID sınıfı + cClientHandle fallback + Render.com dizin zorlaması
     _plugin_dir = MC_DIR / "Plugins" / "PlayerSave"
     _plugin_dir.mkdir(parents=True, exist_ok=True)
     _plugin_main = _plugin_dir / "main.lua"
-    _plugin_main.write_text(r'''-- PlayerSave v1.0 — stats/player dosyası iostream hatasını önler
--- HOOK_LOGIN: player entity oluşmadan ÖNCE stats dosyasını hazırla
--- Cuberite {"stats":{}} formatını bekler; {} veya eksik dosya kick verir
+    _plugin_main.write_text(r'''-- ══════════════════════════════════════════════════════════════════
+--  PlayerSave — Cuberite Lua Plugin  v4.0 (Render.com Fix)
+-- ══════════════════════════════════════════════════════════════════
 
-local EMPTY_STATS = '{"stats":{}}'
+PLUGIN = nil
+local CACHE = {}
 
-local function EnsureDir(path)
-    os.execute('mkdir -p "' .. path .. '" 2>/dev/null')
-    os.execute('chmod 777 "' .. path .. '" 2>/dev/null')
-end
-
-local function IsValidStats(path)
-    local f = io.open(path, "r")
-    if not f then return false end
-    local c = f:read("*all"); f:close()
-    return c and c:find('"stats"') ~= nil
-end
-
-local function WriteStats(path, name)
-    local f = io.open(path, "w")
-    if f then
-        f:write(EMPTY_STATS); f:close()
-        os.execute('chmod 666 "' .. path .. '" 2>/dev/null')
-        LOG("[PlayerSave] " .. name .. " stats hazir")
+-- ── Dizin Garantileme (Kritik Render.com Çözümü) ──────────────────
+-- İlk girişte fırlatılan iostream hatasının sebebi C++'ın olmayan
+-- klasöre dosya yazamamasıdır. Bu fonksiyon Linux komutlarıyla klasörleri zorla açar.
+local function EnsureDirs()
+    local dirs = {
+        "world/stats",
+        "world/players",
+        "world/playerdata",
+        "world/data/stats",
+        "players",
+        "stats"
+    }
+    for _, dir in ipairs(dirs) do
+        os.execute('mkdir -p "' .. dir .. '" 2>/dev/null')
+        os.execute('chmod -R 777 "' .. dir .. '" 2>/dev/null')
     end
 end
 
+-- ── Güvenli UUID Alma ─────────────────────────────────────────────
+local function GetOfflineUUID(username)
+    if CACHE[username] then return CACHE[username] end
+    local uuidDashed = nil
+
+    -- Yöntem 1: Yeni Nesil Cuberite Sürümleri (cUUID sınıfı)
+    if cUUID then
+        pcall(function()
+            local cuuid = cUUID()
+            cuuid:GenerateVersion3("OfflinePlayer:" .. username)
+            uuidDashed = cuuid:ToLongString()
+        end)
+    end
+
+    -- Yöntem 2: Eski Nesil Cuberite Sürümleri (cClientHandle)
+    if not uuidDashed and cClientHandle and cClientHandle.GenerateOfflineUUID then
+        pcall(function()
+            local uuid32 = cClientHandle:GenerateOfflineUUID(username)
+            if uuid32 and cMojangAPI then
+                uuidDashed = cMojangAPI:MakeUUIDDashed(uuid32)
+            end
+        end)
+    end
+
+    if uuidDashed then
+        CACHE[username] = uuidDashed
+    else
+        LOG("[PlayerSave] ⚠️ UUID uretilemedi: " .. username)
+    end
+    return uuidDashed
+end
+
+-- ── Dosya Geçerlilik Kontrolü ─────────────────────────────────────
+local function IsValidJSON(path)
+    local f = io.open(path, "r")
+    if not f then return nil end -- Dosya yoksa sorun değil, Cuberite oluşturur.
+    local content = f:read("*all")
+    f:close()
+    if not content or #content < 2 then return false end -- 0 byte ise bozuktur.
+    if not content:find("^%s*{") then return false end   -- JSON başlangıcı yoksa bozuktur.
+    return true
+end
+
+-- ── Bozuk Dosya Temizleyici ───────────────────────────────────────
+local function FixPlayerFiles(username, uuidDashed)
+    local fixed = 0
+    local pathsToCheck = {}
+
+    if uuidDashed then
+        table.insert(pathsToCheck, "world/stats/"   .. uuidDashed .. ".json")
+        table.insert(pathsToCheck, "world/players/" .. uuidDashed .. ".json")
+        table.insert(pathsToCheck, "world/data/stats/" .. uuidDashed .. ".json")
+        table.insert(pathsToCheck, "players/"       .. uuidDashed .. ".json")
+    end
+
+    table.insert(pathsToCheck, "world/stats/"   .. username .. ".json")
+    table.insert(pathsToCheck, "world/players/" .. username .. ".json")
+    table.insert(pathsToCheck, "world/data/stats/" .. username .. ".json")
+    table.insert(pathsToCheck, "players/"       .. username .. ".json")
+
+    for _, path in ipairs(pathsToCheck) do
+        local valid = IsValidJSON(path)
+        if valid == false then
+            os.remove(path)
+            LOG("[PlayerSave] Bozuk dosya silindi: " .. path)
+            fixed = fixed + 1
+        end
+    end
+    return fixed
+end
+
+-- ── Kancalar (Hooks) ──────────────────────────────────────────────
 function OnLogin(Client, ProtocolVersion, Username)
     if not Username or Username == "" then return false end
-    local dir  = "world/data/stats"
-    local path = dir .. "/" .. Username .. ".json"
-    EnsureDir(dir)
-    EnsureDir("players")
-    if not IsValidStats(path) then
-        local bak = dir .. "/_bak_" .. Username .. ".json"
-        os.rename(path, bak)
-        WriteStats(path, Username)
+    EnsureDirs()
+    local uuidDashed = GetOfflineUUID(Username)
+    local fixed = FixPlayerFiles(Username, uuidDashed)
+    if fixed > 0 then
+        LOG("[PlayerSave] " .. Username .. " icin " .. fixed .. " bozuk dosya onarildi.")
     end
     return false
 end
 
 function OnPlayerDestroyed(Player)
-    local name = Player:GetName()
-    local path = "world/data/stats/" .. name .. ".json"
-    if not IsValidStats(path) then
-        WriteStats(path, name)
-    end
+    local username = Player:GetName()
+    if not username or username == "" then return false end
+    local uuidDashed = GetOfflineUUID(username)
+    FixPlayerFiles(username, uuidDashed)
     return false
 end
 
+-- ── Eklenti Başlatma ──────────────────────────────────────────────
 function Initialize(Plugin)
     Plugin:SetName("PlayerSave")
-    Plugin:SetVersion(1)
+    Plugin:SetVersion(4)
+    PLUGIN = Plugin
+    EnsureDirs()
     cPluginManager.AddHook(cPluginManager.HOOK_LOGIN,            OnLogin)
     cPluginManager.AddHook(cPluginManager.HOOK_PLAYER_DESTROYED, OnPlayerDestroyed)
-    LOG("[PlayerSave] v1.0 aktif — HOOK_LOGIN + HOOK_PLAYER_DESTROYED")
+    LOG("[PlayerSave] v4.0 (Render.com Fix) yuklendi")
     return true
 end
 
 function OnDisable()
+    CACHE = {}
     LOG("[PlayerSave] devre disi")
 end
 ''')
-    log("[Panel] PlayerSave Lua plugin yazıldı: Plugins/PlayerSave/main.lua")
+    log("[Panel] PlayerSave Lua plugin v4.0 yazıldı: Plugins/PlayerSave/main.lua")
 
 
 def download_paper():
