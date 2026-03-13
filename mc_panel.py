@@ -219,26 +219,18 @@ def _reset_player_files(player_name: str):
     except Exception: pass
 
     deleted = []
-    # Tüm olası konumlarda player dosyasını sil — Cuberite kendi yazar
-    _fixed = [
+    # Tüm olası player dosyalarını SİL — Cuberite kendi yazar
+    for fp in [
         players_dir / f"{player_name}.json",
         players_dir / f"{player_name.lower()}.json",
         stats_dir   / f"{player_name}.json",
         stats_dir   / f"{player_name.lower()}.json",
         MC_DIR / "world" / "playerdata" / f"{player_name}.json",
-        MC_DIR / "world" / "players"    / f"{player_name}.json",
-        MC_DIR / "world" / "data" / "stats" / f"{player_name}.json",
-    ]
-    import glob as _gl
-    _found = (
-        _gl.glob(str(MC_DIR / "**" / f"{player_name}.json"),       recursive=True) +
-        _gl.glob(str(MC_DIR / "**" / f"{player_name.lower()}.json"), recursive=True)
-    )
-    for fp in _fixed + [Path(p) for p in _found]:
+    ]:
         try:
             if fp.exists():
                 fp.unlink()
-                deleted.append(str(fp.relative_to(MC_DIR)))
+                deleted.append(fp.name)
         except Exception as _e:
             log(f"[Players] ⚠️  silinemedi {fp.name}: {_e}")
 
@@ -1034,26 +1026,26 @@ def get_cuberite_cmd() -> list:
     wrapper = MC_DIR / "_start_cuberite.sh"
     wrapper.write_text(
         "#!/bin/sh\n"
-        f"umask 000\n"
-        # dizinler
-        f"mkdir -p {MC_DIR}/world/data/stats "
-        f"{MC_DIR}/world/data "
-        f"{MC_DIR}/world/playerdata "
-        f"{MC_DIR}/players "
-        f"{MC_DIR}/world_nether/data/stats "
-        f"{MC_DIR}/world_the_end/data/stats "
-        f"{MC_DIR}/logs 2>/dev/null || true\n"
-        # tam izin — Cuberite root olmadan yazabilmeli
+        # 1. DİZİNLERİ ÖNCE OLUŞTUR — chmod bunları görmesi için var olmalı
+        f"mkdir -p"
+        f" {MC_DIR}/players"
+        f" {MC_DIR}/world/players"
+        f" {MC_DIR}/world/data"
+        f" {MC_DIR}/world/data/stats"
+        f" {MC_DIR}/world/playerdata"
+        f" {MC_DIR}/world_nether/data/stats"
+        f" {MC_DIR}/world_the_end/data/stats"
+        f" {MC_DIR}/logs"
+        f" 2>/dev/null\n"
+        # 2. İZİN VER — artık dizinler var, chmod -R hepsini yakalar
         f"chmod -R 777 {MC_DIR} 2>/dev/null || true\n"
-        # scoreboard.dat SİL — sahte NBT crash eder, yoksa sadece warning verir
-        f"rm -f {MC_DIR}/world/data/scoreboard.dat 2>/dev/null || true\n"
-        # TÜM player dosyalarını sil — Online→Offline geçişinde UUID uyumsuzluğu
-        # Cuberite ilk girişte kendi doğru formatında yeniden yazar
-        f"rm -f {MC_DIR}/players/*.json 2>/dev/null || true\n"
-        f"rm -f {MC_DIR}/world/data/stats/*.json 2>/dev/null || true\n"
-        f"rm -f {MC_DIR}/world/playerdata/*.json 2>/dev/null || true\n"
-        f"rm -f {MC_DIR}/world/players/*.json 2>/dev/null || true\n"
-        f"exec {MC_BIN}\n"
+        f"umask 000\n"
+        # 3. scoreboard.dat SİL — yoksa sadece warning, varsa crash riski
+        f"rm -f {MC_DIR}/world/data/scoreboard.dat 2>/dev/null\n"
+        # 4. ÇALIŞMA DİZİNİNE GEÇ — Cuberite relative path kullanıyor
+        f"cd {MC_DIR}\n"
+        # 5. Cuberite başlat — --config-file ile settings.ini konumunu açık ver
+        f"exec {MC_BIN} --config-file {MC_DIR}/settings.ini\n"
     )
     wrapper.chmod(0o755)
     log("[Panel] Cuberite C++ baslatiliyor (JVM yok, ~50MB RAM)")
