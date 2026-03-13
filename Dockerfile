@@ -1,4 +1,7 @@
 FROM ubuntu:24.04
+# ── Cuberite C++ Minecraft Server (1.8.8 uyumlu) ──────────────
+# JVM yok → ~50MB RAM (Paper 400MB yerine)
+# Cuberite binary runtime sırasında /minecraft'a indirilir
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -8,10 +11,12 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # Paketler (hem ana hem agent modu için)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 python3-pip python3-dev \
-    openjdk-21-jre-headless \
     gcc make \
     wget curl ca-certificates \
     procps util-linux kmod iproute2 \
+    libstdc++6 libgcc-s1 \
+    libssl3 libcrypto3 2>/dev/null || true \
+    && apt-get install -y --no-install-recommends libssl-dev 2>/dev/null || true \
     && rm -rf /var/lib/apt/lists/*
 
 # cloudflared
@@ -29,12 +34,9 @@ COPY mc_panel.py  ./mc_panel.py
 COPY cluster.py   ./cluster.py
 COPY main.py      ./main.py
 COPY agent.py     ./agent.py
-COPY userswap.c   ./userswap.c
+# userswap.c kaldırıldı — Cuberite C++ kullanılıyor
 
-# userswap.so derle
-RUN gcc -O2 -shared -fPIC -o /app/userswap.so /app/userswap.c \
-        -ldl -lpthread -DSWAP_SHARDS=4 -DSHARD_GB=1 \
-    && echo "✅ userswap.so hazır ($(du -sh /app/userswap.so | cut -f1))"
+# userswap kaldırıldı — Cuberite C++ JVM gerektirmiyor
 
 # Dizinler
 RUN mkdir -p /minecraft/world/region \
@@ -48,7 +50,7 @@ RUN mkdir -p /minecraft/world/region \
              /agent_data/regions/world_the_end \
              /agent_data/backups /agent_data/plugins \
              /agent_data/configs /agent_data/chunks \
-             /agent_data/paper_cache
+             /agent_data/cuberite_cache
 
 EXPOSE 5000 8080 25565
 

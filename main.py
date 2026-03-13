@@ -1,7 +1,7 @@
 """
-⛏️  Minecraft Server Boot — v11.0
+⛏️  Minecraft Server Boot — v14.0 (Cuberite)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-v11.0:
+v14.0 (Cuberite):
   • ANA sunucu: Panel + MC + UserSwap
   • AGENT modu: agent.py'yi başlat, ana sunucuya kayıt ol
   • Swap: zram → disk dosyası (hem ANA hem AGENT için)
@@ -59,7 +59,7 @@ base_env = {
 }
 
 print("\n" + "━" * 56)
-print("  ⛏️   Minecraft Server — v11.0")
+print("  ⛏️   Minecraft Server — v14.0 (Cuberite)")
 print(f"      MOD    : {'🟢 ANA' if IS_MAIN else '🔵 AGENT'}")
 print(f"      MY_URL : {MY_URL or '(boş → ANA)'}")
 print(f"      RAM    : {CONTAINER_RAM_MB}MB")
@@ -194,27 +194,7 @@ def setup_swap() -> int:
     return swp.total // 1024 // 1024
 
 
-# ── UserSwap (userswap.so) derleme ───────────────────────────────────────────
-
-def build_userswap() -> str:
-    """userswap.c'yi derle, .so yolunu döner. Başarısızsa boş string."""
-    src = "/app/userswap.c"
-    out = "/app/userswap.so"
-    if not os.path.exists(src):
-        return ""
-    if os.path.exists(out):
-        return out
-    print("  🔨 userswap.so derleniyor...")
-    r = _sh(
-        f"gcc -O2 -shared -fPIC -o {out} {src} "
-        f"-ldl -lpthread -DSWAP_SHARDS=4 -DSHARD_GB=1 2>&1"
-    )
-    if r.returncode == 0 and os.path.exists(out):
-        print(f"  ✅ userswap.so hazır: {out}")
-        return out
-    else:
-        print(f"  ⚠️  userswap.so derlenemedi: {r.stdout.decode()[:200]}")
-        return ""
+# UserSwap kaldırıldı — Cuberite C++ JVM gerektirmiyor
 
 
 # ── Kernel ayarları ───────────────────────────────────────────────────────────
@@ -251,13 +231,10 @@ def start_panel():
     print(f"\n🚀 Panel (iki fazlı) başlatılıyor :{PORT}...")
     print(f"  Faz1: Minimal HTTP + MC Xmx=340MB")
     print(f"  Faz2: MC Done! → Flask+SocketIO devralır")
-    userswap_so = build_userswap()
     env = {
         **base_env,
-        "MC_ONLY": "0",   # İki fazlı mod: minimal→MC Done!→Flask
+        "MC_ONLY": "0",
     }
-    if userswap_so:
-        env["USERSWAP_SO"] = userswap_so
     proc = subprocess.Popen([sys.executable, "/app/mc_panel.py"], env=env)
     # Faz1 minimal HTTP port açılışını bekle
     if _wait_port(PORT, 30):
@@ -276,7 +253,7 @@ def auto_start():
       Faz2: MC Done! → Flask+SocketIO
     Buradan sadece tünel açıyoruz.
     """
-    _panel_log("[Sistem] 🟢 v12.0 iki fazlı başladı")
+    _panel_log("[Sistem] 🟢 v14.0 (Cuberite) iki fazlı başladı")
     _panel_log("[Sistem] ⏳ Faz1: Minimal HTTP + MC Xmx=340MB bootstrap...")
 
     if _wait_port(MC_PORT, 360):
@@ -324,7 +301,7 @@ def run_agent():
     ram_cache_mb = max(200, CONTAINER_RAM_MB - 130)
 
     print(f"\n{'═'*56}")
-    print(f"  🔵 AGENT MODU v11.0")
+    print(f"  🔵 AGENT MODU v14.0 (Cuberite)")
     print(f"  Ana    : {MAIN_SERVER_URL}")
     print(f"  Cache  : {ram_cache_mb}MB")
     print(f"{'═'*56}\n")
@@ -360,7 +337,7 @@ optimize_all("main" if IS_MAIN else "agent")
 
 if IS_MAIN:
     print(f"\n{'━'*56}")
-    print(f"  🟢 ANA SUNUCU v12.0 — İki Fazlı :{PORT}")
+    print(f"  🟢 ANA SUNUCU v14.0 (Cuberite) — İki Fazlı :{PORT}")
     print(f"  Faz1: Minimal HTTP + Xmx=340MB bootstrap")
     print(f"  Faz2: MC Done! → Flask+SocketIO (wc-tsgd.onrender.com)")
     print(f"{'━'*56}\n")

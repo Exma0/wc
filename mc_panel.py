@@ -1,5 +1,5 @@
 """
-⛏️  Minecraft Yönetim Paneli — v10.0
+⛏️  Minecraft Yönetim Paneli — v14.0 (Cuberite)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 v10.0: NBD kaldırıldı → Resource Pool entegrasyonu
   - /api/agent/register + heartbeat
@@ -29,7 +29,7 @@ from flask_socketio import SocketIO, emit
 
 # ── Ayarlar ───────────────────────────────────────────────────
 MC_DIR     = Path("/minecraft")
-MC_JAR     = MC_DIR / "server.jar"
+MC_BIN     = MC_DIR / "Cuberite"    # C++ binary, JVM yok
 MC_PORT    = 25565
 PANEL_PORT  = int(os.environ.get("PORT", "5000"))
 # ── Çalışma Modu ─────────────────────────────────────────────────────────────
@@ -42,8 +42,8 @@ PANEL_PORT  = int(os.environ.get("PORT", "5000"))
 MC_ONLY    = os.environ.get("MC_ONLY",    "0") == "1"
 WORKER_URL = os.environ.get("WORKER_URL", "").rstrip("/")
 IS_PROXY   = bool(WORKER_URL)
-MC_VERSION = "1.21.1"
-MC_RAM     = os.environ.get("MC_RAM", "2G")
+MC_VERSION = "1.8.8"  # Cuberite 1.8.8 uyumlu
+
 
 # ── Global durum ─────────────────────────────────────────────
 mc_process   = None
@@ -83,43 +83,66 @@ def log(line: str):
 
 
 def _parse_mc_output(line: str):
-    m = re.search(r"(\w+)\[/.+\] logged in", line)
+    # ── Cuberite 1.8.8 log formatı ──────────────────────────────
+    # Giriş:  "Player <name> has connected from <ip>"
+    # Çıkış:  "Player <name> has disconnected"
+    # Hazır:  "Cuberite 1.x.x is running"
+    # TPS:    Cuberite kendi TPS'ini loglamaz — psutil ile ölçülür
+
+    m = re.search(r"Player (\w+) has connected", line)
     if m:
         players[m.group(1)] = {"op": False, "joined_ts": time.time()}
         server_state["online_players"] = len(players)
         socketio.emit("players_update", _players_list())
         socketio.emit("stats_update", server_state)
         return
-    m = re.search(r"(\w+) lost connection|(\w+) left the game", line)
+
+    m = re.search(r"Player (\w+) has disconnected", line)
     if m:
-        players.pop(m.group(1) or m.group(2), None)
+        players.pop(m.group(1), None)
         server_state["online_players"] = len(players)
         socketio.emit("players_update", _players_list())
         socketio.emit("stats_update", server_state)
         return
-    m = re.search(r"TPS from last 1m, 5m, 15m: ([\d.]+),\s*([\d.]+),\s*([\d.]+)", line)
-    if m:
-        server_state["tps"]  = float(m.group(1))
-        server_state["tps5"] = float(m.group(2))
-        server_state["tps15"]= float(m.group(3))
-        socketio.emit("stats_update", server_state)
-        return
-    m = re.search(r"Starting minecraft server version (.+)", line)
-    if m:
-        server_state["version"] = m.group(1).strip()
+
+    # Paper uyumluluk (fallback):
+    m2 = re.search(r"(\w+)\[/.+\] logged in", line)
+    if m2:
+        players[m2.group(1)] = {"op": False, "joined_ts": time.time()}
+        server_state["online_players"] = len(players)
+        socketio.emit("players_update", _players_list()); return
+
+    m2 = re.search(r"(\w+) left the game|(\w+) lost connection", line)
+    if m2:
+        players.pop(m2.group(1) or m2.group(2), None)
+        server_state["online_players"] = len(players)
+        socketio.emit("players_update", _players_list()); return
+
+    # Cuberite hazır sinyali: "Cuberite 1.x is running" veya "Startup complete"
+    if re.search(r"Cuberite .* is running|Startup complete|server is running", line, re.I):
+        server_state["status"]  = "running"
+        server_state["version"] = "1.8.8"
+        server_state["started"] = time.time()
+        server_state["online_players"] = 0
+        try: socketio.emit("server_status", server_state)
+        except Exception: pass
+        log("[Panel] ✅ Cuberite Server hazır! (1.8.8)")
+        threading.Thread(target=_tps_monitor, daemon=True).start()
+        try: _bootstrap_done.set()
+        except Exception: pass
+
+    # Paper/Paper uyumlu "Done" sinyali (fallback)
     if "Done" in line and "help" in line.lower():
         server_state["status"]  = "running"
         server_state["started"] = time.time()
-        server_state["online_players"] = 0
-        # socketio henüz hazır olmayabilir — try/except
         try: socketio.emit("server_status", server_state)
         except Exception: pass
-        log("[Panel] ✅ Minecraft Server hazır!")
+        log("[Panel] ✅ Server hazır!")
         threading.Thread(target=_tps_monitor, daemon=True).start()
-        # Faz 2'ye geç — Flask+SocketIO başlat
         try: _bootstrap_done.set()
         except Exception: pass
-    if "Stopping server" in line:
+
+    if "Stopping server" in line or "Shutting down" in line:
         server_state["status"] = "stopping"
         socketio.emit("server_status", server_state)
 
@@ -129,10 +152,28 @@ def _players_list():
 
 
 def _tps_monitor():
+    """
+    Cuberite kendi TPS komutunu desteklemez.
+    CPU zamanlamasından TPS tahmini:
+      process CPU delta / (20 tick * 50ms) → normalize
+    """
+    import psutil
+    _prev_cpu = 0.0
     while mc_process and mc_process.poll() is None:
-        time.sleep(30)
+        time.sleep(10)
         if server_state["status"] == "running":
-            send_command("tps")
+            try:
+                proc  = psutil.Process(mc_process.pid)
+                cpu_p = proc.cpu_percent(interval=1)
+                # Cuberite hedef: 20 TPS @ ~5-15% CPU (1 core)
+                # Düşük CPU → TPS yüksek; yüksek CPU → TPS düşüyor
+                tps_est = round(max(1.0, min(20.0, 20.0 * (1.0 - cpu_p / 100.0))), 1)
+                server_state["tps"] = tps_est
+                server_state["tps5"] = tps_est
+                server_state["tps15"] = tps_est
+                socketio.emit("stats_update", server_state)
+            except Exception:
+                pass
 
 
 def _stdout_reader():
@@ -324,165 +365,91 @@ def _auto_archive_old_regions(older_than_days: int = 5):
 # ══════════════════════════════════════════════════════════════
 
 def download_paper():
-    import ssl
-    ctx = ssl.create_default_context()
-    log("[Panel] 📥 Paper MC indiriliyor...")
-    try:
-        api_url = f"https://api.papermc.io/v2/projects/paper/versions/{MC_VERSION}/builds"
-        req = _urllib_req.Request(api_url, headers={"User-Agent": "MCPanel/10.0"})
-        with _urllib_req.urlopen(req, timeout=20, context=ctx) as r:
-            builds = json.loads(r.read()).get("builds", [])
-        if not builds:
-            raise ValueError("Build listesi boş")
-        build    = builds[-1]["build"]
-        jar_name = f"paper-{MC_VERSION}-{build}.jar"
-        url = (f"https://api.papermc.io/v2/projects/paper"
-               f"/versions/{MC_VERSION}/builds/{build}/downloads/{jar_name}")
-        log(f"[Panel] 📦 {jar_name} (build #{build})...")
-        req2 = _urllib_req.Request(url, headers={"User-Agent": "MCPanel/10.0"})
-        done = 0
-        with _urllib_req.urlopen(req2, timeout=180, context=ctx) as r2:
-            total = int(r2.headers.get("Content-Length", 0))
-            with open(MC_JAR, "wb") as f:
-                while True:
-                    chunk = r2.read(65536)
-                    if not chunk: break
-                    f.write(chunk); done += len(chunk)
-                    if total:
-                        socketio.emit("download_progress",
-                                      {"pct": int(done*100/total), "done": done, "total": total})
-        log(f"[Panel] ✅ Paper MC {MC_VERSION} build #{build} indirildi ({done//1024//1024}MB)")
-        return True
-    except Exception as e:
-        log(f"[Panel] ❌ İndirme hatası: {e}")
-        return False
-
+    """Geriye dönük uyumluluk — Cuberite C++ kullanılıyor."""
+    return download_cuberite()
 
 def write_server_config():
-    (MC_DIR / "eula.txt").write_text("eula=true\n")
-    props = MC_DIR / "server.properties"
-    if not props.exists():
-        props.write_text(
-            f"server-port={MC_PORT}\nmax-players=20\nonline-mode=false\n"
-            "gamemode=survival\ndifficulty=normal\nlevel-name=world\n"
-            "motd=\\u00A7a\\u00A7lRender MC Server\nview-distance=8\n"
-            "simulation-distance=6\nspawn-protection=0\nallow-flight=true\n"
-            "enable-rcon=false\nmax-tick-time=60000\nwhite-list=false\n"
-            "enable-command-block=true\npvp=true\ngenerate-structures=true\n"
-            "allow-nether=true\nsync-chunk-writes=true\n"
+    """
+    Cuberite INI konfigürasyon dosyaları yaz.
+    Paper server.properties → settings.ini
+    Paper paper-world-defaults.yml → world.ini
+    """
+    MC_DIR.mkdir(parents=True, exist_ok=True)
+
+    # ── settings.ini — Ana sunucu ayarları ─────────────────────
+    settings = MC_DIR / "settings.ini"
+    settings.write_text(
+        f"[Server]\n"
+        f"Ports={MC_PORT}\n"
+        f"MaxPlayers=20\n"
+        f"OnlineMode=false\n"        # Render'da auth sunucusuna erişim yok
+        f"Motd=\u00A7aRender MC • Cuberite 1.8.8\n"
+        f"AllowFlight=true\n"
+        f"Description=Cuberite 1.8.8 on Render\n"
+        f"ShutdownMessage=Server kapaniyor...\n"
+        f"\n"
+        f"[Authentication]\n"
+        f"Authenticate=false\n"      # Offline mode
+        f"\n"
+        f"[AntiCheat]\n"
+        f"LimitPlayerBlockChanges=false\n"
+        f"AllowFlight=true\n"
+    )
+
+    # ── world.ini — Dünya ayarları ──────────────────────────────
+    world_ini = MC_DIR / "world.ini"
+    if not world_ini.exists():
+        world_ini.write_text(
+            f"[General]\n"
+            f"Dimension=Overworld\n"
+            f"WorldType=Normal\n"
+            f"Seed=12345\n"
+            f"Difficulty=1\n"          # Normal
+            f"Gamemode=0\n"            # Survival
+            f"PVPEnabled=1\n"
+            f"AllowFlight=1\n"
+            f"\n"
+            f"[SpawnPosition]\n"
+            f"X=0\n"
+            f"Y=64\n"
+            f"Z=0\n"
+            f"\n"
+            f"[Mobs]\n"
+            f"MaxMobDistanceFromPlayer=80\n"
+            f"MaxAnimals=8\n"          # Azaltıldı (RAM tasarrufu)
+            f"MaxMonsters=40\n"        # Azaltıldı
+            f"MaxWaterMobs=3\n"
+            f"\n"
+            f"[Chunking]\n"
+            f"ChunkDestroyTimer=60\n"  # 60sn kullanılmayan chunk kaldır
+            f"LimitedHeightWorld=false\n"
         )
-    config = MC_DIR / "config"
-    config.mkdir(exist_ok=True)
-    pw = config / "paper-world-defaults.yml"
-    if not pw.exists():
-        pw.write_text(
-            "world-settings:\n  default:\n"
-            "    spawn-limits:\n      monsters: 70\n      animals: 10\n"
-            "      water-animals: 5\n      water-ambient: 20\n"
-            "    chunks:\n      auto-save-interval: 6000\n"
-        )
+
+    # ── webadmin.ini — Cuberite web admin (kapalı, Panel var) ──
+    webadmin = MC_DIR / "webadmin.ini"
+    if not webadmin.exists():
+        webadmin.write_text("[WebAdmin]\nEnabled=false\n")
+
+    # ── Nether/End dizinleri ────────────────────────────────────
+    (MC_DIR / "world" / "region").mkdir(parents=True, exist_ok=True)
+    (MC_DIR / "world_nether").mkdir(parents=True, exist_ok=True)
+
+
+def get_cuberite_cmd() -> list:
+    """
+    Cuberite C++ binary çalıştırma komutu.
+    JVM YOK — RAM kullanımı ~40-80MB (Paper 400MB yerine).
+    """
+    log(f"[Panel] 🚀 Cuberite C++ başlatılıyor (JVM yok, ~50MB RAM)")
+    return [
+        str(MC_BIN),
+        "--config-file", str(MC_DIR / "settings.ini"),
+    ]
 
 
 def get_jvm_args():
-    """
-    JVM heap hesabı:
-    ─────────────────────────────────────────────────────
-    Render container'da fiziksel RAM 512MB (cgroup limit).
-    Bu limit bypass edilemiyor — yazılan değerler yok sayılıyor.
-    
-    Güvenli bütçe (512MB container):
-      MC_ONLY=0  (Panel + MC):  512 - 90(flask) - 110(jvm meta/code) - 32(os) = 280MB Xmx
-      MC_ONLY=1  (Panel ayrı):  512 - 110(jvm meta/code) - 32(os)            = 370MB Xmx ✅
-
-    UserSwap (LD_PRELOAD mmap hook) GC spike'larını yumuşatır ama
-    Render cgroup 512MB FİZİKSEL limiti aşılamaz — Xmx artırmaz.
-    ─────────────────────────────────────────────────────
-    """
-    import psutil as _ps
-
-    # Gerçek fiziksel RAM'i oku (cgroup'tan)
-    phys_mb = 512   # Render default
-    for path in ["/sys/fs/cgroup/memory.max",
-                 "/sys/fs/cgroup/memory/memory.limit_in_bytes"]:
-        try:
-            val = open(path).read().strip()
-            if val not in ("max", "-1", "9223372036854771712"):
-                mb = int(val) // 1024 // 1024
-                if 128 < mb < 65536:
-                    phys_mb = mb
-                    break
-        except: pass
-
-    # UserSwap SO — env'den veya bilinen konumdan bul
-    us_path = ""
-    for _p in [os.environ.get("USERSWAP_SO", ""), "/app/userswap.so"]:
-        if _p and os.path.exists(_p):
-            us_path = _p
-            break
-    us_ok = bool(us_path)
-
-    # ── Xmx hesabı — SADECE FİZİKSEL RAM baz alınır ──────────────────────
-    #
-    # Render cgroup: 512MB FİZİKSEL. Page cache dahil. Aşılırsa → SIGKILL.
-    # UserSwap GC spike'larını yumuşatır ama Xmx'i artırmaz
-    # (dosya sayfaları page cache üzerinden RAM'e sayılır).
-    #
-    # MC_ONLY=1  (Panel ayrı agent):
-    #   512 - 110(jvm meta/code/stack) - 32(os) = 370MB Xmx
-    #
-    # MC_ONLY=0  (Panel + MC aynı yerde):
-    #   512 - 90(flask) - 110(jvm meta) - 32(os) = 280MB Xmx
-    #
-    xmx_mb = 370 if MC_ONLY else 340   # Phase1: Flask yok → +80MB Xmx
-    xms_mb = 32   # lazy start — GC baskısını azalt
-
-    log(f"[Panel] 🧠 {'MC_ONLY' if MC_ONLY else 'FULL'} "
-        f"RAM={phys_mb}MB Xmx={xmx_mb}M (Phase1=no-Flask) "
-        f"UserSwap={'✅ ' + us_path if us_ok else '❌'}")
-
-    cmd_prefix = ["env", f"LD_PRELOAD={us_path}", "java"] if us_ok else ["java"]
-
-    return cmd_prefix + [
-        f"-Xms{xms_mb}M", f"-Xmx{xmx_mb}M",
-
-        # Non-heap — minimumda tut (meta+class+code+stack = ~124MB)
-        "-XX:MaxMetaspaceSize=80m",
-        "-XX:CompressedClassSpaceSize=20m",
-        "-XX:ReservedCodeCacheSize=24m",
-        "-Xss256k",
-
-        # G1GC — düşük RAM için optimize
-        "-XX:+UseG1GC",
-        "-XX:+ParallelRefProcEnabled",
-        "-XX:MaxGCPauseMillis=100",          # daha sık ama kısa GC
-        "-XX:+UnlockExperimentalVMOptions",
-        "-XX:+DisableExplicitGC",
-        "-XX:G1NewSizePercent=15",
-        "-XX:G1MaxNewSizePercent=25",
-        "-XX:G1HeapRegionSize=2m",           # küçük heap → küçük region
-        "-XX:G1ReservePercent=15",
-        "-XX:InitiatingHeapOccupancyPercent=20",
-        "-XX:SoftRefLRUPolicyMSPerMB=0",
-        "-XX:+UseStringDeduplication",
-
-        # Bellek baskısı azaltma
-        "-XX:+UseCompressedOops",
-        "-XX:+UseCompressedClassPointers",
-        "-XX:NativeMemoryTracking=off",      # tracking overhead yok
-        "-XX:+ExplicitGCInvokesConcurrent",  # GC bloklamayı azalt
-        "-XX:-OmitStackTraceInFastThrow",
-
-        # OOM dump yok — disk alanı kritik
-        "-XX:-HeapDumpOnOutOfMemoryError",
-
-        # Genel
-        "-Djava.net.preferIPv4Stack=true",
-        "-Dfile.encoding=UTF-8",
-        "-Dcom.mojang.eula.agree=true",
-        "-Djava.awt.headless=true",
-
-        "-jar", str(MC_JAR), "--nogui",
-    ]
+    """Geriye dönük uyumluluk — Cuberite C++ kullanıyor, çağrılmaz."""
+    return get_cuberite_cmd()
 
 
 def _worker_proxy(path: str, body: dict = None) -> dict:
@@ -512,35 +479,31 @@ def start_server():
     if mc_process and mc_process.poll() is None:
         return False, "Server zaten çalışıyor"
     MC_DIR.mkdir(parents=True, exist_ok=True)
-    if not MC_JAR.exists():
+    if not MC_BIN.exists():
         server_state["status"] = "downloading"
         socketio.emit("server_status", server_state)
-        if not download_paper():
+        if not download_cuberite():
             server_state["status"] = "stopped"
             socketio.emit("server_status", server_state)
-            return False, "Jar indirilemedi"
+            return False, "Cuberite indirilemedi"
     write_server_config()
     server_state.update({"status": "starting", "online_players": 0})
     players.clear()
     socketio.emit("server_status", server_state)
     socketio.emit("players_update", [])
-    jvm = get_jvm_args()
-    log(f"[Panel] 🚀 Server başlatılıyor...")
+    cmd = get_cuberite_cmd()
+    log(f"[Panel] 🚀 Cuberite C++ başlatılıyor (JVM yok)...")
     try:
         def _child_setup():
-            # Adres alanı sınırını kaldır
             try:
                 import resource as _r
                 _r.setrlimit(_r.RLIMIT_AS, (_r.RLIM_INFINITY, _r.RLIM_INFINITY))
-            except Exception:
-                pass
-            # OOM koruma — child /proc/self yazabilir, parent /proc/PID yazamaz (EPERM)
+            except Exception: pass
             try:
                 open("/proc/self/oom_score_adj", "w").write("-900")
-            except Exception:
-                pass
+            except Exception: pass
         mc_process = subprocess.Popen(
-            jvm, cwd=str(MC_DIR),
+            cmd, cwd=str(MC_DIR),
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             preexec_fn=_child_setup,
         )
@@ -550,7 +513,7 @@ def start_server():
         socketio.emit("server_status", server_state)
         return False, str(e)
     threading.Thread(target=_stdout_reader, daemon=True).start()
-    log(f"[Panel] 🛡️  Java PID={mc_process.pid} (OOM adj child-preexec ✅)")
+    log(f"[Panel] ✅ Cuberite PID={mc_process.pid} (~50MB RAM, JVM yok)")
     return True, "Başlatılıyor..."
 
 
@@ -566,7 +529,7 @@ def stop_server(force=False):
     if force:
         mc_process.kill()
     else:
-        send_command("save-all"); time.sleep(1); send_command("stop")
+        send_command("/save"); time.sleep(1); send_command("/stop")
     return True, "Durduruluyor..."
 
 
@@ -1317,7 +1280,7 @@ select.set-inp option{background:#1e1e1e}
 <div class="sidebar">
   <div class="sb-head">
     <h2>⛏️ MC Panel</h2>
-    <div class="sb-ver" id="sb-ver">Paper MC • v10.0</div>
+    <div class="sb-ver" id="sb-ver">Cuberite • 1.8.8</div>
   </div>
   <div class="sb-status">
     <div class="dot dot-red" id="status-dot"></div>
@@ -1717,7 +1680,7 @@ function updateStatus(d){
   document.getElementById('status-dot').className='dot '+dc;
   document.getElementById('status-text').textContent=label;
   const b=document.getElementById('d-status');if(b){b.className='badge '+bc;b.textContent=label;}
-  const v=document.getElementById('sb-ver');if(v&&d.version&&d.version!=='—')v.textContent='Paper MC • '+d.version;
+  const v=document.getElementById('sb-ver');if(v&&d.version&&d.version!=='—')v.textContent='Cuberite • 1.8.8';
   const dv=document.getElementById('d-ver');if(dv)dv.textContent=d.version||'—';
 }
 function updateStats(d){
@@ -1951,10 +1914,10 @@ def _run_mc_only():
     def _do_start():
         global mc_process
         MC_DIR.mkdir(parents=True, exist_ok=True)
-        if not MC_JAR.exists():
+        if not MC_BIN.exists():
             server_state["status"] = "downloading"
             _mc_log("[MC_ONLY] 📥 server.jar indiriliyor...")
-            if not download_paper():
+            if not download_cuberite():
                 server_state["status"] = "stopped"
                 return False, "İndirme başarısız"
         write_server_config()
