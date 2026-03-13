@@ -24,13 +24,12 @@ import eventlet
 eventlet.monkey_patch()
 
 import resource as _resource
-try:
-    _PANEL_LIMIT = 480 * 1024 * 1024
-    _s, _h = _resource.getrlimit(_resource.RLIMIT_AS)
-    if _h == _resource.RLIM_INFINITY or _h > _PANEL_LIMIT:
-        _resource.setrlimit(_resource.RLIMIT_AS, (_PANEL_LIMIT, _PANEL_LIMIT))
-except Exception:
-    pass
+# NOT: RLIMIT_AS hard limiti ARTIK set edilmiyor.
+# Daha önce (480MB, 480MB) ile kilitleniyordu → Cuberite alt process'i
+# _child_setup içinde RLIM_INFINITY'e çekmeye çalışıyordu ama hard limit
+# kilitli olduğundan başarısız olup sessizce atlıyordu.
+# Sonuç: Cuberite 480MB sanal adres alanına sıkışıp Lua OOM veriyordu.
+# Çözüm: Sınırı hiç koymuyoruz; kernel zaten cgroup ile yönetiyor.
 
 from flask import Flask, request, jsonify, send_file, abort, Response
 from cluster import vcluster, cluster_api
@@ -56,7 +55,7 @@ MC_VERSION = "1.8.8"  # Cuberite 1.8.8 uyumlu
 
 # ── Global durum ─────────────────────────────────────────────
 mc_process   = None
-console_buf  = deque(maxlen=3000)
+console_buf  = deque(maxlen=500)   # 3000→500: ~12MB RAM kazanımı
 players      = {}
 tunnel_info  = {"url": "", "host": ""}
 _bootstrap_done = threading.Event()  # MC "Done!" gelince set edilir
@@ -730,6 +729,10 @@ def write_server_config():
         f"AllowFlight=true\n"
         f"Description=Cuberite 1.8.8 on Render\n"
         f"ShutdownMessage=Server kapaniyor...\n"
+        # MaxViewDistance=4 → spawn chunk sayısı 400→81 (%75 azalma)
+        # Varsayılan 10 ile başlangıçta 400 chunk Lua'da OOM'a neden oluyordu.
+        # RAM izinli olduğunda watchdog view-distance 8'e yükseltir.
+        f"MaxViewDistance=4\n"
         f"\n"
         f"[Authentication]\n"
         f"Authenticate=false\n"      # Offline mode
@@ -759,13 +762,17 @@ def write_server_config():
             f"\n"
             f"[Mobs]\n"
             f"MaxMobDistanceFromPlayer=80\n"
-            f"MaxAnimals=8\n"          # Azaltıldı (RAM tasarrufu)
-            f"MaxMonsters=40\n"        # Azaltıldı
-            f"MaxWaterMobs=3\n"
+            f"MaxAnimals=4\n"          # 8→4: mob hesaplama RAM kullanımı azaltıldı
+            f"MaxMonsters=20\n"        # 40→20: azaltıldı
+            f"MaxWaterMobs=2\n"        # 3→2
             f"\n"
             f"[Chunking]\n"
-            f"ChunkDestroyTimer=60\n"  # 60sn kullanılmayan chunk kaldır
+            f"ChunkDestroyTimer=30\n"  # 60→30sn: kullanılmayan chunk'ları daha çabuk temizle
             f"LimitedHeightWorld=false\n"
+            f"\n"
+            f"[WorldLimit]\n"
+            f"LimitX=1500\n"           # Dünya sınırı: spawn OOM önlemek için
+            f"LimitZ=1500\n"
         )
 
     # ── webadmin.ini — Cuberite web admin (kapalı, Panel var) ──
@@ -844,8 +851,13 @@ def start_server():
         def _child_setup():
             try:
                 import resource as _r
-                _r.setrlimit(_r.RLIMIT_AS, (_r.RLIM_INFINITY, _r.RLIM_INFINITY))
-            except Exception: pass
+                # Hard + soft limiti tamamen kaldır — Lua OOM'un önüne geç
+                _r.setrlimit(_r.RLIMIT_AS,   (_r.RLIM_INFINITY, _r.RLIM_INFINITY))
+                _r.setrlimit(_r.RLIMIT_DATA, (_r.RLIM_INFINITY, _r.RLIM_INFINITY))
+            except Exception as _rl_err:
+                # Başarısız olursa stderr'e yaz (panel loguna da düşer)
+                import sys as _sys
+                print(f"[Panel] ⚠️  RLIMIT kaldırma hatası: {_rl_err}", file=_sys.stderr)
             try:
                 open("/proc/self/oom_score_adj", "w").write("-900")
             except Exception: pass
@@ -935,9 +947,9 @@ def _ram_watchdog():
 
             else:
                 _consecutive_low = 0
-                # Yeterli swap varsa view distance'ı geri getir
-                if swap_free_mb > 1000:
-                    send_command("minecraft:view-distance 8")
+                # Başlangıç view-distance zaten 4 — yalnızca swap bolsa yükselt
+                if swap_free_mb > 2000:
+                    send_command("minecraft:view-distance 6")
 
         except: pass
 
@@ -2352,8 +2364,11 @@ def _run_mc_only():
         def _cs():
             try:
                 import resource as _r
-                _r.setrlimit(_r.RLIMIT_AS, (_r.RLIM_INFINITY, _r.RLIM_INFINITY))
-            except Exception: pass
+                _r.setrlimit(_r.RLIMIT_AS,   (_r.RLIM_INFINITY, _r.RLIM_INFINITY))
+                _r.setrlimit(_r.RLIMIT_DATA, (_r.RLIM_INFINITY, _r.RLIM_INFINITY))
+            except Exception as _e:
+                import sys as _sys
+                print(f"[Panel] ⚠️  RLIMIT kaldırma hatası: {_e}", file=_sys.stderr)
             try: open("/proc/self/oom_score_adj", "w").write("-900")
             except Exception: pass
         mc_process = subprocess.Popen(
