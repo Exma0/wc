@@ -197,8 +197,24 @@ def _players_list():
 
 
 def _pre_create_player_files(player_name: str):
-    """Oyuncu dosyalarını boş {} ile önceden oluştur — iostream'i önler."""
-    _reset_player_files(player_name)
+    """Oyuncu dosyalarını /tmp konumlarında boş {} ile oluştur — iostream'i önler."""
+    if not player_name:
+        return
+    import subprocess as _spp
+    for fp in [
+        Path("/tmp/mc_players")      / f"{player_name}.json",
+        Path("/tmp/mc_stats")        / f"{player_name}.json",
+        Path("/tmp/mc_playerdata")   / f"{player_name}.json",
+        Path("/tmp/mc_world_players")/ f"{player_name}.json",
+    ]:
+        try:
+            fp.parent.mkdir(parents=True, exist_ok=True)
+            if not fp.exists():
+                fp.write_text("{}")
+            _spp.run(["chmod", "666", str(fp)], capture_output=True, timeout=2)
+        except Exception:
+            pass
+    log(f"[Players] ✅ {player_name} /tmp dosyalari hazirlandi — yeniden baglanabilir")
 
 
 def _reset_player_files(player_name: str):
@@ -221,36 +237,48 @@ def _reset_player_files(player_name: str):
         return
 
     for fp in [
-        MC_DIR / "players"                  / f"{player_name}.json",
-        MC_DIR / "world" / "data" / "stats" / f"{player_name}.json",
-        MC_DIR / "world" / "playerdata"     / f"{player_name}.json",
-        MC_DIR / "world" / "players"        / f"{player_name}.json",
+        Path("/tmp/mc_players")       / f"{player_name}.json",
+        Path("/tmp/mc_stats")         / f"{player_name}.json",
+        Path("/tmp/mc_playerdata")    / f"{player_name}.json",
+        Path("/tmp/mc_world_players") / f"{player_name}.json",
     ]:
         try:
+            fp.parent.mkdir(parents=True, exist_ok=True)
             if not fp.exists():
                 fp.write_text("{}")
-                _sp.run(["chmod", "666", str(fp)], capture_output=True, timeout=3)
+            _sp.run(["chmod", "666", str(fp)], capture_output=True, timeout=3)
         except Exception: pass
 
     log(f"[Players] ✅ {player_name} dizin+izin hazir — yeniden baglanabilir")
 
 def _ensure_runtime_dirs():
-    """iostream error geldiginde cagrilir — dizinleri aninda garantile."""
+    """/tmp dizinlerini garantile — her zaman yazılabilir."""
     import subprocess as _sp3
     for _d in [
-        MC_DIR / "world" / "data" / "stats",
-        MC_DIR / "world" / "playerdata",
-        MC_DIR / "world_nether" / "data" / "stats",
-        MC_DIR / "world_the_end" / "data" / "stats",
-        MC_DIR / "players",
+        Path("/tmp/mc_players"),
+        Path("/tmp/mc_stats"),
+        Path("/tmp/mc_playerdata"),
+        Path("/tmp/mc_world_players"),
+        MC_DIR / "world" / "data",
         MC_DIR / "logs",
     ]:
         _d.mkdir(parents=True, exist_ok=True)
-    try:
-        _sp3.run(["chmod", "-R", "777", str(MC_DIR)], capture_output=True, timeout=10)
-    except Exception: pass
-
-
+        try: _sp3.run(["chmod", "777", str(_d)], capture_output=True, timeout=2)
+        except Exception: pass
+    # symlink'ler hâlâ geçerli mi kontrol et
+    for src, dst in [
+        (Path("/tmp/mc_players"),       MC_DIR / "players"),
+        (Path("/tmp/mc_stats"),         MC_DIR / "world" / "data" / "stats"),
+        (Path("/tmp/mc_playerdata"),    MC_DIR / "world" / "playerdata"),
+        (Path("/tmp/mc_world_players"), MC_DIR / "world" / "players"),
+    ]:
+        try:
+            if not dst.is_symlink():
+                if dst.exists():
+                    import shutil as _shu
+                    _shu.rmtree(str(dst), ignore_errors=True)
+                dst.symlink_to(src)
+        except Exception: pass
 def _backup_players_to_agents():
     """players/*.json dosyalarini agent disk'e yedekle."""
     players_dir = MC_DIR / "players"
@@ -1022,19 +1050,27 @@ def get_cuberite_cmd() -> list:
     wrapper.write_text(
         "#!/bin/sh\n"
         f"umask 000\n"
+        # /tmp her zaman yazılabilir — stats + players buraya yönlendir
+        f"mkdir -p /tmp/mc_players /tmp/mc_stats /tmp/mc_playerdata /tmp/mc_world_players\n"
+        f"chmod 777 /tmp/mc_players /tmp/mc_stats /tmp/mc_playerdata /tmp/mc_world_players\n"
+        # Disk üzerinde dizinleri oluştur (olabildiğince)
+        f"mkdir -p {MC_DIR}/world/data {MC_DIR}/world_nether/data/stats "
+        f"{MC_DIR}/world_the_end/data/stats {MC_DIR}/logs 2>/dev/null || true\n"
         f"chmod -R 777 {MC_DIR} 2>/dev/null || true\n"
-        f"mkdir -p {MC_DIR}/world/data/stats "
-        f"{MC_DIR}/world/data "
-        f"{MC_DIR}/world/playerdata "
-        f"{MC_DIR}/players "
-        f"{MC_DIR}/world_nether/data/stats "
-        f"{MC_DIR}/world_the_end/data/stats "
-        f"{MC_DIR}/logs 2>/dev/null || true\n"
-        f"chmod 777 {MC_DIR}/world/data {MC_DIR}/world/data/stats "
-        f"{MC_DIR}/world/playerdata {MC_DIR}/players 2>/dev/null || true\n"
-        f"rm -f {MC_DIR}/world/data/scoreboard.dat 2>/dev/null || true\n"
-        # oyuncu .json dosyaları SİLİNMEZ — envanter korunur
-        f"exec {MC_BIN}\n"
+        # players/ → /tmp/mc_players (symlink — her zaman yazılabilir)
+        f"rm -rf {MC_DIR}/players && ln -sfn /tmp/mc_players {MC_DIR}/players\n"
+        # world/data/stats/ → /tmp/mc_stats
+        f"rm -rf {MC_DIR}/world/data/stats && mkdir -p {MC_DIR}/world/data && "
+        f"ln -sfn /tmp/mc_stats {MC_DIR}/world/data/stats\n"
+        # world/playerdata/ → /tmp/mc_playerdata
+        f"rm -rf {MC_DIR}/world/playerdata && ln -sfn /tmp/mc_playerdata {MC_DIR}/world/playerdata\n"
+        # world/players/ → /tmp/mc_world_players
+        f"rm -rf {MC_DIR}/world/players && ln -sfn /tmp/mc_world_players {MC_DIR}/world/players\n"
+        # scoreboard.dat — sadece sil, Cuberite yeniden yazar (warning normal)
+        f"rm -f {MC_DIR}/world/data/scoreboard.dat 2>/dev/null\n"
+        # Çalışma dizinine geç ve başlat
+        f"cd {MC_DIR}\n"
+        f"exec {MC_BIN} --config-file {MC_DIR}/settings.ini\n"
     )
     wrapper.chmod(0o755)
     log("[Panel] Cuberite C++ baslatiliyor (JVM yok, ~50MB RAM)")
