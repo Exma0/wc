@@ -244,33 +244,60 @@ def optimize_all(mode: str = "main"):
 
 def start_panel():
     """
-    Ana sunucuda mc_panel.py'yi MC_ONLY=1 ile başlatır.
-    Flask/SocketIO yok → Xmx=370MB.
-    Panel UI ayrı bir agent'ta (IS_PANEL=1) çalışır.
+    Ana sunucuda mc_panel.py'yi FULL Flask moduyla başlatır.
+    Panel UI: https://wc-tsgd.onrender.com
+    JVM: SerialGC ile ~150MB non-heap → Xmx=240MB (toplam ~480MB ✓)
     """
-    print(f"\n🚀 MC_ONLY modu başlatılıyor :{PORT}...")
+    print(f"\n🚀 Panel (FULL Flask) başlatılıyor :{PORT}...")
     userswap_so = build_userswap()
     env = {
         **base_env,
-        "MC_ONLY": "1",   # Flask yok → Xmx=370MB
+        "MC_ONLY":         "0",   # Flask + SocketIO aktif → panel wc-tsgd.onrender.com'da
+        "MAIN_SERVER_URL": "https://wc-tsgd.onrender.com",
     }
     if userswap_so:
         env["USERSWAP_SO"] = userswap_so
     proc = subprocess.Popen([sys.executable, "/app/mc_panel.py"], env=env)
-    if _wait_port(PORT, 30):
-        print("  ✅ MC_ONLY API hazır (Xmx=370MB)")
+    if _wait_port(PORT, 45):
+        print("  ✅ Panel hazır → https://wc-tsgd.onrender.com")
     else:
-        print("  ⚠️  MC_ONLY API timeout (30s)")
+        print("  ⚠️  Panel timeout (45s)")
     return proc
 
 
 # ── MC otomatik başlatma ──────────────────────────────────────────────────────
 
 def auto_start():
-    """MC_ONLY modunda mc_panel.py kendi başlatır — burada tünel açıyoruz."""
-    _panel_log("[Sistem] 🟢 v11.0 MC_ONLY başladı")
+    """
+    Panel hazır olunca MC start API'sini çağır.
+    MC hazır olunca cloudflared tüneli aç.
+    """
+    _panel_log("[Sistem] 🟢 v12.0 başladı — swap kuruluyor...")
+    # Swap yeterli mi bekle
+    import psutil as _ps
+    for _ in range(18):   # max 90sn
+        swp = _ps.swap_memory()
+        if swp.total // 1024 // 1024 >= 512:
+            break
+        time.sleep(5)
+    sw_mb = _ps.swap_memory().total // 1024 // 1024
+    _panel_log(f"[Sistem] 💾 Swap hazır: {sw_mb}MB — MC başlatılıyor")
 
-    # MC hazır olana kadar bekle (mc_panel otomatik başlatıyor)
+    # Panel API'sine MC start komutu gönder
+    for attempt in range(3):
+        try:
+            _ur.urlopen(_ur.Request(
+                f"http://localhost:{PORT}/api/start",
+                data=b"{}",
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            ), timeout=10)
+            print("  ✅ MC başlatma komutu gönderildi")
+            break
+        except Exception as e:
+            print(f"  ⚠️  MC start ({attempt+1}/3): {e}")
+            time.sleep(5)
+
     if _wait_port(MC_PORT, 300):
         print("  ✅ MC Server hazır!")
         _panel_log("[Sistem] ✅ MC oyuncuları bekliyor!")
@@ -352,9 +379,10 @@ optimize_all("main" if IS_MAIN else "agent")
 
 if IS_MAIN:
     print(f"\n{'━'*56}")
-    print(f"  🟢 ANA SUNUCU v11.0 — MC_ONLY :{PORT}")
-    print(f"  UserSwap: 4 shard × 1GB = 4GB  |  Xmx=370MB")
-    print(f"  Panel UI: Ayrı agent (IS_PANEL=1)")
+    print(f"  🟢 ANA SUNUCU v12.0 — FULL PANEL :{PORT}")
+    print(f"  URL    : https://wc-tsgd.onrender.com")
+    print(f"  Memory : SerialGC | Xmx=240MB | Non-heap≈150MB | Python≈90MB ≈ 480MB")
+    print(f"  Swap   : zram+disk+agent → 512MB+ virtual")
     print(f"{'━'*56}\n")
     panel = start_panel()
     threading.Thread(target=auto_start, daemon=True).start()
