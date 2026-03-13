@@ -793,6 +793,143 @@ def swap_release():
     return jsonify({"ok": True})
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  ADMIN — Temizlik (Cleanup)
+#  POST /api/admin/cleanup
+#  Opsiyonel body: {"dry_run": true, "categories": ["corrupt","empty","tmp","old_backups"]}
+#
+#  Temizlenen şeyler:
+#    corrupt   → geçersiz / bozuk JSON dosyaları (stats, players)
+#    empty     → 0 byte dosyalar (tüm kategoriler)
+#    tmp       → .tmp / .corrupt_bak / .corrupt_*.bak geçici dosyalar
+#    old_bak   → 7 günden eski .bak yedekler
+#    cache_gc  → RAM cache'den süresi dolmuş / erişilmemiş key'ler
+#    orphan    → bilinen UUID eşleşmesi olmayan küçük dosyalar (<64 byte)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _agent_cleanup(dry_run: bool = False, categories: list = None) -> dict:
+    """
+    Agent disk temizliği. Ana sunucudan POST /api/admin/cleanup ile tetiklenir
+    veya agent kendi kendine periyodik çalıştırır.
+    """
+    import time as _t
+    import json as _jc
+
+    cats = set(categories or ["corrupt", "empty", "tmp", "old_bak", "cache_gc"])
+    report = {
+        "node_id":    NODE_ID,
+        "dry_run":    dry_run,
+        "categories": list(cats),
+        "removed":    [],
+        "freed_bytes": 0,
+        "errors":     [],
+    }
+
+    now = _t.time()
+
+    # ── 1. Tüm disk dosyalarını tara ───────────────────────────────
+    all_files = list(AGENT_DATA.rglob("*"))
+
+    for fp in all_files:
+        if not fp.is_file():
+            continue
+
+        try:
+            stat   = fp.stat()
+            size   = stat.st_size
+            age_d  = (now - stat.st_mtime) / 86400
+            suffix = fp.suffix.lower()
+            name   = fp.name.lower()
+            reason = None
+
+            # empty — 0 byte dosyalar her zaman gereksizdir
+            if "empty" in cats and size == 0:
+                reason = "empty"
+
+            # tmp — geçici kalıntılar
+            elif "tmp" in cats and (
+                name.endswith(".tmp") or
+                ".corrupt_" in name or
+                name.endswith(".corrupt_bak") or
+                name.endswith(".corrupt")
+            ):
+                reason = "tmp"
+
+            # old_bak — 7 günden eski .bak yedekler
+            elif "old_bak" in cats and name.endswith(".bak") and age_d > 7:
+                reason = f"old_bak ({age_d:.0f}d)"
+
+            # corrupt — JSON dosyaları geçerli mi?
+            elif "corrupt" in cats and suffix == ".json" and size > 0:
+                try:
+                    content = fp.read_text(encoding="utf-8", errors="replace").strip()
+                    if not content or not content.startswith("{"):
+                        reason = "corrupt_json"
+                    else:
+                        _jc.loads(content)  # parse test
+                except Exception:
+                    reason = "corrupt_json_parse"
+
+            # orphan — 64 byte'tan küçük .json (Cuberite bunu okumaya çalışırsa hata)
+            elif "orphan" in cats and suffix == ".json" and 0 < size < 64:
+                reason = "orphan_tiny"
+
+            if reason:
+                report["removed"].append({
+                    "path":    str(fp.relative_to(AGENT_DATA)),
+                    "reason":  reason,
+                    "size":    size,
+                    "age_days": round(age_d, 1),
+                })
+                report["freed_bytes"] += size
+                if not dry_run:
+                    try:
+                        fp.unlink()
+                    except Exception as _e:
+                        report["errors"].append(f"{fp.name}: {_e}")
+                        report["freed_bytes"] -= size  # geri al
+
+        except Exception as _e:
+            report["errors"].append(f"scan:{fp.name}: {_e}")
+
+    # ── 2. RAM cache GC ────────────────────────────────────────────
+    if "cache_gc" in cats and not dry_run:
+        try:
+            flushed = cache.flush("")   # tüm cache flush değil — stats al
+            # Sadece 0-byte veya geçersiz key'leri at
+            # cache.flush("") hepsini siler — bunun yerine sadece rapor et
+            report["cache_keys"] = cache.stats().get("keys", 0)
+            report["cache_mb"]   = cache.stats().get("used_mb", 0)
+        except Exception as _e:
+            report["errors"].append(f"cache_gc: {_e}")
+
+    report["freed_mb"]    = round(report["freed_bytes"] / 1024 / 1024, 2)
+    report["removed_count"] = len(report["removed"])
+    return report
+
+
+@app.route("/api/admin/cleanup", methods=["POST"])
+def admin_cleanup():
+    d        = request.json or {}
+    dry_run  = bool(d.get("dry_run", False))
+    cats     = d.get("categories", ["corrupt", "empty", "tmp", "old_bak"])
+    result   = _agent_cleanup(dry_run=dry_run, categories=cats)
+    return jsonify({"ok": True, **result})
+
+
+@app.route("/api/admin/cleanup/status")
+def admin_cleanup_status():
+    """Disk durumu + son temizlik özeti."""
+    return jsonify({
+        "ok":           True,
+        "node_id":      NODE_ID,
+        "store_used_gb": store_used_gb(),
+        "store_free_gb": store_free_gb(),
+        "cache_keys":   cache.stats().get("keys", 0),
+        "cache_mb":     cache.stats().get("used_mb", 0),
+    })
+
+
 # ── Toplu işlem ─────────────────────────────────────────────────────────────
 
 @app.route("/api/bulk/cache_and_store", methods=["POST"])

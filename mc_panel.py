@@ -1187,6 +1187,220 @@ def _clean_player_files():
         log(f"[Players] {n} oyuncu dosyasi saglikli" if n else
             "[Players] Kayitli oyuncu yok - ilk girislerinde olusturulur")
 
+
+# ══════════════════════════════════════════════════════════════
+#  DERİN TEMİZLİK — Ana Sunucu + Tüm Agentlar
+# ══════════════════════════════════════════════════════════════
+
+def _deep_cleanup(dry_run: bool = False, categories: list = None) -> dict:
+    """
+    Hem ana sunucu MC_DIR hem de tüm bağlı agentları temizler.
+
+    Kategoriler:
+      corrupt    → bozuk / geçersiz JSON (stats, players)
+      empty      → 0 byte dosyalar
+      tmp        → .tmp / .corrupt_*.bak / .bak geçici kalıntılar
+      old_logs   → 30 günden eski log dosyaları (logs/)
+      crash      → crash-reports/ içeriği (bilgilendirici, silinebilir)
+      old_bak    → 7 günden eski .bak yedekler (players_backup/)
+      old_bak_agent → agent tarafındaki eski yedekler
+    """
+    import json as _jd, shutil as _shd, time as _td
+
+    cats   = set(categories or ["corrupt", "empty", "tmp", "old_logs", "crash", "old_bak"])
+    now    = _td.time()
+    report = {
+        "dry_run":    dry_run,
+        "categories": list(cats),
+        "local":      {"removed": [], "freed_bytes": 0, "errors": []},
+        "agents":     [],
+        "total_freed_mb": 0,
+    }
+
+    def _is_valid_json(p: Path) -> bool:
+        try:
+            txt = p.read_text(encoding="utf-8", errors="replace").strip()
+            if not txt or not txt.startswith("{"):
+                return False
+            _jd.loads(txt)
+            return True
+        except Exception:
+            return False
+
+    def _rm(fp: Path, reason: str, loc_rep: dict):
+        size = 0
+        try: size = fp.stat().st_size
+        except Exception: pass
+        loc_rep["removed"].append({
+            "path":   str(fp.relative_to(MC_DIR)) if fp.is_relative_to(MC_DIR) else str(fp),
+            "reason": reason,
+            "size":   size,
+        })
+        loc_rep["freed_bytes"] += size
+        if not dry_run:
+            try:
+                fp.unlink()
+            except Exception as _e:
+                loc_rep["errors"].append(f"{fp.name}: {_e}")
+                loc_rep["freed_bytes"] -= size
+
+    loc = report["local"]
+
+    # ── A. corrupt / empty — stats (EN KRİTİK) ──────────────────
+    if "corrupt" in cats or "empty" in cats:
+        for wdir in ["world", "world_nether", "world_the_end"]:
+            sdir = MC_DIR / wdir / "data" / "stats"
+            if not sdir.exists():
+                continue
+            for sf in list(sdir.glob("*.json")):
+                if not sf.is_file():
+                    continue
+                sz = sf.stat().st_size
+                if "empty" in cats and sz == 0:
+                    _rm(sf, "empty_stats", loc)
+                elif "corrupt" in cats and sz > 0 and not _is_valid_json(sf):
+                    # Önce yedekle (silinmeden önce)
+                    _bk = MC_DIR / "players_corrupted" / ("stats_" + sf.name)
+                    if not dry_run:
+                        try: _shd.copy2(str(sf), str(_bk))
+                        except Exception: pass
+                    _rm(sf, "corrupt_stats", loc)
+
+    # ── B. corrupt / empty — players ────────────────────────────
+    if "corrupt" in cats or "empty" in cats:
+        pdir    = MC_DIR / "players"
+        cor_dir = MC_DIR / "players_corrupted"
+        bak_dir = MC_DIR / "players_backup"
+        for _d in [pdir, cor_dir, bak_dir]:
+            _d.mkdir(parents=True, exist_ok=True)
+        if pdir.exists():
+            for pf in list(pdir.rglob("*.json")):
+                if not pf.is_file():
+                    continue
+                if cor_dir in pf.parents:
+                    continue
+                sz = pf.stat().st_size
+                if "empty" in cats and sz == 0:
+                    _rm(pf, "empty_player", loc)
+                elif "corrupt" in cats and sz > 0 and not _is_valid_json(pf):
+                    if not dry_run:
+                        try: _shd.copy2(str(pf), str(cor_dir / pf.name))
+                        except Exception: pass
+                    _rm(pf, "corrupt_player", loc)
+
+    # ── C. tmp — geçici kalıntılar (tüm MC_DIR) ─────────────────
+    if "tmp" in cats:
+        for fp in MC_DIR.rglob("*"):
+            if not fp.is_file():
+                continue
+            nm = fp.name.lower()
+            if (nm.endswith(".tmp") or
+                ".corrupt_" in nm or
+                nm.endswith(".corrupt_bak")):
+                age_d = (now - fp.stat().st_mtime) / 86400
+                if age_d > 0.1:  # en az 2.4 saat eski
+                    _rm(fp, "tmp_file", loc)
+
+    # ── D. old_bak — eski yedekler ──────────────────────────────
+    if "old_bak" in cats:
+        for bdir in [MC_DIR / "players_backup", MC_DIR / "players_corrupted"]:
+            if not bdir.exists():
+                continue
+            for fp in bdir.rglob("*"):
+                if not fp.is_file():
+                    continue
+                age_d = (now - fp.stat().st_mtime) / 86400
+                if age_d > 7:
+                    _rm(fp, f"old_bak_{age_d:.0f}d", loc)
+
+    # ── E. old_logs — eski log dosyaları ────────────────────────
+    if "old_logs" in cats:
+        logs_dir = MC_DIR / "logs"
+        if logs_dir.exists():
+            for lf in logs_dir.glob("*.gz"):
+                age_d = (now - lf.stat().st_mtime) / 86400
+                if age_d > 30:
+                    _rm(lf, f"old_log_{age_d:.0f}d", loc)
+
+    # ── F. crash — crash-reports temizliği ──────────────────────
+    if "crash" in cats:
+        cdir = MC_DIR / "crash-reports"
+        if cdir.exists():
+            for cf in cdir.glob("*.txt"):
+                age_d = (now - cf.stat().st_mtime) / 86400
+                if age_d > 3:
+                    _rm(cf, f"crash_report_{age_d:.0f}d", loc)
+
+    loc["freed_mb"]      = round(loc["freed_bytes"] / 1024 / 1024, 2)
+    loc["removed_count"] = len(loc["removed"])
+
+    # ── G. Tüm agentlara cleanup gönder ─────────────────────────
+    agent_cats = [c for c in cats if c not in ("old_logs", "crash")]
+    # agents global değişkenine erişim
+    with _agents_lock:
+        healthy_agents = [a for a in _agents.values() if a.get("healthy")]
+
+    for ag in healthy_agents:
+        try:
+            payload = _jd.dumps({
+                "dry_run":    dry_run,
+                "categories": agent_cats,
+            }).encode()
+            req = _urllib_req.Request(
+                ag["url"] + "/api/admin/cleanup",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with _urllib_req.urlopen(req, timeout=30) as resp:
+                ar = _jd.loads(resp.read())
+                ar["node_id"] = ag["node_id"]
+                report["agents"].append(ar)
+                log(f"[Cleanup] ✅ {ag['node_id']}: "
+                    f"{ar.get('removed_count', 0)} dosya, "
+                    f"{ar.get('freed_mb', 0):.1f}MB temizlendi")
+        except Exception as _e:
+            report["agents"].append({
+                "node_id": ag["node_id"],
+                "error":   str(_e),
+            })
+            log(f"[Cleanup] ⚠️  {ag['node_id']} cleanup hatası: {_e}")
+
+    # ── Toplam özet ──────────────────────────────────────────────
+    total_freed = loc["freed_bytes"]
+    for ar in report["agents"]:
+        total_freed += int(ar.get("freed_bytes", 0))
+    report["total_freed_mb"]     = round(total_freed / 1024 / 1024, 2)
+    report["local_removed"]      = loc["removed_count"]
+    report["agent_count"]        = len(report["agents"])
+
+    msg = (f"[Cleanup] {'[DRY-RUN] ' if dry_run else ''}"
+           f"Toplam: {report['local_removed']} yerel + "
+           f"{sum(a.get('removed_count',0) for a in report['agents'])} agent dosyası, "
+           f"{report['total_freed_mb']:.1f}MB boşaltıldı")
+    log(msg)
+    return report
+
+
+def _schedule_daily_cleanup():
+    """Günlük 03:00'te otomatik deep cleanup çalıştır."""
+    import time as _ts
+    while True:
+        try:
+            now    = datetime.now()
+            # Bir sonraki 03:00'e kadar bekle
+            target = now.replace(hour=3, minute=0, second=0, microsecond=0)
+            if now >= target:
+                target = target.replace(day=target.day + 1)
+            wait_s = (target - now).total_seconds()
+            _ts.sleep(wait_s)
+            log("[Cleanup] ⏰ Günlük otomatik temizlik başlatılıyor...")
+            _deep_cleanup(dry_run=False, categories=["corrupt","empty","tmp","old_bak","old_logs","crash"])
+        except Exception as _e:
+            log(f"[Cleanup] ⚠️  Otomatik temizlik hatası: {_e}")
+            _ts.sleep(3600)  # Hata varsa 1 saat sonra tekrar dene
+
+
 def write_server_config():
     """
     Cuberite INI konfigürasyon dosyaları yaz.
@@ -1782,6 +1996,70 @@ def api_pool_archive_regions():
         archived, freed_mb = result
         return jsonify({"ok": True, "archived": archived, "freed_mb": round(freed_mb,1)})
     return jsonify({"ok": False, "error": "Agent yok veya region bulunamadı"})
+
+
+# ── Temizlik (Ana Sunucu + Agentlar) ────────────────────────────
+
+@app.route("/api/admin/cleanup", methods=["POST"])
+def api_admin_cleanup():
+    """
+    Ana sunucu + tüm agentları temizle.
+
+    Body (opsiyonel):
+      {
+        "dry_run": false,          // true → sil, raporla sadece
+        "categories": [            // boş → hepsi
+          "corrupt",               // bozuk JSON dosyaları
+          "empty",                 // 0 byte dosyalar
+          "tmp",                   // .tmp / .corrupt_*.bak kalıntılar
+          "old_bak",               // 7+ gün eski yedekler
+          "old_logs",              // 30+ gün eski log.gz
+          "crash"                  // 3+ gün eski crash-reports
+        ]
+      }
+    """
+    d        = request.json or {}
+    dry_run  = bool(d.get("dry_run", False))
+    cats     = d.get("categories") or ["corrupt","empty","tmp","old_bak","old_logs","crash"]
+    result   = _deep_cleanup(dry_run=dry_run, categories=cats)
+    return jsonify({"ok": True, **result})
+
+
+@app.route("/api/admin/cleanup/dry-run", methods=["GET", "POST"])
+def api_admin_cleanup_dry():
+    """Ne silineceğini göster ama SİLME. Rapor döner."""
+    d    = request.json or {}
+    cats = d.get("categories") or ["corrupt","empty","tmp","old_bak","old_logs","crash"]
+    result = _deep_cleanup(dry_run=True, categories=cats)
+    return jsonify({"ok": True, **result})
+
+
+@app.route("/api/admin/cleanup/status")
+def api_admin_cleanup_status():
+    """Disk durumu özeti (ana sunucu + agentlar)."""
+    import shutil as _shutil
+    local_disk = _shutil.disk_usage(str(MC_DIR))
+    with _agents_lock:
+        ag_list = [a for a in _agents.values() if a.get("healthy")]
+    agent_info = []
+    for ag in ag_list:
+        try:
+            r = _agent_json(ag, "GET", "/api/admin/cleanup/status")
+            if r:
+                agent_info.append(r)
+        except Exception:
+            pass
+    return jsonify({
+        "ok": True,
+        "local": {
+            "path":        str(MC_DIR),
+            "total_gb":    round(local_disk.total / 1024**3, 2),
+            "used_gb":     round(local_disk.used  / 1024**3, 2),
+            "free_gb":     round(local_disk.free  / 1024**3, 2),
+            "pct":         round(local_disk.used * 100 / local_disk.total, 1),
+        },
+        "agents": agent_info,
+    })
 
 
 # ── Oyuncu yönetimi ───────────────────────────────────────────
@@ -3172,6 +3450,7 @@ def _minimal_http_phase():
     threading.Thread(target=_pool_auto_optimize,   daemon=True).start()
     threading.Thread(target=_region_disk_daemon,   daemon=True).start()
     threading.Thread(target=_region_cache_daemon,  daemon=True).start()
+    threading.Thread(target=_schedule_daily_cleanup, daemon=True).start()
     _register_cluster_blueprint()
 
     print(f"[Phase2] 🚀 Flask+SocketIO :{PANEL_PORT} başlatılıyor...", flush=True)
@@ -3207,6 +3486,7 @@ if __name__ == "__main__":
         threading.Thread(target=_pool_auto_optimize,   daemon=True).start()
         threading.Thread(target=_region_disk_daemon,   daemon=True).start()
         threading.Thread(target=_region_cache_daemon,  daemon=True).start()
+        threading.Thread(target=_schedule_daily_cleanup, daemon=True).start()
         def _auto_start_mc():
             import time as _t; _t.sleep(3)
             try: start_server()
