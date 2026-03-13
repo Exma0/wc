@@ -1,28 +1,35 @@
 # ─────────────────────────────────────────────────────────────────
-# Normal Agent (cache + disk store + proxy)
-# Bu dosyayı 7 kez kullan — her biri farklı Render hesabında
+# Panel Agent — Sadece 1 tane, herhangi bir Render hesabında
+# Kullanıcı bu servisin URL'ine browser ile bağlanır.
+# JVM Ana sunucuda (wc-tsgd.onrender.com) çalışır.
+#
+# Nasıl çalışır:
+#   1. mc_panel.py WORKER_URL=ana_sunucu ile başlar
+#   2. Flask/SocketIO web UI bu agent'ta (Xmx yok, sadece ~90MB)
+#   3. Başlat/Durdur/Komut → WORKER_URL/api/mc/* proxy edilir
+#   4. Ana sunucu MC_ONLY=1 → Xmx=370MB (Flask yok)
 # ─────────────────────────────────────────────────────────────────
 services:
   - type: web
-    name: mc-agent
+    name: mc-panel-agent
     runtime: docker
     dockerfilePath: ./agent.Dockerfile
     plan: free
     envVars:
       - key: PORT
-        value: "8080"
+        value: "5000"
       - key: MAIN_URL
         value: "https://wc-tsgd.onrender.com"
+      - key: IS_PANEL
+        value: "1"          # Panel host modu
       - key: RAM_CACHE_MB
-        value: "380"
+        value: "200"        # Panel için daha az cache
       - key: DISK_LIMIT_GB
-        value: "10.0"
+        value: "5.0"
       - key: AGENT_DATA
         value: "/agent_data"
-      - key: IS_PANEL
-        value: "0"          # Normal agent
     healthCheckPath: /health
     disk:
-      name: agent-disk
+      name: panel-disk
       mountPath: /agent_data
-      sizeGB: 10
+      sizeGB: 5

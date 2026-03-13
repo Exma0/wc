@@ -31,7 +31,17 @@ from flask_socketio import SocketIO, emit
 MC_DIR     = Path("/minecraft")
 MC_JAR     = MC_DIR / "server.jar"
 MC_PORT    = 25565
-PANEL_PORT = int(os.environ.get("PORT", "5000"))
+PANEL_PORT  = int(os.environ.get("PORT", "5000"))
+# ── Çalışma Modu ─────────────────────────────────────────────────────────────
+# MC_ONLY=1   → Flask/SocketIO yok. Sadece JVM + minimal HTTP API çalışır.
+#               ~90MB kazanım → Xmx 280MB→370MB.
+#               Panel UI başka bir agent'ta (WORKER_URL env ile) çalışır.
+#
+# WORKER_URL  → Bu process panel agent'i. JVM ana sunucuda (WORKER_URL).
+#               start/stop/command → WORKER_URL'e proxy edilir.
+MC_ONLY    = os.environ.get("MC_ONLY",    "0") == "1"
+WORKER_URL = os.environ.get("WORKER_URL", "").rstrip("/")
+IS_PROXY   = bool(WORKER_URL)
 MC_VERSION = "1.21.1"
 MC_RAM     = os.environ.get("MC_RAM", "2G")
 
@@ -257,17 +267,18 @@ def _auto_archive_old_regions(older_than_days: int = 5):
     best = _best_agent_by_disk()
     if not best:
         return
-    # ÖNEMLİ: shutil.disk_usage("/") host FS okur (örn: 68GB free) — yanıltıcı.
-    # Render 18GB limiti cgroup ile uygulanır.
-    # /minecraft altındaki gerçek kullanımı hesapla.
+    # shutil.disk_usage("/") Render container'da HOST FS'i okur (~68GB free görünür).
+    # Gerçek limit: /minecraft dizini kullanımı + 4GB OS tabanı.
     try:
-        mc_used_gb = sum(f.stat().st_size for f in MC_DIR.rglob("*") if f.is_file()) / 1e9
-    except:
+        mc_used_gb = sum(
+            f.stat().st_size for f in MC_DIR.rglob("*") if f.is_file()
+        ) / 1e9
+    except Exception:
         mc_used_gb = 0.0
-    render_limit = float(os.environ.get("RENDER_DISK_LIMIT_GB", "18.0"))
-    used_gb = 4.0 + mc_used_gb  # 4GB OS/image tabanı
-    if used_gb < render_limit * 0.60:
-        return  # Disk %60'dan az kullanılıyor — gerek yok
+    render_limit_gb = float(os.environ.get("RENDER_DISK_LIMIT_GB", "18.0"))
+    used_gb = 4.0 + mc_used_gb
+    if used_gb < render_limit_gb * 0.65:
+        return  # Disk %65'ten az doluysa gerek yok
 
     archived  = 0
     freed_mb  = 0
@@ -296,8 +307,7 @@ def _auto_archive_old_regions(older_than_days: int = 5):
                 continue   # sessiz hata
 
     if archived > 0:
-        # NOT: swapon Render'da EPERM → swap denemesi yok.
-        # UserSwap (LD_PRELOAD) zaten 4GB dosya swap sağlıyor.
+        # NOT: swapon Render'da EPERM → deneme yok. UserSwap 4GB dosya swap sağlıyor.
         log(f"[Pool] 💾 {archived} region arşivlendi ({freed_mb:.0f}MB) → agent disk")
 
     return archived, freed_mb
@@ -375,15 +385,11 @@ def get_jvm_args():
     Bu limit bypass edilemiyor — yazılan değerler yok sayılıyor.
     
     Güvenli bütçe (512MB container):
-      Python/Flask/Panel   : ~90MB
-      JVM overhead         : ~60MB  (JIT, compiler threads, GC)
-      Java metaspace       : 96MB   (Paper MC için yeterli)
-      Java heap (Xmx)      : 256MB  ← bu değeri ASLA aşma
-      Toplam               : ~502MB ✓
-    
-    Swap varsa (agent'lar veya yerel swap):
-      Swap her 512MB için Xmx'i +128MB artırabilirsin
-      Max Xmx: 1024MB (swap > 2GB ise)
+      MC_ONLY=0  (Panel + MC):  512 - 90(flask) - 110(jvm meta/code) - 32(os) = 280MB Xmx
+      MC_ONLY=1  (Panel ayrı):  512 - 110(jvm meta/code) - 32(os)            = 370MB Xmx ✅
+
+    UserSwap (LD_PRELOAD mmap hook) GC spike'larını yumuşatır ama
+    Render cgroup 512MB FİZİKSEL limiti aşılamaz — Xmx artırmaz.
     ─────────────────────────────────────────────────────
     """
     import psutil as _ps
@@ -401,70 +407,43 @@ def get_jvm_args():
                     break
         except: pass
 
-    # Gerçek swap'ı oku
-    swp   = _ps.swap_memory()
-    sw_mb = swp.total // 1024 // 1024
-
-    # ── Heap hesabı ───────────────────────────────────────
-    # Python+panel overhead: 90MB
-    # JVM iç overhead: 60MB
-    # Metaspace: 96MB
-    # → fiziksel RAM'den kullanılabilir heap:
-    heap_from_phys = max(100, phys_mb - 90 - 60 - 96)   # = 266MB (512MB için)
-
-    # Swap'tan ek heap (swap daha yavaş ama kullanılabilir)
-    # Her 512MB swap için +128MB heap
-    heap_from_swap = min(768, (sw_mb // 512) * 128)
-
-    xmx_mb = heap_from_phys + heap_from_swap
-
-    # UserSwap varsa dosyaya taşabilir — minimum 320MB garanti et
-    # UserSwap yoksa 256MB ile güvenli kal
-    # UserSwap SO — env'den veya bilinen konumlardan bul
+    # UserSwap SO — env'den veya bilinen konumdan bul
     us_path = ""
-    for _p in [os.environ.get("USERSWAP_SO", ""), "/app/userswap.so",
-               "/usr/local/lib/userswap.so"]:
+    for _p in [os.environ.get("USERSWAP_SO", ""), "/app/userswap.so"]:
         if _p and os.path.exists(_p):
             us_path = _p
             break
     us_ok = bool(us_path)
 
-    # Swap hesabı düzeltmesi:
-    # psutil.swap_memory() Render container içinde SIFIR gösterir (cgroup).
-    # Gerçek swap kaynakları:
-    #   1. userswap.so → 4 shard × 1GB = 4096MB (dosya-destekli mmap)
-    #   2. Yerel disk swap (/swapfile)
-    # UserSwap varsa 4096MB sayıyoruz.
-    if us_ok and sw_mb < 512:
-        sw_mb = 4096   # 4 shard × 1GB
-        log("[Panel] 🔄 UserSwap aktif → Swap=4096MB sayıldı")
+    # ── Xmx hesabı — SADECE FİZİKSEL RAM baz alınır ──────────────────────
+    #
+    # Render cgroup: 512MB FİZİKSEL. Page cache dahil. Aşılırsa → SIGKILL.
+    # UserSwap GC spike'larını yumuşatır ama Xmx'i artırmaz
+    # (dosya sayfaları page cache üzerinden RAM'e sayılır).
+    #
+    # MC_ONLY=1  (Panel ayrı agent):
+    #   512 - 110(jvm meta/code/stack) - 32(os) = 370MB Xmx
+    #
+    # MC_ONLY=0  (Panel + MC aynı yerde):
+    #   512 - 90(flask) - 110(jvm meta) - 32(os) = 280MB Xmx
+    #
+    xmx_mb = 370 if MC_ONLY else 280
+    xms_mb = 32   # lazy start — GC baskısını azalt
 
-    # Heap yeniden hesapla (güncel sw_mb ile)
-    heap_from_swap = min(768, (sw_mb // 512) * 128)
-    xmx_mb = heap_from_phys + heap_from_swap
+    log(f"[Panel] 🧠 {'MC_ONLY' if MC_ONLY else 'FULL'} "
+        f"RAM={phys_mb}MB Xmx={xmx_mb}M "
+        f"UserSwap={'✅ ' + us_path if us_ok else '❌'}")
 
-    xmx_min = 320 if us_ok else 256
-    xmx_mb  = max(xmx_min, min(xmx_mb, 1536))
-
-    xms_mb = 48   # biraz daha yüksek — bootstrap sırasında GC baskısını azalt
-
-    log(f"[Panel] 🧠 RAM={phys_mb}MB Swap={sw_mb}MB {'(UserSwap)' if us_ok else ''} → "
-        f"heap_phys={heap_from_phys}MB heap_swap={heap_from_swap}MB "
-        f"→ Xms={xms_mb}M Xmx={xmx_mb}M | LD_PRELOAD={'✅' if us_ok else '❌'}")
-
-    # LD_PRELOAD prefix — UserSwap aktifse ["env","LD_PRELOAD=...","java"]
-    if us_ok:
-        cmd_prefix = ["env", f"LD_PRELOAD={us_path}", "java"]
-    else:
-        log("[Panel] ⚠️  userswap.so bulunamadı — LD_PRELOAD atlanıyor")
-        cmd_prefix = ["java"]
+    cmd_prefix = ["env", f"LD_PRELOAD={us_path}", "java"] if us_ok else ["java"]
 
     return cmd_prefix + [
         f"-Xms{xms_mb}M", f"-Xmx{xmx_mb}M",
 
-        # Metaspace — Paper için 96MB yeterli, sabit tut
-        "-XX:CompressedClassSpaceSize=48m",
-        "-XX:MaxMetaspaceSize=96m",
+        # Non-heap — minimumda tut (meta+class+code+stack = ~124MB)
+        "-XX:MaxMetaspaceSize=80m",
+        "-XX:CompressedClassSpaceSize=20m",
+        "-XX:ReservedCodeCacheSize=24m",
+        "-Xss256k",
 
         # G1GC — düşük RAM için optimize
         "-XX:+UseG1GC",
@@ -487,9 +466,8 @@ def get_jvm_args():
         "-XX:+ExplicitGCInvokesConcurrent",  # GC bloklamayı azalt
         "-XX:-OmitStackTraceInFastThrow",
 
-        # OOM yerine swap kullan (JVM kendi OOM'unu geciktir)
-        "-XX:+HeapDumpOnOutOfMemoryError",
-        f"-XX:HeapDumpPath=/tmp/java_oom.hprof",
+        # OOM dump yok — disk alanı kritik
+        "-XX:-HeapDumpOnOutOfMemoryError",
 
         # Genel
         "-Djava.net.preferIPv4Stack=true",
@@ -501,8 +479,30 @@ def get_jvm_args():
     ]
 
 
+def _worker_proxy(path: str, body: dict = None) -> dict:
+    """WORKER_URL (ana sunucu MC_ONLY API) üzerindeki endpoint'i çağır."""
+    try:
+        req = _urllib_req.Request(
+            WORKER_URL + path,
+            data=json.dumps(body or {}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with _urllib_req.urlopen(req, timeout=15) as r:
+            return json.loads(r.read())
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 def start_server():
     global mc_process
+    # Panel-agent modu: komutu ana sunucuya yönlendir
+    if IS_PROXY:
+        r = _worker_proxy("/api/mc/start")
+        if r.get("ok"):
+            server_state["status"] = "starting"
+            socketio.emit("server_status", server_state)
+        return r.get("ok", False), r.get("msg", "Proxy çağrısı")
     if mc_process and mc_process.poll() is None:
         return False, "Server zaten çalışıyor"
     MC_DIR.mkdir(parents=True, exist_ok=True)
@@ -521,26 +521,18 @@ def start_server():
     jvm = get_jvm_args()
     log(f"[Panel] 🚀 Server başlatılıyor...")
     try:
-        # NOT: preexec_fn → _child_setup (aşağıda)
         def _child_setup():
-            """
-            Child (Java) process'in başlamadan önce çalışır.
-            preexec_fn → fork sonrası, exec öncesi.
-            Kendi /proc/self/oom_score_adj'ını yazabilir (parent cannot write child's).
-            """
-            # Adres alanı limitini kaldır
+            # Adres alanı sınırını kaldır
             try:
                 import resource as _r
                 _r.setrlimit(_r.RLIMIT_AS, (_r.RLIM_INFINITY, _r.RLIM_INFINITY))
             except Exception:
                 pass
-            # OOM koruma — child kendi'sini koruyabilir
+            # OOM koruma — child /proc/self yazabilir, parent /proc/PID yazamaz (EPERM)
             try:
-                with open("/proc/self/oom_score_adj", "w") as _f:
-                    _f.write("-900")
+                open("/proc/self/oom_score_adj", "w").write("-900")
             except Exception:
-                pass  # Permission denied olsa da devam et (uyarı verme)
-
+                pass
         mc_process = subprocess.Popen(
             jvm, cwd=str(MC_DIR),
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -552,13 +544,15 @@ def start_server():
         socketio.emit("server_status", server_state)
         return False, str(e)
     threading.Thread(target=_stdout_reader, daemon=True).start()
-    log(f"[Panel] 🛡️  Java PID={mc_process.pid} başlatıldı (OOM adj child-process içinde)")
-
+    log(f"[Panel] 🛡️  Java PID={mc_process.pid} (OOM adj child-preexec ✅)")
     return True, "Başlatılıyor..."
 
 
 def stop_server(force=False):
     global mc_process
+    if IS_PROXY:
+        r = _worker_proxy("/api/mc/stop", {"force": force})
+        return r.get("ok", False), r.get("msg", "")
     if not mc_process or mc_process.poll() is not None:
         return False, "Server çalışmıyor"
     server_state["status"] = "stopping"
@@ -571,6 +565,8 @@ def stop_server(force=False):
 
 
 def send_command(cmd: str) -> bool:
+    if IS_PROXY:
+        return _worker_proxy("/api/mc/command", {"cmd": cmd}).get("ok", False)
     if mc_process and mc_process.poll() is None:
         try:
             mc_process.stdin.write(f"{cmd}\n".encode())
@@ -1112,33 +1108,33 @@ def api_performance():
                 proc=psutil.Process(mc_process.pid)
                 procs=[{"cpu":round(proc.cpu_percent(),1),"ram":int(proc.memory_info().rss/1024/1024),"threads":proc.num_threads()}]
             except: pass
-        pool = vcluster.summary()
+        pool     = vcluster.summary()
         vm_info  = pool.get("virtual_machine", {})
         mem_info = pool.get("memory", {})
         disk_info= pool.get("disk", {})
-        cpu_info = pool.get("cpu", {})
-        # UserSwap stats (JSON dosyasından)
-        us_stats = {}
+        # UserSwap stats (userswap.so JSON dosyasından)
+        us = {}
         try:
-            import json as _j
-            us_stats = _j.loads(open("/tmp/userswap.stats").read())
-        except: pass
-        swap_total = us_stats.get("total_mb", int(swp.total/1024/1024))
-        swap_free  = us_stats.get("free_mb",  int(swp.free/1024/1024))
+            us = json.loads(open("/tmp/userswap.stats").read())
+        except Exception:
+            pass
+        swap_total = us.get("total_mb", int(swp.total / 1024 / 1024))
+        swap_free  = us.get("free_mb",  int(swp.free  / 1024 / 1024))
         return jsonify({
-            "cpu":round(cpu,1),"ram_pct":round(vm.percent,1),
-            "ram_used_mb":int(vm.used/1024/1024),"ram_total_mb":int(vm.total/1024/1024),
-            "ram_free_mb":int(vm.available/1024/1024),
+            "cpu": round(cpu, 1), "ram_pct": round(vm.percent, 1),
+            "ram_used_mb": int(vm.used/1024/1024), "ram_total_mb": int(vm.total/1024/1024),
+            "ram_free_mb": int(vm.available/1024/1024),
             "swap_total_mb": swap_total, "swap_free_mb": swap_free,
-            "disk_pct":round(dk.percent,1),"disk_used_gb":round(dk.used/1e9,1),
-            "disk_total_gb":round(dk.total/1e9,1),
-            "cpu_count":psutil.cpu_count(),"mc":procs[0] if procs else {},
-            "tps":server_state["tps"],"tps5":server_state["tps5"],"tps15":server_state["tps15"],
-            "pool_agents":    pool.get("healthy", 0),
-            "pool_ram_mb":    vm_info.get("agent_cache_mb", 0),
-            "pool_disk_gb":   disk_info.get("remote_gb", 0),
-            "pool_cache_mb":  mem_info.get("local_cache_mb", 0),
-            "userswap":       us_stats,
+            "disk_pct": round(dk.percent, 1), "disk_used_gb": round(dk.used/1e9, 1),
+            "disk_total_gb": round(dk.total/1e9, 1),
+            "cpu_count": psutil.cpu_count(), "mc": procs[0] if procs else {},
+            "tps": server_state["tps"], "tps5": server_state["tps5"],
+            "tps15": server_state["tps15"],
+            "pool_agents":   pool.get("healthy", 0),
+            "pool_ram_mb":   vm_info.get("agent_cache_mb", 0),
+            "pool_disk_gb":  disk_info.get("remote_gb", 0),
+            "pool_cache_mb": mem_info.get("local_cache_mb", 0),
+            "userswap":      us,
         })
     except Exception as e:
         return jsonify({"error":str(e)})
@@ -1736,8 +1732,7 @@ function copyAddr(){if(mcAddr){navigator.clipboard.writeText(mcAddr);notify('Kop
 function updatePool(d){
   poolData=d||{total:0,healthy:0,resources:{},agents:[]};
   const h=poolData.healthy||0,res=poolData.resources||{};
-  const vm=res.virtual_machine||{};
-  const cacheMB=(vm.agent_cache_mb||res.cache_used_mb||0),diskGB=(vm.total_disk_gb||res.disk_free_gb||0),cpu=(vm.total_cpu_cores||res.cpu_cores||0);
+  const cacheMB=res.cache_used_mb||0,diskGB=res.disk_free_gb||0,cpu=res.cpu_cores||0;
   // topbar
   document.getElementById('tb-agents').textContent=h;
   document.getElementById('tb-cache').textContent=cacheMB+'MB';
@@ -1896,138 +1891,206 @@ init();
 
 
 # ══════════════════════════════════════════════════════════════
+#  MC_ONLY — Minimal HTTP API (Flask/SocketIO yok, ~5MB overhead)
+# ══════════════════════════════════════════════════════════════
+
+def _run_mc_only():
+    """
+    MC_ONLY=1: Ana sunucu. Flask hiç başlatılmaz → ~90MB kazanım → Xmx=370MB.
+    Python http.server ile minimal REST API sunar.
+    Panel agent (WORKER_URL bu sunucuyu gösterir) tüm komutları buraya proxy eder.
+    """
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+    import urllib.parse as _up2
+
+    _log_buf  = []
+    _log_lock = threading.Lock()
+
+    def _mc_log(line: str):
+        with _log_lock:
+            _log_buf.append(line)
+            if len(_log_buf) > 500:
+                del _log_buf[:100]
+        print(f"[MC] {line}", flush=True)
+        # Panel agent'e push
+        cb = os.environ.get("LOG_CALLBACK_URL", "")
+        if cb:
+            try:
+                _urllib_req.urlopen(_urllib_req.Request(
+                    cb, data=json.dumps({"line": line}).encode(),
+                    headers={"Content-Type": "application/json"}, method="POST",
+                ), timeout=2)
+            except Exception:
+                pass
+
+    def _reader():
+        while mc_process and mc_process.poll() is None:
+            try:
+                line = mc_process.stdout.readline().decode("utf-8", "replace").rstrip()
+                if line:
+                    _mc_log(line)
+                    m = re.search(r"TPS from last[^:]+:\s*([\d.]+),\s*([\d.]+),\s*([\d.]+)", line)
+                    if m:
+                        server_state["tps"]   = float(m.group(1))
+                        server_state["tps5"]  = float(m.group(2))
+                        server_state["tps15"] = float(m.group(3))
+                    if "Done" in line and "For help" in line:
+                        server_state["status"] = "running"
+                    if "Stopping server" in line:
+                        server_state["status"] = "stopping"
+            except Exception:
+                break
+        server_state["status"] = "stopped"
+
+    def _do_start():
+        global mc_process
+        MC_DIR.mkdir(parents=True, exist_ok=True)
+        if not MC_JAR.exists():
+            server_state["status"] = "downloading"
+            _mc_log("[MC_ONLY] 📥 server.jar indiriliyor...")
+            if not download_paper():
+                server_state["status"] = "stopped"
+                return False, "İndirme başarısız"
+        write_server_config()
+        server_state.update({"status": "starting", "online_players": 0})
+        jvm = get_jvm_args()
+        def _cs():
+            try:
+                import resource as _r
+                _r.setrlimit(_r.RLIMIT_AS, (_r.RLIM_INFINITY, _r.RLIM_INFINITY))
+            except Exception: pass
+            try: open("/proc/self/oom_score_adj", "w").write("-900")
+            except Exception: pass
+        mc_process = subprocess.Popen(
+            jvm, cwd=str(MC_DIR),
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            preexec_fn=_cs,
+        )
+        threading.Thread(target=_reader, daemon=True).start()
+        _mc_log(f"[MC_ONLY] 🚀 Java PID={mc_process.pid} Xmx=370MB")
+        return True, f"Başlatıldı PID={mc_process.pid}"
+
+    class _Handler(BaseHTTPRequestHandler):
+        def log_message(self, *a): pass
+
+        def _send(self, code, obj):
+            body = json.dumps(obj).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            p = _up2.urlparse(self.path).path
+            if p in ("/", "/health", "/api/ping"):
+                self._send(200, {"ok": True, "mode": "MC_ONLY",
+                                 "status": server_state.get("status", "stopped")})
+            elif p == "/api/mc/status":
+                self._send(200, {
+                    "ok": True,
+                    "status": server_state.get("status", "stopped"),
+                    "tps": server_state.get("tps", 0),
+                    "tps5": server_state.get("tps5", 0),
+                    "tps15": server_state.get("tps15", 0),
+                    "players": server_state.get("online_players", 0),
+                    "pid": mc_process.pid if mc_process else None,
+                })
+            elif p == "/api/mc/logs":
+                with _log_lock:
+                    lines = list(_log_buf[-200:])
+                self._send(200, {"ok": True, "lines": lines})
+            elif p == "/api/cluster/status":
+                self._send(200, vcluster.summary())
+            else:
+                self._send(404, {"ok": False, "error": "not found"})
+
+        def do_POST(self):
+            global mc_process
+            p  = _up2.urlparse(self.path).path
+            cl = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(cl)) if cl else {}
+
+            if p == "/api/mc/start":
+                if mc_process and mc_process.poll() is None:
+                    self._send(200, {"ok": False, "msg": "Zaten çalışıyor"})
+                else:
+                    ok, msg = _do_start()
+                    self._send(200, {"ok": ok, "msg": msg})
+
+            elif p == "/api/mc/stop":
+                if mc_process and mc_process.poll() is None:
+                    server_state["status"] = "stopping"
+                    if body.get("force"):
+                        mc_process.kill()
+                    else:
+                        try:
+                            mc_process.stdin.write(b"save-all\nstop\n")
+                            mc_process.stdin.flush()
+                        except Exception: pass
+                    self._send(200, {"ok": True, "msg": "Durduruluyor"})
+                else:
+                    self._send(200, {"ok": False, "msg": "Çalışmıyor"})
+
+            elif p == "/api/mc/command":
+                cmd = body.get("cmd", "")
+                if cmd and mc_process and mc_process.poll() is None:
+                    try:
+                        mc_process.stdin.write(f"{cmd}\n".encode())
+                        mc_process.stdin.flush()
+                        self._send(200, {"ok": True})
+                    except Exception as e:
+                        self._send(200, {"ok": False, "error": str(e)})
+                else:
+                    self._send(200, {"ok": False, "msg": "MC çalışmıyor"})
+
+            elif p in ("/api/agent/register", "/api/agent/heartbeat"):
+                nid    = body.get("node_id", "")
+                tunnel = body.get("tunnel", "")
+                if nid and tunnel:
+                    try: vcluster.register_agent(tunnel, nid, body)
+                    except Exception: pass
+                self._send(200, {"ok": True})
+
+            elif p == "/api/internal/status_msg":
+                msg = body.get("msg", "")
+                if msg: print(f"[STATUS] {msg}", flush=True)
+                self._send(200, {"ok": True})
+
+            else:
+                self._send(404, {"ok": False, "error": "not found"})
+
+    # Agent heartbeat thread (vcluster için)
+    threading.Thread(target=_pool_health_watchdog, daemon=True).start()
+    threading.Thread(target=_pool_auto_optimize,   daemon=True).start()
+
+    # Otomatik MC başlat
+    def _auto_start():
+        time.sleep(3)
+        _mc_log("[MC_ONLY] ⚡ Minimal API hazır, MC başlatılıyor...")
+        _do_start()
+    threading.Thread(target=_auto_start, daemon=True).start()
+
+    print(f"[MC_ONLY] ⚡ HTTP API :{PANEL_PORT} (Flask yok → Xmx=370MB)", flush=True)
+    HTTPServer(("0.0.0.0", PANEL_PORT), _Handler).serve_forever()
+
+
+# ══════════════════════════════════════════════════════════════
 #  BAŞLATMA
 # ══════════════════════════════════════════════════════════════
 
-threading.Thread(target=_ram_monitor,        daemon=True).start()
-threading.Thread(target=_ram_watchdog,       daemon=True).start()
-threading.Thread(target=_pool_health_watchdog, daemon=True).start()  # agent sağlık izleme
-threading.Thread(target=_pool_auto_optimize,   daemon=True).start()  # disk tier-out
-# cluster.py kendi thread'lerini başlatır
-
-
-def _agent_cache_warm():
-    """
-    Agent RAM cache'lerini doldur:
-    1. server.jar → tüm agentlara replicate
-    2. World region dosyaları (.mca) → hash tabanlı dağıtım
-    Vcluster agent'larını kullanır.
-    """
-    # MC JAR + en az 1 agent hazır olana kadar bekle
-    for _ in range(900):
-        if MC_JAR.exists() and vcluster.agent_count() > 0:
-            break
-        time.sleep(1)
-    else:
-        return  # 15dk içinde hazır olmadı
-
-    time.sleep(10)  # MC başlasın
-
-    def _push_to_agent(ag_info: dict, key: str, data: bytes) -> bool:
-        url = ag_info.get("url", "")
-        if not url:
-            return False
-        try:
-            import urllib.request as _uur
-            req = _uur.Request(
-                f"{url}/api/cache/set?key={key}",
-                data=data,
-                headers={"Content-Type": "application/octet-stream"},
-                method="POST",
-            )
-            _uur.urlopen(req, timeout=60)
-            return True
-        except:
-            return False
-
-    def _warm_one(ag_info: dict):
-        pushed = 0
-        pushed_bytes = 0
-        limit_mb = ag_info.get("info", {}).get("ram", {}).get("total_mb", 350)
-        target_bytes = int(limit_mb * 0.85 * 1024 * 1024)
-
-        # 1. server.jar
-        if MC_JAR.exists() and pushed_bytes < target_bytes:
-            try:
-                data = MC_JAR.read_bytes()
-                if _push_to_agent(ag_info, "mc/server.jar", data):
-                    pushed_bytes += len(data)
-                    pushed += 1
-            except: pass
-
-        # 2. Config dosyaları
-        for cfg in ["paper.yml", "spigot.yml", "bukkit.yml", "server.properties"]:
-            if pushed_bytes >= target_bytes: break
-            p = MC_DIR / cfg
-            if p.exists():
-                try:
-                    data = p.read_bytes()
-                    if _push_to_agent(ag_info, f"mc/config/{cfg}", data):
-                        pushed_bytes += len(data)
-                        pushed += 1
-                except: pass
-
-        # 3. World region dosyaları — dağıtımlı
-        agents = [a for a in vcluster.get_agents() if a.get("healthy")]
-        n      = max(1, len(agents))
-        try:
-            sorted_ids = sorted(a["node_id"] for a in agents)
-            my_idx     = sorted_ids.index(ag_info["node_id"])
-        except:
-            my_idx = 0
-
-        for region_dir, dim in [
-            (MC_DIR / "world"        / "region",           "world"),
-            (MC_DIR / "world_nether" / "DIM-1" / "region","world_nether"),
-        ]:
-            if not region_dir.exists(): continue
-            for rf in sorted(region_dir.glob("*.mca"),
-                             key=lambda f: f.stat().st_mtime, reverse=True):
-                if pushed_bytes >= target_bytes: break
-                import hashlib as _hl
-                if int(_hl.md5(rf.name.encode()).hexdigest(), 16) % n != my_idx:
-                    continue
-                try:
-                    data = rf.read_bytes()
-                    key  = f"mc/region/{dim}/{rf.name}"
-                    if _push_to_agent(ag_info, key, data):
-                        pushed_bytes += len(data)
-                        pushed += 1
-                except: pass
-
-        mb = pushed_bytes // 1024 // 1024
-        if pushed:
-            log(f"[Cluster] 🧠 {ag_info['node_id']}: {pushed} dosya, {mb}MB → cache")
-        return pushed
-
-    # Tüm agentlara paralel gönder
-    agents = [a for a in vcluster.get_agents() if a.get("healthy")]
-    if agents:
-        threads = [threading.Thread(target=_warm_one, args=(a,), daemon=True) for a in agents]
-        for t in threads: t.start()
-        for t in threads: t.join(timeout=240)
-        log(f"[Cluster] ✅ Cache warm tamamlandı: {len(agents)} agent")
-
-    # Periyodik: yeni agentlar + güncel region'lar
-    _warmed = set(a["node_id"] for a in vcluster.get_agents() if a.get("healthy"))
-    while True:
-        time.sleep(300)
-        try:
-            current  = set(a["node_id"] for a in vcluster.get_agents() if a.get("healthy"))
-            new_ids  = current - _warmed
-            for nid in new_ids:
-                ag = next((a for a in vcluster.get_agents() if a["node_id"] == nid), None)
-                if ag:
-                    threading.Thread(target=_warm_one, args=(ag,), daemon=True).start()
-            _warmed.update(current)
-        except Exception as e:
-            log(f"[Cluster] ⚠️  Cache warm döngü: {e}")
-
-
-threading.Thread(target=_agent_cache_warm, daemon=True).start()
+if not MC_ONLY:
+    threading.Thread(target=_ram_monitor,          daemon=True).start()
+    threading.Thread(target=_ram_watchdog,         daemon=True).start()
+    threading.Thread(target=_pool_health_watchdog, daemon=True).start()
+    threading.Thread(target=_pool_auto_optimize,   daemon=True).start()
+    # cluster.py kendi thread'lerini başlatır
 
 if __name__ == "__main__":
     MC_DIR.mkdir(parents=True, exist_ok=True)
-    print(f"[MC Panel v10.0] :{PANEL_PORT} başlatılıyor...")
-    socketio.run(app, host="0.0.0.0", port=PANEL_PORT,
-                 debug=False, use_reloader=False, log_output=False)
+    if MC_ONLY:
+        _run_mc_only()
+    else:
+        print(f"[MC Panel v10.0] :{PANEL_PORT} başlatılıyor...")
+        socketio.run(app, host="0.0.0.0", port=PANEL_PORT,
+                     debug=False, use_reloader=False, log_output=False)

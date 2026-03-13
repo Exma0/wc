@@ -62,6 +62,11 @@ NODE_ID       = MY_URL.replace("https://","").replace(".onrender.com","") or f"a
 AGENT_DATA    = Path(os.environ.get("AGENT_DATA", "/agent_data"))
 VERSION       = "12.0"
 
+# IS_PANEL=1 → Bu agent panel host'u.
+# mc_panel.py'yi WORKER_URL=MAIN_URL ile başlatır.
+# Kullanıcı bu agent'ın URL'ine browser ile bağlanır.
+IS_PANEL      = os.environ.get("IS_PANEL", "0") == "1"
+
 # ── Dizinler ──────────────────────────────────────────────────────────────────
 AGENT_DATA.mkdir(parents=True, exist_ok=True)
 CATEGORIES = {"regions", "chunks", "backups", "plugins", "configs", "paper_cache"}
@@ -810,13 +815,57 @@ def bulk_cache_and_store():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  PANEL MODU — mc_panel.py'yi subprocess olarak çalıştır
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _run_as_panel():
+    """
+    IS_PANEL=1: Bu agent panel host.
+    - mc_panel.py'yi WORKER_URL=MAIN_URL (JVM ana sunucu) ile başlatır.
+    - Agent kendi Flask'ını da çalıştırır (cache/disk/proxy için).
+    - Panel PORT'ta, agent AGENT_PORT'ta çalışır (ikisi aynı port olabilir).
+    """
+    panel_path = "/app/mc_panel.py"
+    if not os.path.exists(panel_path):
+        print(f"[PanelAgent] ❌ {panel_path} bulunamadı — normal agent moduna geçiliyor")
+        return False
+
+    env = {
+        **os.environ,
+        "MC_ONLY":    "0",       # Flask aç
+        "WORKER_URL": MAIN_URL,  # JVM bu URL'de (MC_ONLY=1 mod)
+        "PORT":       str(PORT), # Aynı port — panel burada
+        "MAIN_URL":   MAIN_URL,
+    }
+    print(f"[PanelAgent] 🖥️  mc_panel.py başlatılıyor (WORKER_URL={MAIN_URL})")
+    proc = subprocess.Popen(
+        [sys.executable, panel_path],
+        env=env,
+    )
+
+    # Panel process'i izle — ölürse yeniden başlat
+    while True:
+        ret = proc.wait()
+        print(f"[PanelAgent] ⚠️  mc_panel.py çıktı (kod={ret}), 10s sonra yeniden...")
+        time.sleep(10)
+        proc = subprocess.Popen([sys.executable, panel_path], env=env)
+
+    return True  # unreachable
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  BAŞLATMA
 # ══════════════════════════════════════════════════════════════════════════════
 
 threading.Thread(target=_heartbeat_loop, daemon=True).start()
 
 if __name__ == "__main__":
-    print(f"[Agent] Port {PORT} başlatılıyor...")
-    import eventlet.wsgi
-    eventlet.wsgi.server(eventlet.listen(("0.0.0.0", PORT)), app,
-                         log_output=False)
+    if IS_PANEL:
+        # Panel modunda agent Flask'ı başlatma — panel zaten PORT'u kullanıyor
+        print(f"[Agent] IS_PANEL=1 → mc_panel.py çalıştırılıyor...")
+        _run_as_panel()
+    else:
+        print(f"[Agent] Port {PORT} başlatılıyor...")
+        import eventlet.wsgi
+        eventlet.wsgi.server(eventlet.listen(("0.0.0.0", PORT)), app,
+                             log_output=False)

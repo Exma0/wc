@@ -243,54 +243,34 @@ def optimize_all(mode: str = "main"):
 # ── Panel başlatma ────────────────────────────────────────────────────────────
 
 def start_panel():
-    print(f"\n🚀 Panel :{PORT} başlatılıyor...")
+    """
+    Ana sunucuda mc_panel.py'yi MC_ONLY=1 ile başlatır.
+    Flask/SocketIO yok → Xmx=370MB.
+    Panel UI ayrı bir agent'ta (IS_PANEL=1) çalışır.
+    """
+    print(f"\n🚀 MC_ONLY modu başlatılıyor :{PORT}...")
     userswap_so = build_userswap()
-    env = {**base_env}
+    env = {
+        **base_env,
+        "MC_ONLY": "1",   # Flask yok → Xmx=370MB
+    }
     if userswap_so:
         env["USERSWAP_SO"] = userswap_so
     proc = subprocess.Popen([sys.executable, "/app/mc_panel.py"], env=env)
     if _wait_port(PORT, 30):
-        print("  ✅ Panel hazır")
+        print("  ✅ MC_ONLY API hazır (Xmx=370MB)")
     else:
-        print("  ⚠️  Panel timeout (30s)")
+        print("  ⚠️  MC_ONLY API timeout (30s)")
     return proc
 
 
 # ── MC otomatik başlatma ──────────────────────────────────────────────────────
 
 def auto_start():
-    """
-    Swap hazır olduğunda MC'yi otomatik başlat.
-    Agent swap'ları eklenince Xmx daha yüksek hesaplanır.
-    """
-    _panel_log("[Sistem] 🟢 v11.0 başladı")
+    """MC_ONLY modunda mc_panel.py kendi başlatır — burada tünel açıyoruz."""
+    _panel_log("[Sistem] 🟢 v11.0 MC_ONLY başladı")
 
-    swp   = psutil.swap_memory()
-    sw_mb = swp.total // 1024 // 1024
-    _panel_log(f"[Sistem] 💾 Swap: {sw_mb}MB")
-
-    # 60 saniye bekle — agent'lar bağlanıp swap eklesin
-    if sw_mb < 512:
-        _panel_log("[Sistem] ⏳ Agent swap bekleniyor (max 60s)...")
-        deadline = time.time() + 60
-        while time.time() < deadline:
-            time.sleep(5)
-            sw_mb = psutil.swap_memory().total // 1024 // 1024
-            if sw_mb >= 512:
-                break
-        _panel_log(f"[Sistem] 💾 Swap hazır: {sw_mb}MB")
-
-    try:
-        _ur.urlopen(_ur.Request(
-            f"http://localhost:{PORT}/api/start",
-            data=json.dumps({"_internal": True}).encode(),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        ), timeout=10)
-        print("  ✅ MC başlatma komutu gönderildi")
-    except Exception as e:
-        print(f"  ⚠️  MC start hatası: {e}")
-
+    # MC hazır olana kadar bekle (mc_panel otomatik başlatıyor)
     if _wait_port(MC_PORT, 300):
         print("  ✅ MC Server hazır!")
         _panel_log("[Sistem] ✅ MC oyuncuları bekliyor!")
@@ -372,9 +352,9 @@ optimize_all("main" if IS_MAIN else "agent")
 
 if IS_MAIN:
     print(f"\n{'━'*56}")
-    print(f"  🟢 ANA SUNUCU v11.0 — Panel :{PORT}")
-    print(f"  UserSwap: 4 shard × 1GB = 4GB dosya swap")
-    print(f"  Agent'lar: RAM cache + disk store + proxy")
+    print(f"  🟢 ANA SUNUCU v11.0 — MC_ONLY :{PORT}")
+    print(f"  UserSwap: 4 shard × 1GB = 4GB  |  Xmx=370MB")
+    print(f"  Panel UI: Ayrı agent (IS_PANEL=1)")
     print(f"{'━'*56}\n")
     panel = start_panel()
     threading.Thread(target=auto_start, daemon=True).start()
