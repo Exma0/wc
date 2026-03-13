@@ -729,6 +729,43 @@ def download_paper():
     """Geriye dönük uyumluluk — Cuberite C++ kullanılıyor."""
     return download_cuberite()
 
+def _clean_player_files():
+    """
+    Cuberite oyuncu NBT/JSON dosyalarını doğrula.
+    Bozuk dosya varsa sil — "Your player's save files could not be parsed"
+    hatasının önüne geçer.
+
+    Cuberite iki format kullanır:
+      /minecraft/players/<UUID>.json   (yeni — offline mode UUID tabanlı)
+      /minecraft/players/<name>.dat    (eski)
+    Geçerli JSON değilse veya TAG_Compound ile başlamıyorsa → sil.
+    """
+    players_dir = MC_DIR / "players"
+    players_dir.mkdir(parents=True, exist_ok=True)
+    removed = 0
+    for pf in list(players_dir.glob("*")):
+        if not pf.is_file():
+            continue
+        try:
+            if pf.suffix == ".json":
+                import json as _j
+                _j.loads(pf.read_text())
+            else:
+                data = pf.read_bytes()
+                # NBT dosyası TAG_Compound (0x0A) ile başlamalı
+                if len(data) < 4 or data[0] != 0x0A:
+                    raise ValueError("geçersiz NBT")
+        except Exception:
+            try:
+                pf.unlink()
+                removed += 1
+                log(f"[Panel] 🗑️  Bozuk oyuncu dosyası silindi: {pf.name}")
+            except Exception:
+                pass
+    if removed:
+        log(f"[Panel] ✅ {removed} bozuk oyuncu dosyası temizlendi")
+
+
 def write_server_config():
     """
     Cuberite INI konfigürasyon dosyaları yaz.
@@ -807,20 +844,36 @@ def write_server_config():
     if not webadmin.exists():
         webadmin.write_text("[WebAdmin]\nEnabled=false\n")
 
-    # ── scoreboard.dat — Boş oluştur (uyarıyı bastır) ──────────
-    sbd_dir = MC_DIR / "world" / "data"
-    sbd_dir.mkdir(parents=True, exist_ok=True)
-    sbd = sbd_dir / "scoreboard.dat"
-    if not sbd.exists():
-        # Minimal NBT binary — boş scoreboard
-        # (Cuberite load edemese de warning vermez çünkü dosya var)
-        sbd.write_bytes(bytes([0x0A, 0x00, 0x00, 0x0A, 0x00, 0x04, 0x64,
-                                0x61, 0x74, 0x61, 0x00, 0x00]))
+    # ── scoreboard.dat — Varsa sil (Cuberite sıfırdan oluşturur) ─
+    # El ile yazılan NBT "Data extraction failed" veriyor.
+    # Dosya yokken Cuberite kendi oluşturuyor — bu daha güvenli.
+    sbd = MC_DIR / "world" / "data" / "scoreboard.dat"
+    if sbd.exists():
+        try:
+            sbd.unlink()
+        except Exception:
+            pass
+    (MC_DIR / "world" / "data").mkdir(parents=True, exist_ok=True)
 
-    # ── allowedbiomes.ini — BambooJungle uyarılarını önle ───────
-    # Cuberite eski sürümlerinde BambooJungle/BambooJungleHills biome
-    # kodu yok → JungleTemple.cubeset'te "Skipping biome" uyarısı çıkar.
-    # allowedbiomes.ini yok → sadece log uyarısıdır, oyunu etkilemez.
+    # ── players dizini — Cuberite oyuncu NBT'lerini buraya yazar ─
+    players_dir = MC_DIR / "players"
+    players_dir.mkdir(parents=True, exist_ok=True)
+
+    # Bozuk oyuncu NBT dosyalarını temizle.
+    # "player's save files could not be parsed" hatası bozuk .json
+    # veya .nbt dosyalarından kaynaklanır — sıfırdan başlatmak için sil.
+    import struct as _struct
+    for pf in players_dir.glob("*"):
+        if pf.is_file():
+            try:
+                data = pf.read_bytes()
+                # NBT dosyası TAG_Compound (0x0A) ile başlamalı
+                if len(data) < 4 or data[0] != 0x0A:
+                    pf.unlink()
+                    log(f"[Panel] 🗑️  Bozuk oyuncu dosyası silindi: {pf.name}")
+            except Exception:
+                try: pf.unlink()
+                except Exception: pass
 
     # ── Bölge dizinleri ─────────────────────────────────────────
     (MC_DIR / "world"         / "region").mkdir(parents=True, exist_ok=True)
@@ -878,6 +931,11 @@ def start_server():
             socketio.emit("server_status", server_state)
             return False, "Cuberite indirilemedi"
     write_server_config()
+
+    # Bozuk oyuncu kayıt dosyalarını temizle — her başlatmada kontrol
+    # "Your player's save files could not be parsed" hatasının önüne geçer
+    _clean_player_files()
+
     server_state.update({"status": "starting", "online_players": 0})
     players.clear()
     socketio.emit("server_status", server_state)
