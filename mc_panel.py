@@ -257,9 +257,17 @@ def _auto_archive_old_regions(older_than_days: int = 5):
     best = _best_agent_by_disk()
     if not best:
         return
-    free_gb = _sh.disk_usage("/").free / 1e9
-    if free_gb > 8.0:
-        return   # Yeterli yer var, gerek yok
+    # ÖNEMLİ: shutil.disk_usage("/") host FS okur (örn: 68GB free) — yanıltıcı.
+    # Render 18GB limiti cgroup ile uygulanır.
+    # /minecraft altındaki gerçek kullanımı hesapla.
+    try:
+        mc_used_gb = sum(f.stat().st_size for f in MC_DIR.rglob("*") if f.is_file()) / 1e9
+    except:
+        mc_used_gb = 0.0
+    render_limit = float(os.environ.get("RENDER_DISK_LIMIT_GB", "18.0"))
+    used_gb = 4.0 + mc_used_gb  # 4GB OS/image tabanı
+    if used_gb < render_limit * 0.60:
+        return  # Disk %60'dan az kullanılıyor — gerek yok
 
     archived  = 0
     freed_mb  = 0
@@ -288,22 +296,9 @@ def _auto_archive_old_regions(older_than_days: int = 5):
                 continue   # sessiz hata
 
     if archived > 0:
-        # Swap dosyası büyüt
-        new_free_gb = _sh.disk_usage("/").free / 1e9
-        sw_mb       = min(6144, int(new_free_gb * 0.7 * 1024))
-        sf2         = "/swapfile2"
-        subprocess.run(f"swapoff {sf2} 2>/dev/null", shell=True)
-        try:
-            if Path(sf2).exists(): Path(sf2).unlink()
-        except: pass
-        r = subprocess.run(f"fallocate -l {sw_mb}M {sf2} && chmod 600 {sf2} && "
-                           f"mkswap -f {sf2} && swapon -p 1 {sf2}",
-                           shell=True, capture_output=True)
-        if r.returncode == 0:
-            log(f"[Pool] 💾 {archived} region arşivlendi ({freed_mb:.0f}MB boşaltıldı) "
-                f"→ yeni swap dosyası: {sw_mb}MB")
-        else:
-            log(f"[Pool] 💾 {archived} region arşivlendi ({freed_mb:.0f}MB)")
+        # NOT: swapon Render'da EPERM → swap denemesi yok.
+        # UserSwap (LD_PRELOAD) zaten 4GB dosya swap sağlıyor.
+        log(f"[Pool] 💾 {archived} region arşivlendi ({freed_mb:.0f}MB) → agent disk")
 
     return archived, freed_mb
 
@@ -425,19 +420,46 @@ def get_jvm_args():
 
     # UserSwap varsa dosyaya taşabilir — minimum 320MB garanti et
     # UserSwap yoksa 256MB ile güvenli kal
-    us_path = os.environ.get("USERSWAP_SO", "/app/userswap.so")
-    us_ok   = os.path.exists(us_path)
+    # UserSwap SO — env'den veya bilinen konumlardan bul
+    us_path = ""
+    for _p in [os.environ.get("USERSWAP_SO", ""), "/app/userswap.so",
+               "/usr/local/lib/userswap.so"]:
+        if _p and os.path.exists(_p):
+            us_path = _p
+            break
+    us_ok = bool(us_path)
+
+    # Swap hesabı düzeltmesi:
+    # psutil.swap_memory() Render container içinde SIFIR gösterir (cgroup).
+    # Gerçek swap kaynakları:
+    #   1. userswap.so → 4 shard × 1GB = 4096MB (dosya-destekli mmap)
+    #   2. Yerel disk swap (/swapfile)
+    # UserSwap varsa 4096MB sayıyoruz.
+    if us_ok and sw_mb < 512:
+        sw_mb = 4096   # 4 shard × 1GB
+        log("[Panel] 🔄 UserSwap aktif → Swap=4096MB sayıldı")
+
+    # Heap yeniden hesapla (güncel sw_mb ile)
+    heap_from_swap = min(768, (sw_mb // 512) * 128)
+    xmx_mb = heap_from_phys + heap_from_swap
+
     xmx_min = 320 if us_ok else 256
-    xmx_mb  = max(xmx_min, min(xmx_mb, 1536))   # mutlak alt/üst sınır
+    xmx_mb  = max(xmx_min, min(xmx_mb, 1536))
 
-    xms_mb = 32   # düşük başlat, JVM ihtiyaca göre büyütsün
+    xms_mb = 48   # biraz daha yüksek — bootstrap sırasında GC baskısını azalt
 
-    log(f"[Panel] 🧠 RAM={phys_mb}MB Swap={sw_mb}MB → "
+    log(f"[Panel] 🧠 RAM={phys_mb}MB Swap={sw_mb}MB {'(UserSwap)' if us_ok else ''} → "
         f"heap_phys={heap_from_phys}MB heap_swap={heap_from_swap}MB "
-        f"→ Xms={xms_mb}M Xmx={xmx_mb}M")
+        f"→ Xms={xms_mb}M Xmx={xmx_mb}M | LD_PRELOAD={'✅' if us_ok else '❌'}")
 
-    return [
-        "java",
+    # LD_PRELOAD prefix — UserSwap aktifse ["env","LD_PRELOAD=...","java"]
+    if us_ok:
+        cmd_prefix = ["env", f"LD_PRELOAD={us_path}", "java"]
+    else:
+        log("[Panel] ⚠️  userswap.so bulunamadı — LD_PRELOAD atlanıyor")
+        cmd_prefix = ["java"]
+
+    return cmd_prefix + [
         f"-Xms{xms_mb}M", f"-Xmx{xmx_mb}M",
 
         # Metaspace — Paper için 96MB yeterli, sabit tut
@@ -499,17 +521,30 @@ def start_server():
     jvm = get_jvm_args()
     log(f"[Panel] 🚀 Server başlatılıyor...")
     try:
-        def _reset_as_limit():
-            """JVM için adres alanı limitini kaldır — panel limiti JVM'e geçmesin."""
+        # NOT: preexec_fn → _child_setup (aşağıda)
+        def _child_setup():
+            """
+            Child (Java) process'in başlamadan önce çalışır.
+            preexec_fn → fork sonrası, exec öncesi.
+            Kendi /proc/self/oom_score_adj'ını yazabilir (parent cannot write child's).
+            """
+            # Adres alanı limitini kaldır
             try:
                 import resource as _r
                 _r.setrlimit(_r.RLIMIT_AS, (_r.RLIM_INFINITY, _r.RLIM_INFINITY))
             except Exception:
                 pass
+            # OOM koruma — child kendi'sini koruyabilir
+            try:
+                with open("/proc/self/oom_score_adj", "w") as _f:
+                    _f.write("-900")
+            except Exception:
+                pass  # Permission denied olsa da devam et (uyarı verme)
+
         mc_process = subprocess.Popen(
             jvm, cwd=str(MC_DIR),
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            preexec_fn=_reset_as_limit,
+            preexec_fn=_child_setup,
         )
     except Exception as e:
         log(f"[Panel] ❌ Başlatma hatası: {e}")
@@ -517,16 +552,7 @@ def start_server():
         socketio.emit("server_status", server_state)
         return False, str(e)
     threading.Thread(target=_stdout_reader, daemon=True).start()
-
-    # Java process'i OOM killer'dan koru
-    if mc_process.pid:
-        try:
-            # -900: kernel başka şeyleri öldürür, Java'ya dokunmaz
-            with open(f"/proc/{mc_process.pid}/oom_score_adj", "w") as f:
-                f.write("-900")
-            log(f"[Panel] 🛡️  Java PID={mc_process.pid} OOM koruması aktif")
-        except Exception as e:
-            log(f"[Panel] ⚠️  OOM adj başarısız: {e}")
+    log(f"[Panel] 🛡️  Java PID={mc_process.pid} başlatıldı (OOM adj child-process içinde)")
 
     return True, "Başlatılıyor..."
 
@@ -1086,19 +1112,33 @@ def api_performance():
                 proc=psutil.Process(mc_process.pid)
                 procs=[{"cpu":round(proc.cpu_percent(),1),"ram":int(proc.memory_info().rss/1024/1024),"threads":proc.num_threads()}]
             except: pass
-        pool=vcluster.summary()
+        pool = vcluster.summary()
+        vm_info  = pool.get("virtual_machine", {})
+        mem_info = pool.get("memory", {})
+        disk_info= pool.get("disk", {})
+        cpu_info = pool.get("cpu", {})
+        # UserSwap stats (JSON dosyasından)
+        us_stats = {}
+        try:
+            import json as _j
+            us_stats = _j.loads(open("/tmp/userswap.stats").read())
+        except: pass
+        swap_total = us_stats.get("total_mb", int(swp.total/1024/1024))
+        swap_free  = us_stats.get("free_mb",  int(swp.free/1024/1024))
         return jsonify({
             "cpu":round(cpu,1),"ram_pct":round(vm.percent,1),
             "ram_used_mb":int(vm.used/1024/1024),"ram_total_mb":int(vm.total/1024/1024),
             "ram_free_mb":int(vm.available/1024/1024),
-            "swap_total_mb":int(swp.total/1024/1024),"swap_free_mb":int(swp.free/1024/1024),
-            "disk_pct":round(dk.percent,1),"disk_used_gb":round(dk.used/1e9,1),"disk_total_gb":round(dk.total/1e9,1),
+            "swap_total_mb": swap_total, "swap_free_mb": swap_free,
+            "disk_pct":round(dk.percent,1),"disk_used_gb":round(dk.used/1e9,1),
+            "disk_total_gb":round(dk.total/1e9,1),
             "cpu_count":psutil.cpu_count(),"mc":procs[0] if procs else {},
             "tps":server_state["tps"],"tps5":server_state["tps5"],"tps15":server_state["tps15"],
-            "pool_agents":pool["healthy"],
-            "pool_ram_mb":pool["resources"]["ram_free_mb"],
-            "pool_disk_gb":pool["resources"]["disk_free_gb"],
-            "pool_cache_mb":pool["resources"]["cache_used_mb"],
+            "pool_agents":    pool.get("healthy", 0),
+            "pool_ram_mb":    vm_info.get("agent_cache_mb", 0),
+            "pool_disk_gb":   disk_info.get("remote_gb", 0),
+            "pool_cache_mb":  mem_info.get("local_cache_mb", 0),
+            "userswap":       us_stats,
         })
     except Exception as e:
         return jsonify({"error":str(e)})
@@ -1696,7 +1736,8 @@ function copyAddr(){if(mcAddr){navigator.clipboard.writeText(mcAddr);notify('Kop
 function updatePool(d){
   poolData=d||{total:0,healthy:0,resources:{},agents:[]};
   const h=poolData.healthy||0,res=poolData.resources||{};
-  const cacheMB=res.cache_used_mb||0,diskGB=res.disk_free_gb||0,cpu=res.cpu_cores||0;
+  const vm=res.virtual_machine||{};
+  const cacheMB=(vm.agent_cache_mb||res.cache_used_mb||0),diskGB=(vm.total_disk_gb||res.disk_free_gb||0),cpu=(vm.total_cpu_cores||res.cpu_cores||0);
   // topbar
   document.getElementById('tb-agents').textContent=h;
   document.getElementById('tb-cache').textContent=cacheMB+'MB';
@@ -1860,7 +1901,130 @@ init();
 
 threading.Thread(target=_ram_monitor,        daemon=True).start()
 threading.Thread(target=_ram_watchdog,       daemon=True).start()
+threading.Thread(target=_pool_health_watchdog, daemon=True).start()  # agent sağlık izleme
+threading.Thread(target=_pool_auto_optimize,   daemon=True).start()  # disk tier-out
 # cluster.py kendi thread'lerini başlatır
+
+
+def _agent_cache_warm():
+    """
+    Agent RAM cache'lerini doldur:
+    1. server.jar → tüm agentlara replicate
+    2. World region dosyaları (.mca) → hash tabanlı dağıtım
+    Vcluster agent'larını kullanır.
+    """
+    # MC JAR + en az 1 agent hazır olana kadar bekle
+    for _ in range(900):
+        if MC_JAR.exists() and vcluster.agent_count() > 0:
+            break
+        time.sleep(1)
+    else:
+        return  # 15dk içinde hazır olmadı
+
+    time.sleep(10)  # MC başlasın
+
+    def _push_to_agent(ag_info: dict, key: str, data: bytes) -> bool:
+        url = ag_info.get("url", "")
+        if not url:
+            return False
+        try:
+            import urllib.request as _uur
+            req = _uur.Request(
+                f"{url}/api/cache/set?key={key}",
+                data=data,
+                headers={"Content-Type": "application/octet-stream"},
+                method="POST",
+            )
+            _uur.urlopen(req, timeout=60)
+            return True
+        except:
+            return False
+
+    def _warm_one(ag_info: dict):
+        pushed = 0
+        pushed_bytes = 0
+        limit_mb = ag_info.get("info", {}).get("ram", {}).get("total_mb", 350)
+        target_bytes = int(limit_mb * 0.85 * 1024 * 1024)
+
+        # 1. server.jar
+        if MC_JAR.exists() and pushed_bytes < target_bytes:
+            try:
+                data = MC_JAR.read_bytes()
+                if _push_to_agent(ag_info, "mc/server.jar", data):
+                    pushed_bytes += len(data)
+                    pushed += 1
+            except: pass
+
+        # 2. Config dosyaları
+        for cfg in ["paper.yml", "spigot.yml", "bukkit.yml", "server.properties"]:
+            if pushed_bytes >= target_bytes: break
+            p = MC_DIR / cfg
+            if p.exists():
+                try:
+                    data = p.read_bytes()
+                    if _push_to_agent(ag_info, f"mc/config/{cfg}", data):
+                        pushed_bytes += len(data)
+                        pushed += 1
+                except: pass
+
+        # 3. World region dosyaları — dağıtımlı
+        agents = [a for a in vcluster.get_agents() if a.get("healthy")]
+        n      = max(1, len(agents))
+        try:
+            sorted_ids = sorted(a["node_id"] for a in agents)
+            my_idx     = sorted_ids.index(ag_info["node_id"])
+        except:
+            my_idx = 0
+
+        for region_dir, dim in [
+            (MC_DIR / "world"        / "region",           "world"),
+            (MC_DIR / "world_nether" / "DIM-1" / "region","world_nether"),
+        ]:
+            if not region_dir.exists(): continue
+            for rf in sorted(region_dir.glob("*.mca"),
+                             key=lambda f: f.stat().st_mtime, reverse=True):
+                if pushed_bytes >= target_bytes: break
+                import hashlib as _hl
+                if int(_hl.md5(rf.name.encode()).hexdigest(), 16) % n != my_idx:
+                    continue
+                try:
+                    data = rf.read_bytes()
+                    key  = f"mc/region/{dim}/{rf.name}"
+                    if _push_to_agent(ag_info, key, data):
+                        pushed_bytes += len(data)
+                        pushed += 1
+                except: pass
+
+        mb = pushed_bytes // 1024 // 1024
+        if pushed:
+            log(f"[Cluster] 🧠 {ag_info['node_id']}: {pushed} dosya, {mb}MB → cache")
+        return pushed
+
+    # Tüm agentlara paralel gönder
+    agents = [a for a in vcluster.get_agents() if a.get("healthy")]
+    if agents:
+        threads = [threading.Thread(target=_warm_one, args=(a,), daemon=True) for a in agents]
+        for t in threads: t.start()
+        for t in threads: t.join(timeout=240)
+        log(f"[Cluster] ✅ Cache warm tamamlandı: {len(agents)} agent")
+
+    # Periyodik: yeni agentlar + güncel region'lar
+    _warmed = set(a["node_id"] for a in vcluster.get_agents() if a.get("healthy"))
+    while True:
+        time.sleep(300)
+        try:
+            current  = set(a["node_id"] for a in vcluster.get_agents() if a.get("healthy"))
+            new_ids  = current - _warmed
+            for nid in new_ids:
+                ag = next((a for a in vcluster.get_agents() if a["node_id"] == nid), None)
+                if ag:
+                    threading.Thread(target=_warm_one, args=(ag,), daemon=True).start()
+            _warmed.update(current)
+        except Exception as e:
+            log(f"[Cluster] ⚠️  Cache warm döngü: {e}")
+
+
+threading.Thread(target=_agent_cache_warm, daemon=True).start()
 
 if __name__ == "__main__":
     MC_DIR.mkdir(parents=True, exist_ok=True)
