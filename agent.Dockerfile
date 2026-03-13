@@ -26,4 +26,5 @@ RUN mkdir -p /agent_data/regions/world \
 
 EXPOSE 8080
 
+# agent.py direkt başlat (main.py yok)
 CMD ["python3", "/app/agent.py"]
