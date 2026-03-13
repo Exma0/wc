@@ -898,15 +898,19 @@ def _clean_player_files():
     OYUNCU DOSYALARI ASLA SILINMEZ.
     Bozuk .json dosyalari players_corrupted/ klasorune TASINIR.
     Agent yedek varsa geri yuklenir, yoksa Cuberite sifirdan baslar.
+
+    Taranan konumlar:
+      • players/**/*.json          — oyuncu kayit dosyalari (alt klasorler dahil)
+      • world/data/stats/*.json    — istatistik dosyalari (bunlar bozulunca kick eder!)
     """
     import json as _j, shutil as _sh, subprocess as _spe
 
     players_dir = MC_DIR / "players"
     corrupt_dir = MC_DIR / "players_corrupted"
     backup_dir  = MC_DIR / "players_backup"
+    stats_dir   = MC_DIR / "world" / "data" / "stats"
 
-    for _d in [players_dir, corrupt_dir, backup_dir,
-               MC_DIR / "world" / "data" / "stats",
+    for _d in [players_dir, corrupt_dir, backup_dir, stats_dir,
                MC_DIR / "world" / "playerdata"]:
         _d.mkdir(parents=True, exist_ok=True)
     try:
@@ -917,48 +921,68 @@ def _clean_player_files():
     agents = [a for a in _agents.values() if a.get("healthy")]
     moved  = 0
 
-    for pf in list(players_dir.glob("*.json")):
-        if not pf.is_file():
-            continue
-        is_corrupt = False
+    def _is_valid_json(path):
         try:
-            txt = pf.read_text(encoding="utf-8", errors="replace").strip()
+            txt = path.read_text(encoding="utf-8", errors="replace").strip()
             if not txt:
-                is_corrupt = True
-            else:
-                obj = _j.loads(txt)
-                if not isinstance(obj, dict):
-                    is_corrupt = True
+                return False
+            return isinstance(_j.loads(txt), dict)
         except Exception:
-            is_corrupt = True
+            return False
 
-        if is_corrupt:
-            try: _sh.copy2(str(pf), str(backup_dir / pf.name))
+    # ── 1. players/**/*.json — alt klasörler dahil (Cuberite players/XX/UUID.json yazar) ──
+    for pf in list(players_dir.rglob("*.json")):
+        if not pf.is_file() or corrupt_dir in pf.parents:
+            continue
+        if _is_valid_json(pf):
+            continue
+
+        # Bozuk — yedekle
+        try: _sh.copy2(str(pf), str(backup_dir / pf.name))
+        except Exception: pass
+
+        restored = False
+        for _ag in agents:
+            try:
+                with _urllib_req.urlopen(
+                        _ag["url"] + f"/api/files/players/{pf.name}", timeout=15) as _r:
+                    _data = _r.read()
+                if _data and len(_data) > 4:
+                    pf.write_bytes(_data)
+                    log(f"[Players] {pf.name} agent'tan geri yuklendi")
+                    restored = True; break
             except Exception: pass
 
-            restored = False
-            for _ag in agents:
-                try:
-                    with _urllib_req.urlopen(
-                            _ag["url"] + f"/api/files/players/{pf.name}", timeout=15) as _r:
-                        _data = _r.read()
-                    if _data and len(_data) > 4:
-                        pf.write_bytes(_data)
-                        log(f"[Players] {pf.name} agent'tan geri yuklendi")
-                        restored = True; break
-                except Exception: pass
+        if not restored:
+            try:
+                _sh.move(str(pf), str(corrupt_dir / pf.name))
+                log(f"[Players] {pf.name} -> players_corrupted/ TASINDI (SILINMEDI)")
+            except Exception as _e:
+                log(f"[Players] {pf.name} tasinamadi: {_e}")
+        moved += 1
 
-            if not restored:
-                try:
-                    _sh.move(str(pf), str(corrupt_dir / pf.name))
-                    log(f"[Players] {pf.name} -> players_corrupted/ TASINDI (SILINMEDI)")
-                except Exception as _e:
-                    log(f"[Players] {pf.name} tasinamadi: {_e}")
-            moved += 1
+    # ── 2. world/data/stats/*.json — bozuk istatistik → SIFIRLA (veri kaybı yok, kayıt değil) ──
+    # Bu dosyalar bozulunca Cuberite oyuncuyu "save or statistics file loading failed" ile atar!
+    stats_fixed = 0
+    for sf in list(stats_dir.glob("*.json")):
+        if not sf.is_file():
+            continue
+        if _is_valid_json(sf):
+            continue
+        # Bozuk stats dosyası — sıfırla (boş obje Cuberite tarafından kabul edilir)
+        try:
+            _sh.copy2(str(sf), str(corrupt_dir / ("stats_" + sf.name)))
+        except Exception: pass
+        try:
+            sf.write_text("{}")
+            log(f"[Players] stats/{sf.name} bozuktu -> sifirlandi (bos obje)")
+            stats_fixed += 1
+        except Exception as _e:
+            log(f"[Players] stats/{sf.name} sıfırlanamadı: {_e}")
 
-    n = len(list(players_dir.glob("*.json")))
-    if moved:
-        log(f"[Players] {moved} sorunlu dosya islendi, {n} dosya kaldi")
+    n = len(list(players_dir.rglob("*.json")))
+    if moved or stats_fixed:
+        log(f"[Players] {moved} kayit + {stats_fixed} stats dosyasi islendi, {n} kayit kaldi")
     else:
         log(f"[Players] {n} oyuncu dosyasi saglikli" if n else
             "[Players] Kayitli oyuncu yok - ilk girislerinde olusturulur")
