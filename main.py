@@ -49,12 +49,9 @@ base_env = {
     **os.environ,
     "HOME": "/root", "USER": "root", "LOGNAME": "root",
     "LANG": "en_US.UTF-8", "LC_ALL": "en_US.UTF-8",
-    "JAVA_HOME": "/usr/lib/jvm/java-21-openjdk-amd64",
-    "PATH": (
-        "/usr/lib/jvm/java-21-openjdk-amd64/bin"
-        ":/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-    ),
-    "PORT":            str(PORT),
+    # JAVA_HOME kaldırıldı — Cuberite C++ JVM gerektirmiyor
+    "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    "PORT":             str(PORT),
     "CONTAINER_RAM_MB": str(CONTAINER_RAM_MB),
 }
 

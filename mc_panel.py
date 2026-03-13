@@ -364,6 +364,98 @@ def _auto_archive_old_regions(older_than_days: int = 5):
 #  MC SERVER YÖNETİMİ
 # ══════════════════════════════════════════════════════════════
 
+def download_cuberite() -> bool:
+    """
+    Cuberite C++ binary'yi indir ve /minecraft/Cuberite'e yerleştir.
+    JVM jar değil — doğrudan çalıştırılabilir binary (~10MB).
+
+    İndirme kaynakları (sırasıyla denenir):
+      1. Cuberite CI nightly (Linux x86_64) — en güncel
+      2. GitHub releases fallback
+    """
+    if MC_BIN.exists() and MC_BIN.stat().st_size > 500_000:
+        log(f"[Panel] ✅ Cuberite binary zaten mevcut "
+            f"({MC_BIN.stat().st_size // 1024 // 1024}MB)")
+        MC_BIN.chmod(0o755)
+        return True
+
+    MC_DIR.mkdir(parents=True, exist_ok=True)
+
+    URLS = [
+        # Cuberite resmi CI nightly — Linux x86_64
+        "https://builds.liteloader.com/job/Cuberite/job/master/"
+        "lastSuccessfulBuild/artifact/builds/Linux_x86_64/Cuberite.tar.gz",
+        # GitHub releases backup
+        "https://github.com/cuberite/cuberite/releases/latest/download/"
+        "Cuberite-Linux-64bit.tar.gz",
+    ]
+
+    import tarfile as _tf
+
+    for url in URLS:
+        try:
+            log(f"[Panel] 📥 Cuberite indiriliyor: {url.split('/')[-1]}")
+            server_state["status"] = "downloading"
+            try:
+                socketio.emit("server_status", server_state)
+            except Exception:
+                pass
+
+            tmp = Path("/tmp/cuberite_dl.tar.gz")
+            req = _urllib_req.Request(
+                url, headers={"User-Agent": "MCPanel/14.0 Cuberite-Downloader"}
+            )
+            with _urllib_req.urlopen(req, timeout=180) as resp:
+                tmp.write_bytes(resp.read())
+
+            if not tmp.exists() or tmp.stat().st_size < 100_000:
+                log(f"[Panel] ⚠️  Dosya çok küçük veya boş — sonraki URL deneniyor")
+                tmp.unlink(missing_ok=True)
+                continue
+
+            log(f"[Panel] 📦 Arşiv açılıyor ({tmp.stat().st_size // 1024 // 1024}MB)...")
+            with _tf.open(tmp, "r:gz") as tf:
+                tf.extractall(str(MC_DIR))
+            tmp.unlink(missing_ok=True)
+
+            # Binary konumunu bul — tar yapısına göre farklı olabilir
+            candidates = [
+                MC_BIN,                          # /minecraft/Cuberite
+                MC_DIR / "Server" / "Cuberite",  # /minecraft/Server/Cuberite
+                MC_DIR / "Cuberite-Server" / "Cuberite",
+            ]
+            for candidate in candidates:
+                if candidate.exists() and candidate.stat().st_size > 100_000:
+                    candidate.chmod(0o755)
+                    if candidate != MC_BIN:
+                        import shutil as _shutil
+                        _shutil.copy2(str(candidate), str(MC_BIN))
+                        MC_BIN.chmod(0o755)
+                        log(f"[Panel] ✅ Cuberite kopyalandı: {candidate} → {MC_BIN}")
+                    else:
+                        log(f"[Panel] ✅ Cuberite hazır: {MC_BIN}")
+                    return True
+
+            # Binary bulunamazsa tar içinde ara
+            for f in MC_DIR.rglob("Cuberite"):
+                if f.is_file() and f.stat().st_size > 100_000:
+                    f.chmod(0o755)
+                    import shutil as _shutil
+                    _shutil.copy2(str(f), str(MC_BIN))
+                    MC_BIN.chmod(0o755)
+                    log(f"[Panel] ✅ Cuberite bulundu ve kopyalandı: {f.parent.name}/Cuberite")
+                    return True
+
+            log(f"[Panel] ⚠️  Cuberite binary arşiv içinde bulunamadı ({url})")
+
+        except Exception as e:
+            log(f"[Panel] ⚠️  İndirme hatası ({url.split('/')[-1]}): {e}")
+            continue
+
+    log("[Panel] ❌ Cuberite indirilemedi! Tüm kaynaklar denendi.")
+    return False
+
+
 def download_paper():
     """Geriye dönük uyumluluk — Cuberite C++ kullanılıyor."""
     return download_cuberite()
@@ -1006,26 +1098,73 @@ def api_plugin_search():
 
 @app.route("/api/settings")
 def api_settings():
-    f=MC_DIR/"server.properties"
-    if not f.exists(): return jsonify({})
-    props={}
-    for line in f.read_text().splitlines():
-        line=line.strip()
-        if line and not line.startswith("#") and "=" in line:
-            k,v=line.split("=",1); props[k.strip()]=v.strip()
+    """Cuberite settings.ini okur — INI formatı (section başlıkları atlanır)."""
+    f = MC_DIR / "settings.ini"
+    if not f.exists():
+        # settings.ini yoksa write_server_config() çalıştır, sonra oku
+        write_server_config()
+    props = {}
+    try:
+        for line in f.read_text(errors="replace").splitlines():
+            line = line.strip()
+            if not line or line.startswith("[") or line.startswith(";"):
+                continue
+            if "=" in line:
+                k, v = line.split("=", 1)
+                props[k.strip()] = v.strip()
+    except Exception as e:
+        return jsonify({"error": str(e)})
     return jsonify(props)
+
 
 @app.route("/api/settings", methods=["POST"])
 def api_settings_save():
-    f=MC_DIR/"server.properties"; existing={}
-    if f.exists():
-        for line in f.read_text().splitlines():
-            line=line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                k,v=line.split("=",1); existing[k.strip()]=v.strip()
-    existing.update(request.json or {})
-    f.write_text("\n".join(f"{k}={v}" for k,v in existing.items())+"\n")
-    return jsonify({"ok":True,"msg":"Kaydedildi. Yeniden başlatın."})
+    """Cuberite settings.ini günceller (sadece [Server] ve [Authentication] bölümleri)."""
+    updates = request.json or {}
+    f = MC_DIR / "settings.ini"
+
+    # Mevcut içeriği oku
+    sections: dict[str, list] = {}   # {section_name: [lines]}
+    cur_section = "__top__"
+    sections[cur_section] = []
+    try:
+        for line in f.read_text(errors="replace").splitlines():
+            stripped = line.strip()
+            if stripped.startswith("[") and stripped.endswith("]"):
+                cur_section = stripped[1:-1]
+                sections.setdefault(cur_section, [])
+            else:
+                sections.setdefault(cur_section, []).append(line)
+    except Exception:
+        # Yoksa varsayılan oluştur
+        write_server_config()
+        return jsonify({"ok": True, "msg": "Varsayılan config oluşturuldu. Yeniden başlatın."})
+
+    # Değerleri güncelle
+    for upd_key, upd_val in updates.items():
+        placed = False
+        for sec_name, sec_lines in sections.items():
+            for i, ln in enumerate(sec_lines):
+                if "=" in ln:
+                    k = ln.split("=", 1)[0].strip()
+                    if k == upd_key:
+                        sec_lines[i] = f"{k}={upd_val}"
+                        placed = True
+                        break
+            if placed:
+                break
+        if not placed:
+            # [Server] bölümüne ekle
+            sections.setdefault("Server", []).append(f"{upd_key}={upd_val}")
+
+    # Geri yaz
+    out_lines = []
+    for sec_name, sec_lines in sections.items():
+        if sec_name != "__top__":
+            out_lines.append(f"[{sec_name}]")
+        out_lines.extend(sec_lines)
+    f.write_text("\n".join(out_lines) + "\n")
+    return jsonify({"ok": True, "msg": "settings.ini kaydedildi. Yeniden başlatın."})
 
 # ── Dünya / Yedek ─────────────────────────────────────────────
 
@@ -1916,7 +2055,7 @@ def _run_mc_only():
         MC_DIR.mkdir(parents=True, exist_ok=True)
         if not MC_BIN.exists():
             server_state["status"] = "downloading"
-            _mc_log("[MC_ONLY] 📥 server.jar indiriliyor...")
+            _mc_log("[MC_ONLY] 📥 Cuberite binary indiriliyor...")
             if not download_cuberite():
                 server_state["status"] = "stopped"
                 return False, "İndirme başarısız"
@@ -1936,7 +2075,7 @@ def _run_mc_only():
             preexec_fn=_cs,
         )
         threading.Thread(target=_reader, daemon=True).start()
-        _mc_log(f"[MC_ONLY] 🚀 Java PID={mc_process.pid} Xmx=370MB")
+        _mc_log(f"[MC_ONLY] 🚀 Cuberite PID={mc_process.pid} (~50MB RAM, JVM yok)")
         return True, f"Başlatıldı PID={mc_process.pid}"
 
     class _Handler(BaseHTTPRequestHandler):
@@ -2154,13 +2293,31 @@ def _minimal_http_phase():
     except Exception: pass
 
     # Daemon thread'leri başlat
-    threading.Thread(target=_ram_monitor,  daemon=True).start()
-    threading.Thread(target=_ram_watchdog, daemon=True).start()
+    threading.Thread(target=_ram_monitor,          daemon=True).start()
+    threading.Thread(target=_ram_watchdog,         daemon=True).start()
+    threading.Thread(target=_pool_health_watchdog, daemon=True).start()
+    threading.Thread(target=_pool_auto_optimize,   daemon=True).start()
     _register_cluster_blueprint()
 
     print(f"[Phase2] 🚀 Flask+SocketIO :{PANEL_PORT} başlatılıyor...", flush=True)
     socketio.run(app, host="0.0.0.0", port=PANEL_PORT,
                  debug=False, use_reloader=False, log_output=False)
+
+
+def _register_cluster_blueprint():
+    """
+    Phase1→Phase2 geçişinde çağrılır.
+    cluster_api blueprint zaten modül yüklenirken register edildi
+    (app.register_blueprint satırı). Bu fonksiyon ek thread'leri
+    başlatmak ve emit yapmak için kullanılır.
+    """
+    try:
+        # vcluster sağlık döngüsü zaten cluster.py'de başlıyor,
+        # burada panel log'una emit yapalım.
+        socketio.emit("pool_update", vcluster.summary())
+        log("[Panel] ✅ Phase2: Cluster API + Kaynak Havuzu aktif")
+    except Exception as e:
+        log(f"[Panel] ⚠️  Blueprint kayıt: {e}")
 
 
 if __name__ == "__main__":
