@@ -75,18 +75,19 @@ import gc as _gc_mod
 import hashlib as _hashlib
 import uuid   as _uuid_mod
 
+# ── Cuberite Offline UUID (kaynak doğrulandı: ClientHandle.cpp) ───
+# cUUID::GenerateVersion3("OfflinePlayer:" + a_Username)
+# Dosya adları: players/{uuid}.json  world/data/stats/{uuid}.json
 def _offline_uuid(username: str) -> str:
     """
-    Minecraft offline-mode UUID üret.
-    Java: UUID.nameUUIDFromBytes(("OfflinePlayer:" + username).getBytes("UTF-8"))
-    → MD5 tabanlı UUID v3 (variant=RFC 4122)
-    Döndürür: 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'
-    Cuberite bu formatı players/{uuid}.json ve world/data/stats/{uuid}.json olarak kullanır.
+    Cuberite offline UUID üret.
+    Kaynak (ClientHandle.cpp): cUUID::GenerateVersion3("OfflinePlayer:" + username)
+    = MD5("OfflinePlayer:"+username) + UUID v3 bitleri → RFC 4122 dashed format
     """
     data = ("OfflinePlayer:" + username).encode("utf-8")
     raw  = bytearray(_hashlib.md5(data).digest())
-    raw[6] = (raw[6] & 0x0F) | 0x30   # version = 3
-    raw[8] = (raw[8] & 0x3F) | 0x80   # variant = RFC 4122
+    raw[6] = (raw[6] & 0x0F) | 0x30   # UUID version = 3
+    raw[8] = (raw[8] & 0x3F) | 0x80   # UUID variant = RFC 4122
     return str(_uuid_mod.UUID(bytes=bytes(raw)))
 
 app = Flask(__name__)
@@ -224,24 +225,29 @@ def _players_list():
 
 def _pre_create_player_files(player_name: str):
     """
-    Oyuncu için dizin garantile + bozuk dosyaları SİL.
+    UUID tabanlı bozuk dosya temizleyici (v3.0 — kaynak doğrulandı).
 
-    v2.0 DÜZELTME — UUID tabanlı dosya adları:
-      Cuberite stats ve player save dosyalarını OYUNCU ADI ile DEĞİL
-      UUID ile okur: world/data/stats/{uuid}.json  players/{uuid}.json
-      Eski sürüm yalnızca Ray.json kontrol ediyordu → hiçbir etkisi yoktu.
+    Cuberite kaynak kodu (ClientHandle.cpp) ile doğrulandı:
+      GenerateOfflineUUID = cUUID::GenerateVersion3("OfflinePlayer:" + username)
+      Dosya adı formatı: world/data/stats/{uuid-dashed}.json
+                          players/{uuid-dashed}.json
+
+    Eski sürümlerdeki hata: sadece "Ray.json" kontrol ediliyordu.
+    Cuberite hiçbir zaman isim tabanlı dosya okumaz — UUID tabanlı okur.
 
     Strateji:
-      - Dosya YOK → Cuberite "not found, resetting to defaults" deyip geçer ✓
-      - Dosya VAR ama bozuk (0 byte / geçersiz JSON) → SİL → yukarıdaki durum ✓
-      - Asla {} yazma: Cuberite "stats" key'ini bekler, {} bulursa exception fırlatır.
+      - Dosya YOK → Cuberite varsayılan ile oluşturur ✓
+      - Dosya VAR + Geçerli JSON → sorun yok ✓
+      - Dosya VAR + Bozuk/Boş → SİL → yukarıdaki durum ✓
+      - ASLA {} veya başka içerik YAZMA — Cuberite kendi formatını bilir.
     """
     if not player_name:
         return
     import subprocess as _spp
     import json as _jj
+    import time as _t
 
-    # Dizinleri garantile
+    # 1. Dizinleri garantile
     for _d in [
         MC_DIR / "players",
         MC_DIR / "world" / "data" / "stats",
@@ -254,47 +260,62 @@ def _pre_create_player_files(player_name: str):
         except Exception:
             pass
 
-    # UUID üret (Minecraft offline-mode algoritması)
+    # 2. Cuberite offline UUID hesapla (algoritma: MD5("OfflinePlayer:"+username))
     uuid_str = _offline_uuid(player_name)
 
-    # Bozuk dosya kontrolü: UUID tabanlı (yeni) + isim tabanlı (fallback)
-    _candidate_files = [
-        MC_DIR / "world" / "data" / "stats" / f"{uuid_str}.json",   # ← ASIL SORUN BURASI
-        MC_DIR / "world" / "data" / "stats" / f"{player_name}.json", # ← eski fallback
-        MC_DIR / "players"                  / f"{uuid_str}.json",
-        MC_DIR / "players"                  / f"{player_name}.json",
+    # 3. Tüm olası bozuk dosyaları kontrol et ve temizle
+    _candidates = [
+        # UUID tabanlı (ASIL OKUNAN DOSYALAR)
+        MC_DIR / "world" / "data" / "stats" / f"{uuid_str}.json",
+        MC_DIR / "players"                   / f"{uuid_str}.json",
+        # İsim tabanlı fallback (eski Cuberite sürümleri)
+        MC_DIR / "world" / "data" / "stats" / f"{player_name}.json",
+        MC_DIR / "players"                   / f"{player_name}.json",
     ]
-    for _fp in _candidate_files:
+
+    fixed = 0
+    for _fp in _candidates:
         if not _fp.exists():
             continue
+        _corrupt = False
         try:
             content = _fp.read_text(encoding="utf-8", errors="replace").strip()
             if not content:
-                raise ValueError("empty")
-            _jj.loads(content)   # Geçerli JSON mu?
+                _corrupt = True
+            elif not content.startswith("{"):
+                _corrupt = True
+            else:
+                _jj.loads(content)  # Geçerli JSON mu?
         except Exception:
-            # Bozuk → yedekle + sil
-            _bak = _fp.with_suffix(".json.corrupt_bak")
+            _corrupt = True
+
+        if _corrupt:
+            _bak = _fp.with_suffix(f".json.corrupt_{int(_t.time())}.bak")
             try:
                 _fp.rename(_bak)
-                log(f"[Players] {player_name} bozuk dosya yedeklendi → {_bak.name}")
+                log(f"[Players] 📦 {player_name} → yedeklendi: {_bak.name}")
             except Exception:
                 try:
                     _fp.unlink()
-                    log(f"[Players] {player_name} bozuk dosya silindi: {_fp.name}")
+                    log(f"[Players] 🗑 {player_name} → bozuk dosya silindi: {_fp.name}")
                 except Exception:
                     pass
+            fixed += 1
 
-    log(f"[Players] ✅ {player_name} (UUID: {uuid_str[:8]}…) hazir — yeniden baglanabilir")
+    if fixed > 0:
+        log(f"[Players] ✅ {player_name} (UUID: {uuid_str[:8]}…) → {fixed} bozuk dosya temizlendi, yeniden baglanabilir")
+    else:
+        log(f"[Players] ✅ {player_name} (UUID: {uuid_str[:8]}…) → dosyalar geçerli, yeniden baglanabilir")
 
 
 def _reset_player_files(player_name: str):
     """
-    Bozuk stats/player dosyalarını SİL (UUID tabanlı).
-    ⚠️  {} yazma — Cuberite kendi oluşturur.
+    Bozuk stats/player dosyalarını temizle — UUID tabanlı (v3.0).
+    Eski sürümden farkı: UUID tabanlı dosyaları da kontrol eder.
     """
     import subprocess as _sp
     import json as _jreset
+    import time as _t
 
     for _d in [
         MC_DIR / "players",
@@ -312,21 +333,35 @@ def _reset_player_files(player_name: str):
     uuid_str = _offline_uuid(player_name)
 
     for fp in [
-        MC_DIR / "world" / "data" / "stats" / f"{uuid_str}.json",    # ← UUID tabanlı (asıl)
-        MC_DIR / "world" / "data" / "stats" / f"{player_name}.json",  # ← isim tabanlı (fallback)
-        MC_DIR / "players"                  / f"{uuid_str}.json",
-        MC_DIR / "players"                  / f"{player_name}.json",
+        MC_DIR / "world" / "data" / "stats" / f"{uuid_str}.json",    # UUID tabanlı (asıl)
+        MC_DIR / "world" / "data" / "stats" / f"{player_name}.json",  # İsim tabanlı (fallback)
+        MC_DIR / "players"                   / f"{uuid_str}.json",
+        MC_DIR / "players"                   / f"{player_name}.json",
     ]:
-        if fp.exists():
+        if not fp.exists():
+            continue
+        _corrupt = False
+        try:
+            content = fp.read_text(encoding="utf-8", errors="replace").strip()
+            if not content or not content.startswith("{"):
+                _corrupt = True
+            else:
+                _jreset.loads(content)
+        except Exception:
+            _corrupt = True
+
+        if _corrupt:
+            _bak = fp.with_suffix(f".json.corrupt_{int(_t.time())}.bak")
             try:
-                _jreset.loads(fp.read_text(encoding="utf-8", errors="replace"))
+                fp.rename(_bak)
+                log(f"[Players] 📦 {player_name} bozuk dosya yedeklendi: {_bak.name}")
             except Exception:
                 try:
                     fp.unlink()
-                    log(f"[Players] {player_name} bozuk dosya silindi: {fp.name} — Cuberite yeniden olusturacak")
+                    log(f"[Players] 🗑 {player_name} bozuk dosya silindi: {fp.name}")
                 except Exception: pass
 
-    log(f"[Players] ✅ {player_name} (UUID: {uuid_str[:8]}…) dizin+izin hazir — yeniden baglanabilir")
+    log(f"[Players] ✅ {player_name} (UUID: {uuid_str[:8]}…) hazir — yeniden baglanabilir")
 
 def _ensure_runtime_dirs():
     """Cuberite için gerekli dizinleri garantile ve izin ver."""
