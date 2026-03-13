@@ -10,21 +10,31 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip3 install --no-cache-dir --break-system-packages \
-    flask eventlet psutil
+    flask flask-socketio eventlet psutil
 
 WORKDIR /app
-COPY agent.py ./agent.py
 
-RUN mkdir -p /agent_data/regions/world \
-             /agent_data/regions/world_nether \
-             /agent_data/regions/world_the_end \
-             /agent_data/backups \
-             /agent_data/plugins \
-             /agent_data/configs \
-             /agent_data/chunks \
-             /agent_data/paper_cache
+# Normal agent modu için
+COPY agent.py     ./agent.py
 
-EXPOSE 8080
+# IS_PANEL=1 modu için (panel agent mc_panel.py + cluster.py gerektirir)
+COPY mc_panel.py  ./mc_panel.py
+COPY cluster.py   ./cluster.py
 
-# agent.py direkt başlat (main.py yok)
+# Dizinler: normal agent + cuberite_cache (Cuberite C++ uyumlu)
+RUN mkdir -p \
+    /agent_data/regions/world \
+    /agent_data/regions/world_nether \
+    /agent_data/regions/world_the_end \
+    /agent_data/backups \
+    /agent_data/plugins \
+    /agent_data/configs \
+    /agent_data/chunks \
+    /agent_data/cuberite_cache
+
+EXPOSE 8080 5000
+
+# Başlatma:
+#   IS_PANEL=0 → normal agent (PORT=8080)
+#   IS_PANEL=1 → panel host: mc_panel.py'yi WORKER_URL ile başlatır (PORT=5000)
 CMD ["python3", "/app/agent.py"]

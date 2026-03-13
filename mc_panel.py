@@ -23,6 +23,16 @@ from pathlib import Path
 import eventlet
 eventlet.monkey_patch()
 
+# ── Panel process 480MB sınırı — Cuberite child process bunu miras almaz ─────
+import resource as _resource
+try:
+    _PANEL_LIMIT = 480 * 1024 * 1024
+    _s, _h = _resource.getrlimit(_resource.RLIMIT_AS)
+    if _h == _resource.RLIM_INFINITY or _h > _PANEL_LIMIT:
+        _resource.setrlimit(_resource.RLIMIT_AS, (_PANEL_LIMIT, _PANEL_LIMIT))
+except Exception:
+    pass  # Bazı ortamlarda izin yok
+
 from flask import Flask, request, jsonify, send_file, abort, Response
 from cluster import vcluster, cluster_api
 from flask_socketio import SocketIO, emit
@@ -62,12 +72,19 @@ server_state = {
 _agents: dict = {}
 _agents_lock  = threading.Lock()
 
+import gc as _gc_mod
+
 app = Flask(__name__)
 app.config["SECRET_KEY"] = "mc-panel-secret"
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet",
                     ping_timeout=60, ping_interval=25)
 if cluster_api: app.register_blueprint(cluster_api)
 vcluster.set_socketio(socketio)
+
+@app.after_request
+def _gc_after(resp):
+    _gc_mod.collect(0)
+    return resp
 
 
 # ══════════════════════════════════════════════════════════════
@@ -639,21 +656,34 @@ def send_command(cmd: str) -> bool:
 
 def _ram_watchdog():
     """
-    Bellek baskısını sürekli izle.
-    512MB fiziksel limit aşılmadan swap'a geçilmesini sağla.
+    Process RSS ile gerçek bellek baskısını izle.
+    psutil.virtual_memory() HOST RAM okur — container sınırını görmez.
+    Cuberite ~50MB + Panel ~120MB = ~170MB → 512MB sınırına çok yer var.
+    Yine de swap baskısını izle.
     """
     import psutil
     _consecutive_low = 0
     while True:
         eventlet.sleep(4)
         try:
-            mem  = psutil.virtual_memory()
+            # Panel process RSS
+            _panel_rss = 0
+            try: _panel_rss = int(psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024)
+            except Exception: _panel_rss = 120
+            # Cuberite process RSS
+            _mc_rss = 0
+            if mc_process and mc_process.poll() is None:
+                try: _mc_rss = int(psutil.Process(mc_process.pid).memory_info().rss / 1024 / 1024)
+                except Exception: pass
+            phys_avail_mb = max(0, 512 - _panel_rss - _mc_rss)
             swp  = psutil.swap_memory()
-            # Gerçek kullanılabilir = fiziksel boş + swap boş
-            phys_avail_mb = mem.available  // 1024 // 1024
-            swap_free_mb  = swp.free       // 1024 // 1024
+            swap_free_mb  = swp.free // 1024 // 1024
 
-            # Fiziksel RAM kritik eşikte (<80MB) — agresif temizlik
+            # status=starting sırasında sessiz (Cuberite başlatma)
+            if server_state.get("status") == "starting":
+                _consecutive_low = 0
+                continue
+
             if phys_avail_mb < 80:
                 _consecutive_low += 1
                 # Kernel sayfa cache'ini boşalt
