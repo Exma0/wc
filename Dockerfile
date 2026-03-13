@@ -18,9 +18,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl3 libssl-dev \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# ── cloudflared (Cloudflare Tunnel) ─────────────────────────────────────────
+# ── cloudflared (Cloudflare Tunnel — yedek) ─────────────────────────────────
 RUN wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
     -O /usr/local/bin/cloudflared && chmod +x /usr/local/bin/cloudflared
+
+# ── bore (birincil TCP tünel — doğrudan IP:PORT, istemci yazılımı gerektirmez) ──
+RUN wget -q --timeout=60 \
+    "https://github.com/ekzhang/bore/releases/download/v0.5.0/bore-v0.5.0-x86_64-unknown-linux-musl.tar.gz" \
+    -O /tmp/bore.tar.gz \
+    && tar -xzf /tmp/bore.tar.gz -C /usr/local/bin/ bore \
+    && chmod +x /usr/local/bin/bore \
+    && rm -f /tmp/bore.tar.gz \
+    && echo "[Dockerfile] ✅ bore tünel aracı yüklendi" \
+    || echo "[Dockerfile] ⚠️  bore yüklenemedi — runtime'da indirilecek"
 
 # ── Python bağımlılıkları ────────────────────────────────────────────────────
 RUN pip3 install --no-cache-dir --break-system-packages \

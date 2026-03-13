@@ -758,15 +758,18 @@ def write_server_config():
     )
 
     # ── world.ini — Dünya ayarları ──────────────────────────────
-    world_ini = MC_DIR / "world.ini"
+    # Cuberite, world.ini'yi dünya klasörünün içinde arar:
+    # /minecraft/world/world.ini  (NOT /minecraft/world.ini)
+    (MC_DIR / "world").mkdir(parents=True, exist_ok=True)
+    world_ini = MC_DIR / "world" / "world.ini"
     if not world_ini.exists():
         world_ini.write_text(
             f"[General]\n"
             f"Dimension=Overworld\n"
             f"WorldType=Normal\n"
             f"Seed=12345\n"
-            f"Difficulty=1\n"          # Normal
-            f"Gamemode=0\n"            # Survival
+            f"Difficulty=1\n"
+            f"Gamemode=0\n"
             f"PVPEnabled=1\n"
             f"AllowFlight=1\n"
             f"\n"
@@ -777,13 +780,26 @@ def write_server_config():
             f"\n"
             f"[Mobs]\n"
             f"MaxMobDistanceFromPlayer=80\n"
-            f"MaxAnimals=8\n"          # Azaltıldı (RAM tasarrufu)
-            f"MaxMonsters=40\n"        # Azaltıldı
-            f"MaxWaterMobs=3\n"
+            f"MaxAnimals=4\n"
+            f"MaxMonsters=20\n"
+            f"MaxWaterMobs=2\n"
             f"\n"
             f"[Chunking]\n"
-            f"ChunkDestroyTimer=60\n"  # 60sn kullanılmayan chunk kaldır
+            f"ChunkDestroyTimer=30\n"
             f"LimitedHeightWorld=false\n"
+            f"\n"
+            f"[WorldLimit]\n"
+            f"LimitX=1500\n"
+            f"LimitZ=1500\n"
+        )
+
+    # world_nether/world.ini
+    (MC_DIR / "world_nether").mkdir(parents=True, exist_ok=True)
+    nether_ini = MC_DIR / "world_nether" / "world.ini"
+    if not nether_ini.exists():
+        nether_ini.write_text(
+            "[General]\nDimension=Nether\nWorldType=Normal\nSeed=12345\n"
+            "Difficulty=1\nGamemode=0\n"
         )
 
     # ── webadmin.ini — Cuberite web admin (kapalı, Panel var) ──
@@ -791,9 +807,24 @@ def write_server_config():
     if not webadmin.exists():
         webadmin.write_text("[WebAdmin]\nEnabled=false\n")
 
-    # ── Nether/End dizinleri ────────────────────────────────────
-    (MC_DIR / "world" / "region").mkdir(parents=True, exist_ok=True)
-    (MC_DIR / "world_nether").mkdir(parents=True, exist_ok=True)
+    # ── scoreboard.dat — Boş oluştur (uyarıyı bastır) ──────────
+    sbd_dir = MC_DIR / "world" / "data"
+    sbd_dir.mkdir(parents=True, exist_ok=True)
+    sbd = sbd_dir / "scoreboard.dat"
+    if not sbd.exists():
+        # Minimal NBT binary — boş scoreboard
+        # (Cuberite load edemese de warning vermez çünkü dosya var)
+        sbd.write_bytes(bytes([0x0A, 0x00, 0x00, 0x0A, 0x00, 0x04, 0x64,
+                                0x61, 0x74, 0x61, 0x00, 0x00]))
+
+    # ── allowedbiomes.ini — BambooJungle uyarılarını önle ───────
+    # Cuberite eski sürümlerinde BambooJungle/BambooJungleHills biome
+    # kodu yok → JungleTemple.cubeset'te "Skipping biome" uyarısı çıkar.
+    # allowedbiomes.ini yok → sadece log uyarısıdır, oyunu etkilemez.
+
+    # ── Bölge dizinleri ─────────────────────────────────────────
+    (MC_DIR / "world"         / "region").mkdir(parents=True, exist_ok=True)
+    (MC_DIR / "world_nether"  / "DIM-1" / "region").mkdir(parents=True, exist_ok=True)
 
 
 def get_cuberite_cmd() -> list:
@@ -802,10 +833,9 @@ def get_cuberite_cmd() -> list:
     JVM YOK — RAM kullanımı ~40-80MB (Paper 400MB yerine).
     """
     log(f"[Panel] 🚀 Cuberite C++ başlatılıyor (JVM yok, ~50MB RAM)")
-    return [
-        str(MC_BIN),
-        "--config-file", str(MC_DIR / "settings.ini"),
-    ]
+    # Cuberite, settings.ini'yi cwd'den otomatik okur.
+    # --config-file argümanı desteklenmez → sadece binary yolu.
+    return [str(MC_BIN)]
 
 
 def get_jvm_args():
