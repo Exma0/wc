@@ -825,6 +825,7 @@ def download_cuberite() -> bool:
                         log(f"[Panel] ✅ Cuberite kopyalandı: {candidate} → {MC_BIN}")
                     else:
                         log(f"[Panel] ✅ Cuberite hazır: {MC_BIN}")
+                    _patch_cuberite_data()
                     return True
 
             # Binary bulunamazsa tar içinde ara
@@ -835,6 +836,7 @@ def download_cuberite() -> bool:
                     _shutil.copy2(str(f), str(MC_BIN))
                     MC_BIN.chmod(0o755)
                     log(f"[Panel] ✅ Cuberite bulundu ve kopyalandı: {f.parent.name}/Cuberite")
+                    _patch_cuberite_data()
                     return True
 
             log(f"[Panel] ⚠️  Cuberite binary arşiv içinde bulunamadı ({url})")
@@ -845,6 +847,46 @@ def download_cuberite() -> bool:
 
     log("[Panel] ❌ Cuberite indirilemedi! Tüm kaynaklar denendi.")
     return False
+
+
+def _patch_cuberite_data():
+    """
+    Cuberite indirildikten sonra bilinen uyarıları gidermek için data dosyalarını düzeltir.
+
+    1. Protocol/1.13/base.recipes.txt  — Cuberite bu dosyayı içermiyor, boş oluştur
+    2. Protocol/1.14.4/base.recipes.txt — aynı
+    3. JungleTemple.cubeset — BambooJungle ve BambooJungleHills Cuberite'de yok, kaldır
+    """
+    import re as _re
+
+    # ── 1 & 2: Eksik recipe dosyaları ──────────────────────────────
+    for _proto_ver in ("1.13", "1.14.4"):
+        _recipe_path = MC_DIR / "Protocol" / _proto_ver / "base.recipes.txt"
+        if not _recipe_path.exists():
+            try:
+                _recipe_path.parent.mkdir(parents=True, exist_ok=True)
+                _recipe_path.write_text("# Cuberite placeholder — protocol not fully supported\n")
+                log(f"[Panel] Protocol/{_proto_ver}/base.recipes.txt oluşturuldu")
+            except Exception as _e:
+                log(f"[Panel] recipe placeholder yazılamadı ({_proto_ver}): {_e}")
+
+    # ── 3: JungleTemple.cubeset — desteklenmeyen biyomları kaldır ──
+    _cubeset = MC_DIR / "Prefabs" / "SinglePieceStructures" / "JungleTemple.cubeset"
+    if _cubeset.exists():
+        try:
+            _txt = _cubeset.read_text()
+            _original = _txt
+            # "BambooJungle", "BambooJungleHills" değerlerini AllowedBiomes listesinden sil
+            for _bm in ("BambooJungleHills", "BambooJungle"):
+                # virgülle başlayan veya biten satırı temizle
+                _txt = _re.sub(r',\s*"' + _bm + r'"', '', _txt)
+                _txt = _re.sub(r'"' + _bm + r'"\s*,\s*', '', _txt)
+                _txt = _re.sub(r'"' + _bm + r'"', '', _txt)
+            if _txt != _original:
+                _cubeset.write_text(_txt)
+                log("[Panel] JungleTemple.cubeset: BambooJungle biyomları kaldırıldı")
+        except Exception as _e:
+            log(f"[Panel] cubeset patch hatası: {_e}")
 
 
 def download_paper():
@@ -1029,12 +1071,37 @@ def write_server_config():
     except Exception as _ce:
         log(f"[Panel] chmod uyarisi: {_ce}")
 
-    # scoreboard.dat — Geçerli boş JSON yaz; silmek basic_ios::clear hatasına yol açar
-    sbd = MC_DIR / "world" / "data" / "scoreboard.dat"
-    try:
-        sbd.write_text('{"Objectives":[],"Teams":[],"DisplaySlots":{}}')
-        log("[Panel] scoreboard.dat sıfırlandı (boş JSON)")
-    except Exception: pass
+    # scoreboard.dat — Geçerli GZIP+NBT binary yaz
+    # JSON yazmak "Data extraction failed" verir çünkü Cuberite binary NBT bekler
+    def _write_empty_scoreboard(path):
+        import struct, gzip as _gz, io as _io
+        def _nbt_str(s):
+            b = s.encode('utf-8')
+            return struct.pack('>H', len(b)) + b
+        def _nbt_list(name, etype, count):
+            return bytes([9]) + _nbt_str(name) + bytes([etype]) + struct.pack('>i', count)
+        def _nbt_compound(name, payload):
+            return bytes([10]) + _nbt_str(name) + payload + bytes([0])
+        data_payload = (
+            _nbt_list('Objectives',   10, 0) +
+            _nbt_list('PlayerScores', 10, 0) +
+            _nbt_list('Teams',        10, 0) +
+            _nbt_compound('DisplaySlots', b'')
+        )
+        root = bytes([10]) + _nbt_str('') + _nbt_compound('data', data_payload) + bytes([0])
+        buf = _io.BytesIO()
+        with _gz.GzipFile(fileobj=buf, mode='wb', mtime=0) as gz:
+            gz.write(root)
+        path.write_bytes(buf.getvalue())
+
+    for _world in ("world", "world_nether", "world_the_end"):
+        _sbd = MC_DIR / _world / "data" / "scoreboard.dat"
+        if not _sbd.exists():
+            try:
+                _write_empty_scoreboard(_sbd)
+                log(f"[Panel] {_world}/data/scoreboard.dat oluşturuldu (boş NBT)")
+            except Exception as _e:
+                log(f"[Panel] scoreboard.dat yazılamadı ({_world}): {_e}")
 
     # OYUNCU DOSYALARI ASLA SILINMEZ — _clean_player_files() halleder
 
@@ -1062,8 +1129,8 @@ def get_cuberite_cmd() -> list:
         f"\n"
         # İzin ver
         f"chmod -R 777 {MC_DIR}\n"
-        # scoreboard.dat — boş geçerli JSON yaz; silmek basic_ios::clear hatasına yol açar
-        f'printf \'{{\"Objectives\":[],\"Teams\":[],\"DisplaySlots\":{{}}}}\' > {MC_DIR}/world/data/scoreboard.dat\n'
+        # scoreboard.dat — sadece yoksa oluştur (NBT binary _prepare_dirs'da yazılır)
+        f"[ -f {MC_DIR}/world/data/scoreboard.dat ] || true\n"
         # Çalışma dizinine geç
         f"cd {MC_DIR}\n"
         # Başlat
