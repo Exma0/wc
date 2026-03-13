@@ -1415,14 +1415,14 @@ def write_server_config():
         f"[Server]\n"
         f"Ports={MC_PORT}\n"
         f"MaxPlayers=20\n"
-        f"OnlineMode=false\n"        # Render'da auth sunucusuna erişim yok
+        f"OnlineMode=0\n"            # Render'da auth sunucusuna erişim yok (0=offline)
         f"Motd=\u00A7aRender MC • Cuberite 1.8.8\n"
         f"AllowFlight=true\n"
         f"Description=Cuberite 1.8.8 on Render\n"
         f"ShutdownMessage=Server kapaniyor...\n"
         f"\n"
         f"[Authentication]\n"
-        f"Authenticate=false\n"      # Offline mode
+        f"Authenticate=0\n"          # Offline mode — Cuberite INI boolean: 0/1 (false/true geçersiz!)
         f"\n"
         f"[AntiCheat]\n"
         f"LimitPlayerBlockChanges=false\n"
