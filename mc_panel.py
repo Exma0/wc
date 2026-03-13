@@ -176,15 +176,13 @@ def _parse_mc_output(line: str):
         try: _bootstrap_done.set()
         except Exception: pass
 
-    # iostream error → stats/ veya playerdata/ eksik — aninda olustur
+    # iostream error → oyuncu dosyasi yok/bozuk → gercerli JSON olustur
     if "iostream error" in line or "statistics file loading failed" in line:
         threading.Thread(target=_ensure_runtime_dirs, daemon=True).start()
-        # Oyuncu adi bul → o oyuncu icin bos stats/players dosyasi olustur
-        m_kick = re.search(r'Player "?([A-Za-z0-9_]+)"? (?:save|statistics).+failed', line)
-        if m_kick:
-            pname = m_kick.group(1)
+        m_pname = re.search(r'Player "([A-Za-z0-9_]+)"', line)
+        if m_pname:
             threading.Thread(
-                target=_create_player_files, args=(pname,), daemon=True
+                target=_create_player_files, args=(m_pname.group(1),), daemon=True
             ).start()
 
     if "Stopping server" in line or "Shutting down" in line:
@@ -198,26 +196,51 @@ def _players_list():
 
 def _create_player_files(player_name: str):
     """
-    Yeni oyuncu girisi: stats/players dosyasi yok → iostream hatasi → kick.
-    Cozum: bos gecerli JSON dosyalarini onceden olustur, Cuberite hata vermez.
+    Cuberite yeni oyuncu girisi: player JSON yok → iostream → kick.
+    Cozum: Cuberite'in bekledigi GERCERLI minimal player JSON olustur.
+    Bos {} kabul etmiyor — zorunlu alanlar lazim.
     """
+    import json as _j
+    _CUBERITE_PLAYER = {
+        "position": [0.0, 65.0, 0.0],
+        "rotation": [0.0, 0.0, 0.0],
+        "velocity": [0.0, 0.0, 0.0],
+        "health": 20,
+        "foodLevel": 20,
+        "foodSaturationLevel": 5.0,
+        "foodTickTimer": 0,
+        "xpTotal": 0, "xpLevel": 0, "xpP": 0.0, "score": 0,
+        "isHardcore": False,
+        "inventory": {}, "enderchestinventory": {},
+        "world": "world", "gamemode": 2,
+        "SpawnX": 0, "SpawnY": 65, "SpawnZ": 0,
+        "AirLevel": 300, "maxAirLevel": 300,
+        "torchPlacedSinceLastPickup": False
+    }
+    _pjson = _j.dumps(_CUBERITE_PLAYER, indent=2)
     created = []
-    for fpath, default in [
-        (MC_DIR / "players"                    / f"{player_name}.json", "{}"),
-        (MC_DIR / "world" / "data" / "stats"   / f"{player_name}.json", "{}"),
-        (MC_DIR / "world" / "playerdata"       / f"{player_name}.json", "{}"),
-    ]:
-        try:
-            fpath.parent.mkdir(parents=True, exist_ok=True)
-            if not fpath.exists():
-                fpath.write_text(default)
-                created.append(fpath.name)
-        except Exception as e:
-            log(f"[Players] ⚠️  {fpath.name} olusturulamadi: {e}")
+    # Ana player dosyasi
+    pf = MC_DIR / "players" / f"{player_name}.json"
+    pf.parent.mkdir(parents=True, exist_ok=True)
+    if not pf.exists() or pf.stat().st_size < 10:
+        pf.write_text(_pjson)
+        created.append("players/" + pf.name)
+    # stats — Cuberite bos JSON kabul eder
+    sf = MC_DIR / "world" / "data" / "stats" / f"{player_name}.json"
+    sf.parent.mkdir(parents=True, exist_ok=True)
+    if not sf.exists() or sf.stat().st_size < 2:
+        sf.write_text("{}")
+        created.append("stats/" + sf.name)
     if created:
-        log(f"[Players] ✅ {player_name}: {len(created)} profil dosyasi olusturuldu — yeniden baglanabilir")
+        log(f"[Players] ✅ {player_name}: {created} olusturuldu — yeniden baglanabilir")
     else:
-        log(f"[Players] ℹ️  {player_name} dosyalari zaten mevcut")
+        # Dosya var ama Cuberite hala okuyamiyor → sil, yeniden yaz
+        try:
+            pf.write_text(_pjson)
+            log(f"[Players] 🔄 {player_name}: dosya yeniden yazildi")
+        except Exception as _e:
+            log(f"[Players] ❌ {player_name}: {_e}")
+
 
 def _ensure_runtime_dirs():
     """iostream error geldiginde cagrilir — dizinleri aninda garantile."""
