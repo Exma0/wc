@@ -382,12 +382,11 @@ def download_cuberite() -> bool:
     MC_DIR.mkdir(parents=True, exist_ok=True)
 
     URLS = [
-        # Cuberite resmi CI nightly — Linux x86_64
-        "https://builds.liteloader.com/job/Cuberite/job/master/"
-        "lastSuccessfulBuild/artifact/builds/Linux_x86_64/Cuberite.tar.gz",
-        # GitHub releases backup
-        "https://github.com/cuberite/cuberite/releases/latest/download/"
-        "Cuberite-Linux-64bit.tar.gz",
+        # 1. Resmi Cuberite download sunucusu (canonical URL — her zaman güncel)
+        "https://download.cuberite.org/linux-x86_64/Cuberite.tar.gz",
+        # 2. Builds.cuberite.org nightly (ikincil)
+        "https://builds.cuberite.org/job/Cuberite%20Linux%20x64%20Master/"
+        "lastSuccessfulBuild/artifact/Cuberite.tar.gz",
     ]
 
     import tarfile as _tf
@@ -2323,29 +2322,6 @@ def _register_cluster_blueprint():
 if __name__ == "__main__":
     MC_DIR.mkdir(parents=True, exist_ok=True)
     if MC_ONLY:
-        # MC_ONLY=1: Flask yok, minimal HTTP + MC
         _run_mc_only()
     else:
-        # Cuberite C++ ~50MB RAM → İki fazlı başlatmaya GEREK YOK.
-        # Direkt Flask+SocketIO başlat, MC thread'de otomatik başlasın.
-        print(f"[Panel] 🚀 Flask+SocketIO direkt başlatılıyor (Cuberite ~50MB)", flush=True)
-
-        # Arka plan thread'leri
-        threading.Thread(target=_ram_monitor,          daemon=True).start()
-        threading.Thread(target=_ram_watchdog,         daemon=True).start()
-        threading.Thread(target=_pool_health_watchdog, daemon=True).start()
-        threading.Thread(target=_pool_auto_optimize,   daemon=True).start()
-
-        # MC otomatik başlat (Flask hazır olduktan 3sn sonra)
-        def _auto_start_mc():
-            time.sleep(3)
-            print("[Panel] 🎮 MC otomatik başlatılıyor...", flush=True)
-            try:
-                start_server()
-            except Exception as e:
-                print(f"[Panel] ⚠️  MC başlatma hatası: {e}", flush=True)
-        threading.Thread(target=_auto_start_mc, daemon=True).start()
-
-        print(f"[Panel] 🌐 Flask :{PANEL_PORT} başlatılıyor...", flush=True)
-        socketio.run(app, host="0.0.0.0", port=PANEL_PORT,
-                     debug=False, use_reloader=False, log_output=False)
+        _minimal_http_phase()

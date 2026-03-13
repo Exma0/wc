@@ -57,7 +57,7 @@ RUN mkdir -p \
 # Build sırasında indirilirse container soğuk başlatması ~60sn kısalır.
 # İndirme başarısız olursa Python runtime'da download_cuberite() devreye girer.
 RUN wget -q --timeout=120 \
-    "https://builds.liteloader.com/job/Cuberite/job/master/lastSuccessfulBuild/artifact/builds/Linux_x86_64/Cuberite.tar.gz" \
+    "https://download.cuberite.org/linux-x86_64/Cuberite.tar.gz" \
     -O /tmp/cuberite.tar.gz \
     && tar -xzf /tmp/cuberite.tar.gz -C /minecraft \
     && find /minecraft -name "Cuberite" -type f -exec chmod +x {} \; \
