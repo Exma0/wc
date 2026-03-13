@@ -820,28 +820,9 @@ try:
     from flask import Blueprint, request, jsonify, Response
     cluster_api = Blueprint("cluster_api", __name__)
 
-    @cluster_api.route("/api/agent/register", methods=["POST"])
-    def c_register():
-        d = request.json or {}
-        if not d.get("tunnel") or not d.get("node_id"):
-            return jsonify({"ok": False, "error": "tunnel/node_id eksik"}), 400
-        vcluster.register_agent(d["tunnel"], d["node_id"], d)
-        return jsonify({"ok": True})
-
-    @cluster_api.route("/api/agent/heartbeat", methods=["POST"])
-    def c_heartbeat():
-        d = request.json or {}
-        nid = d.get("node_id", "")
-        if not nid:
-            return jsonify({"ok": False, "error": "node_id eksik"}), 400
-        if nid in vcluster._agents:
-            vcluster.heartbeat_agent(nid, d)
-        else:
-            # Yeniden kayıt
-            tunnel = d.get("tunnel") or d.get("url", "")
-            if tunnel:
-                vcluster.register_agent(tunnel, nid, d)
-        return jsonify({"ok": True})
+    # NOT: /api/agent/register ve /api/agent/heartbeat route'ları
+    # mc_panel.py'de tanımlı — burada tanımlamak Flask route çakışmasına yol açar.
+    # mc_panel.py o route'larda vcluster.register_agent() + vcluster.heartbeat_agent() çağırır.
 
     @cluster_api.route("/api/cluster/status")
     def c_status():

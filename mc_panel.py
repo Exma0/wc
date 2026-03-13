@@ -23,18 +23,6 @@ from pathlib import Path
 import eventlet
 eventlet.monkey_patch()
 
-# ── 512MB process limiti ──────────────────────────────────────────────────────
-# Panel (Python) + JVM birlikte 512MB. Python adres alanını 480MB ile kısıtla.
-# JVM ayrı subprocess, UserSwap ile kendi sınırını yönetiyor.
-import resource as _resource
-try:
-    _PANEL_LIMIT = 480 * 1024 * 1024
-    _s, _h = _resource.getrlimit(_resource.RLIMIT_AS)
-    if _h == _resource.RLIM_INFINITY or _h > _PANEL_LIMIT:
-        _resource.setrlimit(_resource.RLIMIT_AS, (_PANEL_LIMIT, _PANEL_LIMIT))
-except Exception:
-    pass
-
 from flask import Flask, request, jsonify, send_file, abort, Response
 from cluster import vcluster, cluster_api
 from flask_socketio import SocketIO, emit
@@ -63,20 +51,12 @@ server_state = {
 _agents: dict = {}
 _agents_lock  = threading.Lock()
 
-import gc as _gc_mod
-
 app = Flask(__name__)
 app.config["SECRET_KEY"] = "mc-panel-secret"
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet",
                     ping_timeout=60, ping_interval=25)
 if cluster_api: app.register_blueprint(cluster_api)
 vcluster.set_socketio(socketio)
-
-@app.after_request
-def _gc_after(resp):
-    """Her response sonrası gen0 GC — panel RAM sürünmesini önle."""
-    _gc_mod.collect(0)
-    return resp
 
 
 # ══════════════════════════════════════════════════════════════
@@ -141,27 +121,11 @@ def _tps_monitor():
 
 def _stdout_reader():
     global mc_process
-    _remap_in_progress = False
-    _remap_done        = False
     while mc_process and mc_process.poll() is None:
         try:
             line = mc_process.stdout.readline()
-            if not line:
-                continue
-            txt = line.decode("utf-8", errors="replace")
-            log(txt)
-            # Remap tespiti
-            if "Remapping server" in txt and not _remap_in_progress:
-                _remap_in_progress = True
-                log("[Panel] 🔄 ReobfServer remapping başladı — UserSwap karşılıyor...")
-            if _remap_in_progress and not _remap_done:
-                if "Applying patches" in txt or "Loading libraries" in txt or "[00:00:" in txt:
-                    _remap_done        = True
-                    _remap_in_progress = False
-                    log("[Panel] ✅ Remapping tamamlandı — cache agent'lara yedekleniyor...")
-                    threading.Thread(
-                        target=vcluster.memory.save_remap_cache, daemon=True
-                    ).start()
+            if line:
+                log(line.decode("utf-8", errors="replace"))
         except Exception:
             break
     server_state["status"] = "stopped"
@@ -458,7 +422,13 @@ def get_jvm_args():
     heap_from_swap = min(768, (sw_mb // 512) * 128)
 
     xmx_mb = heap_from_phys + heap_from_swap
-    xmx_mb = max(180, min(xmx_mb, 1536))   # mutlak alt/üst sınır
+
+    # UserSwap varsa dosyaya taşabilir — minimum 320MB garanti et
+    # UserSwap yoksa 256MB ile güvenli kal
+    us_path = os.environ.get("USERSWAP_SO", "/app/userswap.so")
+    us_ok   = os.path.exists(us_path)
+    xmx_min = 320 if us_ok else 256
+    xmx_mb  = max(xmx_min, min(xmx_mb, 1536))   # mutlak alt/üst sınır
 
     xms_mb = 32   # düşük başlat, JVM ihtiyaca göre büyütsün
 
@@ -522,17 +492,6 @@ def start_server():
             socketio.emit("server_status", server_state)
             return False, "Jar indirilemedi"
     write_server_config()
-
-    # ── Remap cache: agent'lardan geri yükle (remap atlanır) ────────────────
-    if vcluster.agent_count() > 0:
-        log("[Panel] 🔍 Remap cache kontrol ediliyor...")
-        if vcluster.memory.restore_remap_cache():
-            log("[Panel] ✅ Remap cache yüklendi — Paper remapping ATLANABİLİR")
-        else:
-            log("[Panel] ℹ️  Remap cache yok — ilk başlatmada remap yapılacak")
-    else:
-        log("[Panel] ℹ️  Agent bağlı değil — remap cache atlandı")
-
     server_state.update({"status": "starting", "online_players": 0})
     players.clear()
     socketio.emit("server_status", server_state)
@@ -540,9 +499,17 @@ def start_server():
     jvm = get_jvm_args()
     log(f"[Panel] 🚀 Server başlatılıyor...")
     try:
+        def _reset_as_limit():
+            """JVM için adres alanı limitini kaldır — panel limiti JVM'e geçmesin."""
+            try:
+                import resource as _r
+                _r.setrlimit(_r.RLIMIT_AS, (_r.RLIM_INFINITY, _r.RLIM_INFINITY))
+            except Exception:
+                pass
         mc_process = subprocess.Popen(
             jvm, cwd=str(MC_DIR),
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            preexec_fn=_reset_as_limit,
         )
     except Exception as e:
         log(f"[Panel] ❌ Başlatma hatası: {e}")
@@ -590,36 +557,21 @@ def send_command(cmd: str) -> bool:
 def _ram_watchdog():
     """
     Bellek baskısını sürekli izle.
-    Process RSS ile ölç (psutil.virtual_memory() HOST RAM okur → yanıltıcı).
-    Remap sırasında (status=starting) tamamen sus.
+    512MB fiziksel limit aşılmadan swap'a geçilmesini sağla.
     """
     import psutil
     _consecutive_low = 0
     while True:
         eventlet.sleep(4)
         try:
-            # Process RSS: panel + JVM gerçek kullanımı
-            try:
-                _panel_rss = int(psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024)
-            except Exception:
-                _panel_rss = 200
-            _jvm_rss = 0
-            if mc_process and mc_process.poll() is None:
-                try:
-                    _jvm_rss = int(psutil.Process(mc_process.pid).memory_info().rss / 1024 / 1024)
-                except Exception:
-                    pass
-            phys_avail_mb = max(0, 512 - _panel_rss - _jvm_rss)
-            swp           = psutil.swap_memory()
-            swap_free_mb  = swp.free // 1024 // 1024
+            mem  = psutil.virtual_memory()
+            swp  = psutil.swap_memory()
+            # Gerçek kullanılabilir = fiziksel boş + swap boş
+            phys_avail_mb = mem.available  // 1024 // 1024
+            swap_free_mb  = swp.free       // 1024 // 1024
 
-            # Remap sırasında sessiz kal (RAM spike normal)
-            if server_state.get("status") == "starting":
-                _consecutive_low = 0
-                continue
-
-            # Kritik eşik: panel+jvm > 480MB
-            if phys_avail_mb < 32:
+            # Fiziksel RAM kritik eşikte (<80MB) — agresif temizlik
+            if phys_avail_mb < 80:
                 _consecutive_low += 1
                 # Kernel sayfa cache'ini boşalt
                 try: open("/proc/sys/vm/drop_caches","w").write("1")
@@ -745,21 +697,35 @@ def api_agent_register():
     node_id    = d.get("node_id", "")
     if not tunnel_url or not node_id:
         return jsonify({"ok": False, "error": "tunnel veya node_id eksik"})
-    is_new = _pool_register(tunnel_url, node_id, d)
-    if is_new:
-        log(f"[Pool] ✅ Yeni agent: {node_id} | "
-            f"RAM:{d.get('ram',{}).get('free_mb',0)}MB | "
-            f"Disk:{d.get('disk',{}).get('free_gb',0):.1f}GB | "
-            f"CPU:{d.get('cpu',{}).get('cores',0)} core")
+    # İkisi de güncelle: eski _pool + vcluster
+    _pool_register(tunnel_url, node_id, d)
+    vcluster.register_agent(tunnel_url, node_id, d)
+    log(f"[Pool] ✅ Agent kayıt: {node_id} | "
+        f"RAM free:{d.get('ram',{}).get('free_mb',0)}MB | "
+        f"Disk free:{d.get('disk',{}).get('store_free_gb',d.get('disk',{}).get('free_gb',0)):.1f}GB")
     socketio.emit("pool_update", vcluster.summary())
     return jsonify({"ok": True})
 
 
 @app.route("/api/agent/heartbeat", methods=["POST"])
 def api_agent_heartbeat():
-    d = request.json or {}
-    if d.get("node_id") and d.get("tunnel"):
-        _pool_register(d["tunnel"], d["node_id"], d)
+    d      = request.json or {}
+    nid    = d.get("node_id", "")
+    tunnel = d.get("tunnel", "")
+    if not nid:
+        return jsonify({"ok": True})
+    if tunnel:
+        # Tunnel URL var → tam kayıt / güncelle
+        _pool_register(tunnel, nid, d)
+        vcluster.register_agent(tunnel, nid, d)
+    else:
+        # Tunnel yok (Render EXTERNAL_URL henüz set olmamış) → sadece info güncelle
+        with vcluster._lock:
+            if nid in vcluster._agents:
+                vcluster._agents[nid]["info"]       = d
+                vcluster._agents[nid]["last_ping"]  = __import__("time").time()
+                vcluster._agents[nid]["healthy"]    = True
+                vcluster._agents[nid]["fail_count"] = 0
     socketio.emit("pool_update", vcluster.summary())
     return jsonify({"ok": True})
 
