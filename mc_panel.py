@@ -280,7 +280,7 @@ def _best_agent_by_disk() -> dict | None:
         agents = [a for a in _agents.values() if a["healthy"]]
     if not agents:
         return None
-    return max(agents, key=lambda a: a["info"].get("disk", {}).get("free_gb", 0))
+    return max(agents, key=lambda a: a["info"].get("disk", {}).get("store_free_gb", 0))
 
 
 def _best_agent_by_ram() -> dict | None:
@@ -303,10 +303,15 @@ def _pool_health_watchdog():
                 ag["info"]      = r
                 ag["healthy"]   = True
                 ag["last_ping"] = time.time()
+                # vcluster._agents ile senkronize et
+                vcluster.heartbeat_agent(ag["node_id"], r)
             else:
                 # 90sn yanıt yoksa unhealthy
                 if time.time() - ag["last_ping"] > 90:
                     ag["healthy"] = False
+                    with vcluster._lock:
+                        if ag["node_id"] in vcluster._agents:
+                            vcluster._agents[ag["node_id"]]["healthy"] = False
         socketio.emit("pool_update", vcluster.summary())
 
 
@@ -316,7 +321,7 @@ def _pool_auto_optimize():
     1. Eski region'ları agent'a taşı → ana sunucuda disk aç → swap büyüt
     2. Düşük RAM'de JVM dışı cache devreye girer
     """
-    time.sleep(120)   # Sunucu stabil olana kadar bekle
+    time.sleep(30)    # Sunucu stabil olana kadar bekle
     while True:
         try:
             _auto_archive_old_regions()
@@ -325,7 +330,7 @@ def _pool_auto_optimize():
         time.sleep(600)   # 10 dakikada bir
 
 
-def _auto_archive_old_regions(older_than_days: int = 5):
+def _auto_archive_old_regions(older_than_days: int = 2):
     import shutil as _sh
     best = _best_agent_by_disk()
     if not best:
@@ -340,8 +345,8 @@ def _auto_archive_old_regions(older_than_days: int = 5):
         mc_used_gb = 0.0
     render_limit_gb = float(os.environ.get("RENDER_DISK_LIMIT_GB", "18.0"))
     used_gb = 4.0 + mc_used_gb
-    if used_gb < render_limit_gb * 0.65:
-        return  # Disk %65'ten az doluysa gerek yok
+    if used_gb < render_limit_gb * 0.50:
+        return  # Disk %50'den az doluysa gerek yok
 
     archived  = 0
     freed_mb  = 0
@@ -488,13 +493,12 @@ def write_server_config():
     settings.write_text(
         f"[Server]\n"
         f"Ports={MC_PORT}\n"
-        f"MaxPlayers=10\n"           # 20→10: her oyuncu ~3MB Lua belleği
+        f"MaxPlayers=20\n"
         f"OnlineMode=false\n"        # Render'da auth sunucusuna erişim yok
         f"Motd=\u00A7aRender MC • Cuberite 1.8.8\n"
         f"AllowFlight=true\n"
         f"Description=Cuberite 1.8.8 on Render\n"
         f"ShutdownMessage=Server kapaniyor...\n"
-        f"MaxViewDistance=4\n"       # 10→4: 400→64 chunk/oyuncu — Lua OOM önlemi
         f"\n"
         f"[Authentication]\n"
         f"Authenticate=false\n"      # Offline mode
@@ -502,76 +506,54 @@ def write_server_config():
         f"[AntiCheat]\n"
         f"LimitPlayerBlockChanges=false\n"
         f"AllowFlight=true\n"
-        f"\n"
-        f"[Worlds]\n"
-        f"DefaultWorld=world\n"
-        f"World=world\n"
-        # Nether ve End KAPATILDI — her dünya ~30MB Lua + chunk belleği
     )
 
-    # ── world.ini — Dünya ayarları (her başlatmada yaz) ─────────
+    # ── world.ini — Dünya ayarları ──────────────────────────────
     world_ini = MC_DIR / "world.ini"
-    world_ini.write_text(
-        f"[General]\n"
-        f"Dimension=Overworld\n"
-        f"WorldType=Normal\n"
-        f"Seed=12345\n"
-        f"Difficulty=1\n"
-        f"Gamemode=0\n"
-        f"PVPEnabled=1\n"
-        f"AllowFlight=1\n"
-        f"\n"
-        f"[SpawnPosition]\n"
-        f"X=0\n"
-        f"Y=64\n"
-        f"Z=0\n"
-        f"\n"
-        f"[Mobs]\n"
-        f"MaxMobDistanceFromPlayer=50\n"  # 80→50
-        f"MaxAnimals=4\n"               # 8→4 Lua belleği
-        f"MaxMonsters=20\n"             # 40→20
-        f"MaxWaterMobs=2\n"
-        f"\n"
-        f"[Chunking]\n"
-        f"ChunkDestroyTimer=30\n"       # 60→30sn: chunk'ları daha hızlı boşalt
-        f"LimitedHeightWorld=false\n"
-        f"MaxLoadedChunks=200\n"        # Maksimum yüklü chunk sayısı
-    )
+    if not world_ini.exists():
+        world_ini.write_text(
+            f"[General]\n"
+            f"Dimension=Overworld\n"
+            f"WorldType=Normal\n"
+            f"Seed=12345\n"
+            f"Difficulty=1\n"          # Normal
+            f"Gamemode=0\n"            # Survival
+            f"PVPEnabled=1\n"
+            f"AllowFlight=1\n"
+            f"\n"
+            f"[SpawnPosition]\n"
+            f"X=0\n"
+            f"Y=64\n"
+            f"Z=0\n"
+            f"\n"
+            f"[Mobs]\n"
+            f"MaxMobDistanceFromPlayer=80\n"
+            f"MaxAnimals=8\n"          # Azaltıldı (RAM tasarrufu)
+            f"MaxMonsters=40\n"        # Azaltıldı
+            f"MaxWaterMobs=3\n"
+            f"\n"
+            f"[Chunking]\n"
+            f"ChunkDestroyTimer=60\n"  # 60sn kullanılmayan chunk kaldır
+            f"LimitedHeightWorld=false\n"
+        )
 
     # ── webadmin.ini — Cuberite web admin (kapalı, Panel var) ──
     webadmin = MC_DIR / "webadmin.ini"
     if not webadmin.exists():
         webadmin.write_text("[WebAdmin]\nEnabled=false\n")
 
-    # ── Temel dizinler ──────────────────────────────────────────
+    # ── Nether/End dizinleri ────────────────────────────────────
     (MC_DIR / "world" / "region").mkdir(parents=True, exist_ok=True)
-    # world_nether ve world_the_end KAPATILDI (RAM tasarrufu)
-    # scoreboard.dat bozuksa Lua crash yapar — her başlatmada temizle
-    for _corrupted in [
-        MC_DIR / "world" / "data" / "scoreboard.dat",
-        MC_DIR / "scoreboard.dat",
-    ]:
-        if _corrupted.exists():
-            try:
-                _corrupted.unlink()
-                log(f"[Panel] 🗑️  Temizlendi: {_corrupted.name}")
-            except Exception:
-                pass
+    (MC_DIR / "world_nether").mkdir(parents=True, exist_ok=True)
 
 
 def get_cuberite_cmd() -> list:
     """
     Cuberite C++ binary çalıştırma komutu.
     JVM YOK — RAM kullanımı ~40-80MB (Paper 400MB yerine).
-    MALLOC_ARENA_MAX=1 → memory fragmentation azaltır.
-    MALLOC_MMAP_THRESHOLD_ → küçük alloc'lar mmap'e gitmez → daha az RSS.
     """
-    log(f"[Panel] 🚀 Cuberite C++ başlatılıyor (JVM yok, ~50-80MB RSS)")
+    log(f"[Panel] 🚀 Cuberite C++ başlatılıyor (JVM yok, ~50MB RAM)")
     return [
-        "env",
-        "MALLOC_ARENA_MAX=1",
-        "MALLOC_MMAP_THRESHOLD_=131072",
-        "MALLOC_TRIM_THRESHOLD_=131072",
         str(MC_BIN),
         "--config-file", str(MC_DIR / "settings.ini"),
     ]
@@ -659,7 +641,7 @@ def stop_server(force=False):
     if force:
         mc_process.kill()
     else:
-        send_command("save"); time.sleep(1); send_command("stop")  # Cuberite: slash olmadan
+        send_command("save"); time.sleep(1); send_command("stop")
     return True, "Durduruluyor..."
 
 
@@ -673,6 +655,23 @@ def send_command(cmd: str) -> bool:
             return True
         except: pass
     return False
+
+
+def _push_to_agent_cache(data: bytes, key: str) -> bool:
+    """Veriyi en boş RAM'li agent'a gönder."""
+    best = _best_agent_by_ram()
+    if not best:
+        return False
+    try:
+        req = _urllib_req.Request(
+            best["url"] + f"/api/cache/{key}",
+            data=data, method="PUT",
+            headers={"Content-Type": "application/octet-stream"},
+        )
+        _urllib_req.urlopen(req, timeout=30)
+        return True
+    except Exception:
+        return False
 
 
 def _ram_watchdog():
@@ -707,14 +706,16 @@ def _ram_watchdog():
                     send_command("kill @e[type=experience_orb]")
                 if _consecutive_low >= 6:
                     send_command("save")
-                    # View distance'ı geçici düşür
-                    send_command("minecraft:view-distance 4")
+                    # View distance'ı geçici düşür (Cuberite komutu yok, sadece log)
+                    log("[Panel] ⚠️  RAM kritik — view distance düşürülemiyor (Cuberite)")
                 log(f"[Panel] ⚠️  RAM kritik: phys={phys_avail_mb}MB swap_free={swap_free_mb}MB")
 
             elif phys_avail_mb < 150:
                 _consecutive_low = max(0, _consecutive_low - 1)
                 try: open("/proc/sys/vm/drop_caches","w").write("1")
                 except: pass
+                # RAM baskısı var → eski region'ları agent'a taşı
+                threading.Thread(target=_auto_archive_old_regions, args=(1,), daemon=True).start()
 
             else:
                 _consecutive_low = 0
@@ -840,11 +841,16 @@ def api_agent_heartbeat():
         _pool_register(tunnel, nid, d)
         vcluster.register_agent(tunnel, nid, d)
     else:
-        # Tunnel yok (Render EXTERNAL_URL henüz set olmamış) → sadece info güncelle
+        # Tunnel yok → sadece mevcut kaydı güncelle
+        with _agents_lock:
+            if nid in _agents:
+                _agents[nid]["info"]      = d
+                _agents[nid]["last_ping"] = time.time()
+                _agents[nid]["healthy"]   = True
         with vcluster._lock:
             if nid in vcluster._agents:
                 vcluster._agents[nid]["info"]       = d
-                vcluster._agents[nid]["last_ping"]  = __import__("time").time()
+                vcluster._agents[nid]["last_ping"]  = time.time()
                 vcluster._agents[nid]["healthy"]    = True
                 vcluster._agents[nid]["fail_count"] = 0
     socketio.emit("pool_update", vcluster.summary())
@@ -1221,7 +1227,7 @@ def api_world_backup():
     if not src.exists(): return jsonify({"ok":False,"error":"Dünya bulunamadı"})
     ts=datetime.now().strftime("%Y%m%d_%H%M%S"); dest=MC_DIR/"backups"/f"{world}_{ts}.zip"
     dest.parent.mkdir(exist_ok=True)
-    # save-off Cuberite'de yok; time.sleep(1); send_command("save"); time.sleep(2)
+    send_command("save"); time.sleep(2)
     with zipfile.ZipFile(str(dest),"w",zipfile.ZIP_DEFLATED) as z:
         for fp in src.rglob("*"):
             if fp.is_file(): z.write(fp,fp.relative_to(MC_DIR))
@@ -1876,9 +1882,13 @@ function setTunnel(d){
 function copyAddr(){if(mcAddr){navigator.clipboard.writeText(mcAddr);notify('Kopyalandı!','ok');}}
 
 function updatePool(d){
-  poolData=d||{total:0,healthy:0,resources:{},agents:[]};
-  const h=poolData.healthy||0,res=poolData.resources||{};
-  const cacheMB=res.cache_used_mb||0,diskGB=res.disk_free_gb||0,cpu=res.cpu_cores||0;
+  poolData=d||{total:0,healthy:0,virtual_machine:{},disk:{},cpu:{},agents:[]};
+  const h=poolData.healthy||0;
+  // vcluster.summary() → virtual_machine / disk / cpu anahtarları
+  const vm=poolData.virtual_machine||{}, dsk=poolData.disk||{}, cpuStat=poolData.cpu||{};
+  const cacheMB=(vm.agent_cache_mb||0)+(vm.local_cache_mb||0),
+        diskGB=dsk.remote_gb||0,
+        cpu=cpuStat.total_cores||0;
   // topbar
   document.getElementById('tb-agents').textContent=h;
   document.getElementById('tb-cache').textContent=cacheMB+'MB';
@@ -2171,7 +2181,7 @@ def _run_mc_only():
                         mc_process.kill()
                     else:
                         try:
-                            mc_process.stdin.write(b"save\nstop\n")  # Cuberite: slash yok, save komutu
+                            mc_process.stdin.write(b"save\nstop\n")
                             mc_process.stdin.flush()
                         except Exception: pass
                     self._send(200, {"ok": True, "msg": "Durduruluyor"})
