@@ -1135,7 +1135,8 @@ class _H(http.server.BaseHTTPRequestHandler):
 
 
 def run_http():
-    srv = http.server.HTTPServer(("0.0.0.0", HTTP_PORT), _H)
+    # HTTPServer yerine ThreadingHTTPServer kullanıyoruz
+    srv = http.server.ThreadingHTTPServer(("0.0.0.0", HTTP_PORT), _H)
     print(f"[HTTP] Port {HTTP_PORT}")
     srv.serve_forever()
 
