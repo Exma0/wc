@@ -334,6 +334,7 @@ PID_ENT_TELEPORT  = 0x18
 PID_ENT_STATUS    = 0x1A
 PID_MULTI_BLK     = 0x22
 PID_BLOCK_CHG     = 0x23
+PID_PLAYER_INFO   = 0x38
 PID_LOGIN_OK      = 0x02
 PID_SET_COMP      = 0x03
 PID_USE_ENTITY    = 0x02
@@ -459,9 +460,26 @@ cs_state = CrossServerState()
 def _ang(deg): return struct.pack("B", int(deg / 360.0 * 256) & 0xFF)
 def _fp(coord): return struct.pack(">i", int(coord * 32))
 
+def pkt_player_info_add(info, comp=-1):
+    u = _uuid_mod.UUID(info.uuid_str)
+    action = vi_enc(0) # 0 = Add Player
+    count = vi_enc(1)
+    # UUID (16 bytes) + Name (String) + Prop Count (0) + Gamemode (0) + Ping (0) + Has Display Name (0)
+    player = u.bytes + mc_str_enc(info.username) + vi_enc(0) + vi_enc(0) + vi_enc(0) + bytes([0])
+    return pkt_make(PID_PLAYER_INFO, action + count + player, comp)
+
+def pkt_player_info_remove(info, comp=-1):
+    u = _uuid_mod.UUID(info.uuid_str)
+    action = vi_enc(4) # 4 = Remove Player
+    count = vi_enc(1)
+    player = u.bytes
+    return pkt_make(PID_PLAYER_INFO, action + count + player, comp)
+
 def pkt_spawn_player(info, comp=-1):
-    payload = (vi_enc(info.virtual_eid) + mc_str_enc(info.uuid_str) + mc_str_enc(info.username) +
-        vi_enc(0) + _fp(info.x) + _fp(info.y) + _fp(info.z) + _ang(info.yaw) + _ang(info.pitch) +
+    u = _uuid_mod.UUID(info.uuid_str)
+    # 1.8 Protokolü: EID + UUID(16 byte) + X + Y + Z + Yaw + Pitch + Item(Short) + Metadata End(0x7F)
+    payload = (vi_enc(info.virtual_eid) + u.bytes +
+        _fp(info.x) + _fp(info.y) + _fp(info.z) + _ang(info.yaw) + _ang(info.pitch) +
         struct.pack(">h", 0) + bytes([0x7F]))
     return pkt_make(PID_SPAWN_PLAYER, payload, comp)
 
@@ -502,13 +520,16 @@ async def bcast_spawn(new_conn):
     peers = _cross_peers(new_conn)
     for c in peers:
         if c.cs_info:
-            try: new_conn.client_w.write(pkt_spawn_player(c.cs_info, new_conn.comp))
+            try: 
+                new_conn.client_w.write(pkt_player_info_add(c.cs_info, new_conn.comp))
+                new_conn.client_w.write(pkt_spawn_player(c.cs_info, new_conn.comp))
             except Exception: pass
     if peers:
         try: await new_conn.client_w.drain()
         except Exception: pass
     for c in peers:
         try:
+            c.client_w.write(pkt_player_info_add(info, c.comp))
             c.client_w.write(pkt_spawn_player(info, c.comp))
             await c.client_w.drain()
         except Exception: pass
@@ -530,6 +551,7 @@ async def bcast_despawn(leaver):
     for c in peers:
         try:
             c.client_w.write(pkt_destroy_entity(info.virtual_eid, c.comp))
+            c.client_w.write(pkt_player_info_remove(info, c.comp))
             await c.client_w.drain()
         except Exception: pass
 
