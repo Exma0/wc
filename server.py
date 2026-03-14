@@ -60,7 +60,7 @@ Port=8081
 
 WORLD_INI = """
 [General]
-Gamemode=0
+Gamemode=1
 WorldType=FLAT
 AllowCommands=1
 AllowFlight=1
@@ -72,7 +72,7 @@ UseChatPrefixes=1
 [SpawnPosition]
 MaxViewDistance=4
 X=0
-Y=64
+Y=5
 Z=0
 
 [Lighting]
@@ -90,6 +90,40 @@ ChangeWeather=0
 
 [Tick]
 TicksPerSecond=20
+
+[Generator]
+Generator=Flat
+Blocks=7
+BiomeGen=Constant
+ConstantBiome=Plains
+
+[Finishers]
+Animals=0
+BottomLava=0
+DeadBushes=0
+DoublePlants=0
+FallenTrees=0
+Ice=0
+LavaLakes=0
+LavaSprings=0
+Lilypads=0
+Melons=0
+Mineshafts=0
+MonsterPits=0
+Mushrooms=0
+OreNests=0
+Plants=0
+Pumpkins=0
+Ravines=0
+Snow=0
+StrongHolds=0
+Sugarcane=0
+TallGrass=0
+Trees=0
+Villages=0
+Vines=0
+WaterLakes=0
+WaterSprings=0
 """.strip()
 
 GROUPS_INI = """
