@@ -1,26 +1,42 @@
 services:
+
+  # ══════════════════════════════════════════════════════════════
+  #  ANA PROXY  —  wc-tsgd.onrender.com  (bir kere kurulur)
+  # ══════════════════════════════════════════════════════════════
   - type: web
-    name: cuberite-minecraft
+    name: wc-tsgd
     runtime: docker
     dockerfilePath: ./Dockerfile
-
-    # Render.com en düşük plan (512MB RAM) yeterli
-    plan: free          # free = 512MB RAM, 0.1 CPU
-    # Daha iyi performans için: starter (512MB), standard (2GB)
-
-    # Render.com HTTP port
+    plan: free
     envVars:
       - key: PORT
         value: "8080"
-
-    # Disk: Cuberite ~30MB, world data ~20MB → 1GB yeter
+      - key: ENGINE_MODE
+        value: proxy
+      - key: DATA_DIR
+        value: /data
     disk:
-      name: mc-data
-      mountPath: /server/world
-      sizeGB: 1           # Minimum disk (dünya verisi burada kalıcı)
-
-    # Sağlık kontrolü
+      name: proxy-state
+      mountPath: /data
+      sizeGB: 1
     healthCheckPath: /
+    autoDeploy: true
 
-    # Auto-deploy: her push'ta yeniden dağıt
+  # ══════════════════════════════════════════════════════════════
+  #  GAMESERVER  —  yeni sunucu açmak için sadece bu bloğu kopyala
+  #  Başka HİÇBİR ŞEY değiştirme — proxy, etiket otomatik ayarlanır
+  # ══════════════════════════════════════════════════════════════
+  - type: web
+    name: wc-gameserver-1
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    envVars:
+      - key: PORT
+        value: "8080"
+    disk:
+      name: gs1-world
+      mountPath: /server/world
+      sizeGB: 1
+    healthCheckPath: /
     autoDeploy: true
