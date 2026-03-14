@@ -1,23 +1,24 @@
 #!/bin/bash
-# Otomatik başlatıcı — yeni sunucu açınca hiçbir şey değiştirme
+# Otomatik başlatıcı — Render hostname'e göre otomatik mod seçer
 
-MODE="${ENGINE_MODE:-gameserver}"
-
-if [ "$MODE" = "proxy" ]; then
-    export DATA_DIR="${DATA_DIR:-/data}"
-    echo "[START] Proxy modu — wc-tsgd ana sunucu"
+# Render'daki URL'miz wc-yccy ise otomatik Proxy moduna geç
+if [[ "$RENDER_EXTERNAL_HOSTNAME" == *"wc-yccy"* ]]; then
+    export ENGINE_MODE="proxy"
+    export DATA_DIR="/data"
+    echo "[START] Otomatik Proxy modu algilandi: $RENDER_EXTERNAL_HOSTNAME"
 else
-    export ENGINE_MODE=gameserver
-    export SERVER_DIR="${SERVER_DIR:-/server}"
-    export DATA_DIR="${DATA_DIR:-/server/world}"
-
-    # Ana proxy — sabit, değişmez
+    # Farklı bir sunucuda çalışıyorsa GameServer moduna geç
+    export ENGINE_MODE="gameserver"
+    export SERVER_DIR="/server"
+    export DATA_DIR="/server/world"
+    
+    # Ana proxy adresimiz sabit
     export PROXY_URL="https://wc-yccy.onrender.com"
-
+    
     # Etiket: hostname'den otomatik üret (her Render servisi unique hostname alır)
     export SERVER_LABEL="${SERVER_LABEL:-$(hostname)}"
-
-    echo "[START] GameServer modu — Proxy: $PROXY_URL — Etiket: $SERVER_LABEL"
+    
+    echo "[START] GameServer modu algilandi — Proxy: $PROXY_URL — Etiket: $SERVER_LABEL"
 fi
 
 exec python3 /engine.py
