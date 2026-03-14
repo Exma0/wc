@@ -24,21 +24,27 @@ MC_DIR=$(dirname "$MC_BIN")
 chmod +x "$MC_BIN"
 echo "[✓] Cuberite: $MC_BIN  |  Dizin: $MC_DIR"
 
-# ─── 3. Eski dünya verisini sil ─────────────────────
-# render.yaml'da disk /server/world'e mount edilmiş
-# rm -rf mount point'i silemez → içini temizle
-echo "[✓] Eski dünya verisi temizleniyor..."
-# Olası tüm world klasörlerini temizle
+# ─── 3. Sadece chunk verisini sil, oyuncu verisini KORU ───
+# Cuberite dünya klasörü yapısı:
+#   world/regions/   ← chunk/terrain verisi  → SİL (yeni dünya)
+#   world/players/   ← envanter/konum        → KORU
+#   world/world.ini  ← config                → KORU (server.py yazar)
+#
+echo "[✓] Chunk verisi temizleniyor (oyuncu verisi korunuyor)..."
 for WORLD_PATH in "/server/world" "/server/Server/world" "$MC_DIR/world"; do
     if [ -d "$WORLD_PATH" ]; then
-        echo "[✓] Temizleniyor: $WORLD_PATH"
-        find "$WORLD_PATH" -mindepth 1 -delete 2>/dev/null || true
+        # Sadece terrain/chunk klasörlerini sil
+        rm -rf "$WORLD_PATH/regions"      2>/dev/null || true
+        rm -rf "$WORLD_PATH/nether"       2>/dev/null || true
+        rm -rf "$WORLD_PATH/nether_nether" 2>/dev/null || true
+        rm -rf "$WORLD_PATH/end"          2>/dev/null || true
+        rm -f  "$WORLD_PATH"/*.mca        2>/dev/null || true
+        rm -f  "$WORLD_PATH"/*.mcr        2>/dev/null || true
+        echo "[✓] Chunk temizlendi: $WORLD_PATH  (players/ korundu)"
     fi
 done
-# world.ini'yi yeniden yaz (server.py zaten yazıyor ama emin olalım)
-mkdir -p /server/world
-python3 /server.py config
-echo "[✓] Dünya verisi tamamen sıfırlandı."
+mkdir -p /server/world/players
+echo "[✓] Oyuncu verisi güvende, yeni dünya oluşturulacak."
 
 # ─── 4. HTTP Durum Sayfası ──────────────────────────
 echo "[✓] HTTP durum sayfası başlatılıyor (port 8080)..."
