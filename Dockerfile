@@ -1,7 +1,7 @@
 FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    wget curl ca-certificates python3 \
+    wget curl ca-certificates python3 libstdc++6 \
     && rm -rf /var/lib/apt/lists/*
 
 # bore tunnel
