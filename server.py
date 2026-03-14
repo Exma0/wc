@@ -134,6 +134,8 @@ def write_configs(server_dir: str = "/server") -> None:
         f"{server_dir}/webadmin.ini":      WEBADMIN_INI,
         f"{server_dir}/world/world.ini":   WORLD_INI,
         f"{server_dir}/groups.ini":        GROUPS_INI,
+        # Render.com disk mount path — her ihtimale karşı buraya da yaz
+        "/server/world/world.ini":         WORLD_INI,
     }
 
     for path, content in files.items():

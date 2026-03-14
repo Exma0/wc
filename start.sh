@@ -25,10 +25,20 @@ chmod +x "$MC_BIN"
 echo "[✓] Cuberite: $MC_BIN  |  Dizin: $MC_DIR"
 
 # ─── 3. Eski dünya verisini sil ─────────────────────
+# render.yaml'da disk /server/world'e mount edilmiş
+# rm -rf mount point'i silemez → içini temizle
 echo "[✓] Eski dünya verisi temizleniyor..."
-rm -rf "$MC_DIR/world"
-mkdir -p "$MC_DIR/world"
-echo "[✓] Dünya klasörü sıfırlandı."
+# Olası tüm world klasörlerini temizle
+for WORLD_PATH in "/server/world" "/server/Server/world" "$MC_DIR/world"; do
+    if [ -d "$WORLD_PATH" ]; then
+        echo "[✓] Temizleniyor: $WORLD_PATH"
+        find "$WORLD_PATH" -mindepth 1 -delete 2>/dev/null || true
+    fi
+done
+# world.ini'yi yeniden yaz (server.py zaten yazıyor ama emin olalım)
+mkdir -p /server/world
+python3 /server.py config
+echo "[✓] Dünya verisi tamamen sıfırlandı."
 
 # ─── 4. HTTP Durum Sayfası ──────────────────────────
 echo "[✓] HTTP durum sayfası başlatılıyor (port 8080)..."
