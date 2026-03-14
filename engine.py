@@ -5,7 +5,7 @@
   • MC 1.8 offline protokol MITM (şifresiz → tam kontrol)
   • Cross-server entity sync (PvP, Chat, Blok)
   • Anti-Dupe: 10 Saniyede Bir Otomatik Kayıt
-  • Stabilizasyon: Port Düzeltmesi (Port vs Ports), NPE Delay Koruması
+  • Stabilizasyon: TCP Ping Düzeltmesi, Compression Kapalı, Plugin Eklendi
 """
 
 import asyncio, json, os, pathlib, struct, sys
@@ -69,7 +69,6 @@ if "wc-yccy" in os.environ.get("RENDER_EXTERNAL_HOSTNAME", ""):
 HTTP_PORT     = int(os.environ.get("PORT", 8080))
 MC_PORT       = int(os.environ.get("MC_PORT", 25565))
 
-# ALL modunda Cuberite'in Proxy ile port çakışması yapmasını engeller
 CUBERITE_PORT = 25566 if MODE == "all" else MC_PORT
 
 DATA_DIR      = os.environ.get("DATA_DIR", "/data")
@@ -80,7 +79,7 @@ BACKENDS_FILE = f"{DATA_DIR}/backends.json"
 
 _current_bore_addr = None
 
-# 1. DÜZELTME: Cuberite ayarlarında 'Ports' yerine 'Port' kullanıldı
+# PROXY DÜZELTMESİ: yavar plugini eklendi ve Compression kapatıldı (-1)
 SETTINGS_INI = f"""
 [Authentication]
 Authenticate=0
@@ -90,13 +89,14 @@ PlayerRestrictIP=0
 
 [Plugins]
 Plugin=WCSync
+Plugin=yaver
 
 [Server]
 Description=Distributed World Engine
 MaxPlayers=999
 Port={CUBERITE_PORT}
 Ports={CUBERITE_PORT}
-NetworkCompressionThreshold=256 
+NetworkCompressionThreshold=-1
 
 [Worlds]
 DefaultWorld=world
@@ -252,7 +252,7 @@ def write_configs(server_dir=SERVER_DIR):
         except Exception as e: pass
 
 # ══════════════════════════════════════════════════════════
-#  MC 1.8 PROTOKOLü  (protocol 47, offline = sifresiz)
+#  MC 1.8 PROTOKOLü
 # ══════════════════════════════════════════════════════════
 
 def vi_enc(v):
@@ -564,16 +564,14 @@ def save_backends(b):
     pathlib.Path(BACKENDS_FILE).parent.mkdir(parents=True, exist_ok=True)
     pathlib.Path(BACKENDS_FILE).write_text(json.dumps(b, indent=2))
 
+# PROXY DÜZELTMESİ: TCP bağlantısı yeterli (Fake handshake beklemeye gerek yok)
 async def check_backend_alive(host, port):
     try:
-        reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=2.0)
-        hs = vi_enc(47) + mc_str_enc("127.0.0.1") + struct.pack(">H", int(port)) + vi_enc(1)
-        writer.write(pkt_make(0x00, hs, -1))
-        writer.write(pkt_make(0x00, b"", -1))
-        await writer.drain()
-        data = await asyncio.wait_for(reader.read(10), timeout=2.0)
+        reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=3.0)
         writer.close()
-        return len(data) > 0
+        try: await writer.wait_closed()
+        except Exception: pass
+        return True
     except Exception:
         return False
 
@@ -1431,7 +1429,7 @@ def run_cuberite():
                             p.parent.mkdir(parents=True, exist_ok=True)
                             p.write_bytes(data)
                             
-                        # 2. DÜZELTME: Oyuncu haritaya tam düşmeden önce NPE almaması için 2 sn bekleme
+                        # NPE Delay Koruması
                         def _delayed_reload():
                             time.sleep(2.0)
                             try:
