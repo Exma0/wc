@@ -5,7 +5,7 @@
   • MC 1.8 offline protokol MITM (şifresiz → tam kontrol)
   • Cross-server entity sync (PvP, Chat, Blok)
   • Anti-Dupe: 10 Saniyede Bir Otomatik Kayıt
-  • Stabilizasyon: Port Kurtarma (SO_REUSEPORT), Drain Lock ve RAM Sızıntı koruması
+  • Stabilizasyon: Port Düzeltmesi (Port vs Ports), NPE Delay Koruması
 """
 
 import asyncio, json, os, pathlib, struct, sys
@@ -80,6 +80,7 @@ BACKENDS_FILE = f"{DATA_DIR}/backends.json"
 
 _current_bore_addr = None
 
+# 1. DÜZELTME: Cuberite ayarlarında 'Ports' yerine 'Port' kullanıldı
 SETTINGS_INI = f"""
 [Authentication]
 Authenticate=0
@@ -93,6 +94,7 @@ Plugin=WCSync
 [Server]
 Description=Distributed World Engine
 MaxPlayers=999
+Port={CUBERITE_PORT}
 Ports={CUBERITE_PORT}
 NetworkCompressionThreshold=256 
 
@@ -348,7 +350,7 @@ PID_PLAYER_LOOK   = 0x05
 PID_PLAYER_PL     = 0x06
 
 # ══════════════════════════════════════════════════════════
-#  PAYLAŞIMLI DÜNYA STATE (RAM LIMIT: MAX 50,000 BLOK)
+#  PAYLAŞIMLI DÜNYA STATE
 # ══════════════════════════════════════════════════════════
 
 class WorldState:
@@ -507,7 +509,7 @@ def pkt_chat_msg(text, color="yellow", comp=-1):
     return pkt_make(PID_CHAT_SC, mc_str_enc(json.dumps({"text": text, "color": color})) + bytes([0]), comp)
 
 # ══════════════════════════════════════════════════════════
-#  AKTIF BAGLANTILAR + BROADCAST (NON-BLOCKING)
+#  AKTIF BAGLANTILAR + BROADCAST
 # ══════════════════════════════════════════════════════════
 
 _active_lock = asyncio.Lock()
@@ -535,8 +537,7 @@ async def bcast_spawn(new_conn, info):
 
 async def bcast_move(info, peers):
     for c in peers:
-        try:
-            c.client_w.write(pkt_entity_teleport(info, c.comp))
+        try: c.client_w.write(pkt_entity_teleport(info, c.comp))
         except Exception: pass
 
 async def bcast_despawn(info, peers):
@@ -1243,7 +1244,6 @@ class _H(http.server.BaseHTTPRequestHandler):
     def handle_error(self, request, client_address): pass
     def log_message(self, *_): pass
 
-# STABILIZASYON: HTTP server hata verse bile zorla portu devralir
 def run_http():
     http.server.ThreadingHTTPServer.allow_reuse_address = True
     for attempt in range(15):
@@ -1252,7 +1252,7 @@ def run_http():
             print(f"[HTTP] Port {HTTP_PORT} aktif.")
             srv.serve_forever()
             break
-        except OSError as e:
+        except OSError:
             print(f"[HTTP] Port {HTTP_PORT} mesgul, deneniyor... ({attempt+1}/15)")
             time.sleep(2)
 
@@ -1421,9 +1421,16 @@ def run_cuberite():
                             p.parent.mkdir(parents=True, exist_ok=True)
                             p.write_bytes(data)
                             
-                        proc.stdin.write(f"wcreload {name}\n")
-                        proc.stdin.flush()
-                        print(f"[SYNC] {name} envanteri merkezden indirildi.")
+                        # 2. DÜZELTME: Oyuncu haritaya tam düşmeden önce NPE almaması için 2 sn bekleme
+                        def _delayed_reload():
+                            time.sleep(2.0)
+                            try:
+                                proc.stdin.write(f"wcreload {name}\n")
+                                proc.stdin.flush()
+                                print(f"[SYNC] {name} envanteri merkezden esitlendi.")
+                            except: pass
+                        threading.Thread(target=_delayed_reload, daemon=True).start()
+                        
                     except Exception as e:
                         if "404" not in str(e): print(f"[SYNC] Hata (Join): {e}")
 
@@ -1466,7 +1473,6 @@ def run_cuberite():
 #  ASYNC PROXY
 # ══════════════════════════════════════════════════════════
 
-# STABILIZASYON: Proxy hata verse bile zorla portu devralir ve cokmesini engeller
 async def run_proxy_async():
     pathlib.Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
     if not pathlib.Path(BACKENDS_FILE).exists(): save_backends([])
@@ -1476,15 +1482,15 @@ async def run_proxy_async():
         try:
             server = await asyncio.start_server(
                 handle_player, "0.0.0.0", MC_PORT, 
-                limit=2**20, reuse_address=True, reuse_port=True
+                limit=2**20
             )
             break
-        except OSError as e:
-            print(f"[PROXY] Port {MC_PORT} asili kalmis, zorla alinmaya calisiliyor... ({attempt+1}/15)")
+        except OSError:
+            print(f"[PROXY] Port {MC_PORT} dolu, tekrar deneniyor... ({attempt+1}/15)")
             await asyncio.sleep(2)
             
     if not server:
-        print(f"[PROXY] KRITIK HATA: {MC_PORT} portu baglanamadi, Render aginda bir sorun olabilir.")
+        print(f"[PROXY] KRITIK HATA: {MC_PORT} portu alinamadi!")
         return
         
     print(f"[PROXY] Port {MC_PORT} - Cross-server entity sync + PvP AKTIF")
