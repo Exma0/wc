@@ -1,10 +1,10 @@
 services:
 
   # ══════════════════════════════════════════════════════════════
-  #  ANA PROXY  —  wc-tsgd.onrender.com  (bir kere kurulur)
+  #  ANA PROXY  —  wc-yccy.onrender.com  (bir kere kurulur)
   # ══════════════════════════════════════════════════════════════
   - type: web
-    name: wc-tsgd
+    name: wc-yccy
     runtime: docker
     dockerfilePath: ./Dockerfile
     plan: free
