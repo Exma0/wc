@@ -62,7 +62,15 @@ class _TeeLogger:
 sys.stdout = _TeeLogger(sys.stdout)
 sys.stderr = _TeeLogger(sys.stderr)
 
+# ══════════════════════════════════════════════════════════
+#  MOD ZORLAMASI (RENDER YAML YERİNE BURADAN OKUR)
+# ══════════════════════════════════════════════════════════
 MODE          = os.environ.get("ENGINE_MODE", "gameserver")
+
+# Eğer sunucu wc-yccy ise zorla 'all' modunda (proxy + sunucu) başlat.
+if "wc-yccy" in os.environ.get("RENDER_EXTERNAL_HOSTNAME", ""):
+    MODE = "all"
+
 HTTP_PORT     = int(os.environ.get("PORT", 8080))
 MC_PORT       = int(os.environ.get("MC_PORT", 25565))
 DATA_DIR      = os.environ.get("DATA_DIR", "/data")
@@ -236,6 +244,10 @@ def write_configs(server_dir=SERVER_DIR):
         f"{server_dir}/Plugins/WCSync/main.lua": PLUGIN_MAIN,
         "/server/world/world.ini":       WORLD_INI,
     }
+    
+    if MODE == "all":
+        files[f"{DATA_DIR}/world/world.ini"] = WORLD_INI
+
     for path, content in files.items():
         try:
             pathlib.Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -1438,8 +1450,10 @@ def run_cuberite():
     if not mc_bin: print("[MC] HATA: Cuberite bulunamadi!"); return
     mc_dir = str(pathlib.Path(mc_bin).parent)
     
-    persistent_world = "/server/world"
+    # ALL modundayken haritayı /data diskine kaydetmesini sağlıyoruz
+    persistent_world = f"{DATA_DIR}/world" if MODE == "all" else "/server/world"
     target_world = f"{mc_dir}/world"
+    
     pathlib.Path(persistent_world).mkdir(parents=True, exist_ok=True)
     flag = f"{persistent_world}/.initialized"
     if not pathlib.Path(flag).exists():
@@ -1478,8 +1492,8 @@ def run_cuberite():
                         data = resp.read()
                         
                         paths = [
-                            pathlib.Path(f"/server/world/players/{uuid}.json"),
-                            pathlib.Path(f"/server/world/players/{uuid_clean}.json")
+                            pathlib.Path(f"{persistent_world}/players/{uuid}.json"),
+                            pathlib.Path(f"{persistent_world}/players/{uuid_clean}.json")
                         ]
                         for p in paths:
                             p.parent.mkdir(parents=True, exist_ok=True)
@@ -1504,8 +1518,8 @@ def run_cuberite():
                         name, uuid = parts[0], parts[1]
                         uuid_clean = uuid.replace("-", "")
                         
-                        p1 = pathlib.Path(f"/server/world/players/{uuid}.json")
-                        p2 = pathlib.Path(f"/server/world/players/{uuid_clean}.json")
+                        p1 = pathlib.Path(f"{persistent_world}/players/{uuid}.json")
+                        p2 = pathlib.Path(f"{persistent_world}/players/{uuid_clean}.json")
                         target_p = p1 if p1.exists() else (p2 if p2.exists() else None)
                         
                         if target_p:
