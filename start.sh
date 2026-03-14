@@ -1,5 +1,4 @@
 #!/bin/bash
-set -e
 
 BORE_ADDR_FILE="/tmp/bore_address.txt"
 MC_PORT=25565
@@ -10,12 +9,11 @@ echo "  Mode: Offline (Crack Girişi Aktif)"
 echo "  Platform: Render.com"
 echo "================================================"
 
-# ─── 1. Config dosyalarını yaz (server.py → .ini) ───
+# ─── 1. Config dosyalarını yaz ──────────────────────
 echo "[✓] Config dosyaları yazılıyor..."
 python3 /server.py config
 
 # ─── 2. Cuberite binary'yi bul ──────────────────────
-# find komutuyla nerede olursa olsun bul
 MC_BIN=$(find /server -name "Cuberite" -type f | head -1)
 if [ -z "$MC_BIN" ]; then
     echo "[HATA] Cuberite binary bulunamadı!"
@@ -24,23 +22,13 @@ if [ -z "$MC_BIN" ]; then
 fi
 MC_DIR=$(dirname "$MC_BIN")
 chmod +x "$MC_BIN"
-cd "$MC_DIR"
-BINARY="$MC_BIN"
-echo "[✓] Cuberite binary: $BINARY (dizin: $MC_DIR)"
+echo "[✓] Cuberite: $MC_BIN  |  Dizin: $MC_DIR"
 
-# ─── 3. HTTP Durum Sayfası (port 8080) ──────────────
-echo "[✓] HTTP durum sayfası başlatılıyor..."
+# ─── 3. HTTP Durum Sayfası ──────────────────────────
+echo "[✓] HTTP durum sayfası başlatılıyor (port 8080)..."
 python3 /server.py http &
-HTTP_PID=$!
 
-# ─── 4. Cuberite Başlat ─────────────────────────────
-echo "[✓] Cuberite başlatılıyor..."
-"$BINARY" &
-MC_PID=$!
-sleep 5
-
-# ─── 5. bore.pub Tunnel ─────────────────────────────
-echo "[✓] bore.pub tunnel başlatılıyor (port $MC_PORT)..."
+# ─── 4. bore.pub Tunnel (arka planda, yeniden bağlanan) ─
 (
   while true; do
     rm -f "$BORE_ADDR_FILE"
@@ -52,15 +40,33 @@ echo "[✓] bore.pub tunnel başlatılıyor (port $MC_PORT)..."
         echo "[✓✓] BAĞLANTI ADRESİ: $ADDR"
       fi
     done
-    echo "[!] bore kesildi, yeniden bağlanılıyor..."; sleep 3
+    echo "[!] bore kesildi, 5sn sonra yeniden bağlanılıyor..."
+    sleep 5
   done
 ) &
 
-# ─── 6. Bekle ───────────────────────────────────────
+# ─── 5. stdin için kalıcı FIFO oluştur ──────────────
+# SORUN: Docker'da TTY yok → Cuberite stdin EOF alır → hemen kapanır
+# ÇÖZÜM: mkfifo ile asla kapanmayan bir pipe stdin olarak ver
+FIFO=/tmp/mc_stdin
+rm -f "$FIFO"
+mkfifo "$FIFO"
+# Bu process fifo'yu sonsuza kadar açık tutar
+tail -f /dev/null > "$FIFO" &
+
 echo "================================================"
-echo "  Çalışıyor → Cuberite:$MC_PID  HTTP:$HTTP_PID"
-echo "  Adres: https://<servis>.onrender.com"
+echo "  Servisler hazır, Cuberite döngüsü başlıyor..."
 echo "================================================"
-wait $MC_PID
-echo "[!] Cuberite kapandı, yeniden başlatılıyor..."
-exit 1
+
+# ─── 6. Cuberite döngüsü — crash olursa yeniden başlat ─
+while true; do
+    echo "[MC] Cuberite başlatılıyor..."
+    cd "$MC_DIR"
+    # stdin olarak fifo'yu bağla → EOF almaz, kapanmaz
+    "$MC_BIN" < "$FIFO" &
+    MC_PID=$!
+    echo "[MC] PID: $MC_PID"
+    wait $MC_PID
+    echo "[MC] Cuberite kapandı. 5sn sonra yeniden başlıyor..."
+    sleep 5
+done
