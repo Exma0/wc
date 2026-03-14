@@ -20,6 +20,66 @@
 import asyncio, json, os, pathlib, struct, sys
 import threading, zlib, time, http.server, urllib.request
 import subprocess, glob, uuid as _uuid_mod
+from collections import deque
+import datetime
+
+# ══════════════════════════════════════════════════════════
+#  CANLI LOG TAMPONU  (SSE konsolu için)
+# ══════════════════════════════════════════════════════════
+
+_LOG_BUF     = deque(maxlen=500)
+_LOG_LOCK    = threading.Lock()
+_SSE_CLIENTS = []
+_SSE_LOCK    = threading.Lock()
+
+_LOG_COLORS = {
+    "[CONN]":   "#4ecca3",
+    "[JOIN]":   "#4ecca3",
+    "[QUIT]":   "#f8b400",
+    "[BORE]":   "#7ec8e3",
+    "[REG]":    "#a8edea",
+    "[UNREG]":  "#f8b400",
+    "[PROXY]":  "#4ecca3",
+    "[HTTP]":   "#555",
+    "[MC]":     "#c5a3ff",
+    "[CFG]":    "#555",
+    "[STATE]":  "#555",
+    "[ERR]":    "#ff6b6b",
+    "[WARN]":   "#f8b400",
+    "[HEALTH]": "#f8b400",
+    "[PVP]":    "#ff6b6b",
+    "[START]":  "#4ecca3",
+}
+
+def _log_color(line):
+    for tag, color in _LOG_COLORS.items():
+        if tag in line:
+            return color
+    return "#c8c8c8"
+
+class _TeeLogger:
+    def __init__(self, orig):
+        self._orig = orig
+    def write(self, text):
+        self._orig.write(text)
+        stripped = text.strip()
+        if stripped:
+            ts    = datetime.datetime.now().strftime("%H:%M:%S")
+            entry = {"ts": ts, "msg": stripped, "color": _log_color(stripped)}
+            with _LOG_LOCK:
+                _LOG_BUF.append(entry)
+            payload = f"data: {json.dumps(entry)}\n\n"
+            with _SSE_LOCK:
+                dead = []
+                for q in _SSE_CLIENTS:
+                    try:    q.put_nowait(payload)
+                    except: dead.append(q)
+                for q in dead: _SSE_CLIENTS.remove(q)
+    def flush(self):   self._orig.flush()
+    def isatty(self):  return False
+
+sys.stdout = _TeeLogger(sys.stdout)
+sys.stderr = _TeeLogger(sys.stderr)
 
 MODE          = os.environ.get("ENGINE_MODE", "gameserver")
 HTTP_PORT     = int(os.environ.get("PORT", 8080))
@@ -758,102 +818,362 @@ HTML = """\
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <meta http-equiv="refresh" content="5">
   <title>Minecraft Engine</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Rajdhani:wght@400;600;700&display=swap" rel="stylesheet">
   <style>
+    :root{{
+      --bg:#0d0f1a; --panel:#111827; --border:#1e3a5f;
+      --accent:#00ffc8; --accent2:#0099ff;
+      --warn:#f8b400; --err:#ff4f4f; --dim:#4a5568; --text:#cbd5e0;
+    }}
     *{{box-sizing:border-box;margin:0;padding:0}}
-    body{{background:#1a1a2e;color:#e0e0e0;font-family:'Courier New',monospace;
-          display:flex;align-items:center;justify-content:center;
-          min-height:100vh;padding:20px}}
-    .card{{background:#16213e;border:2px solid #0f3460;border-radius:12px;
-           padding:36px;max-width:740px;width:100%;text-align:center;
-           box-shadow:0 0 30px rgba(15,52,96,.5)}}
-    h1{{font-size:1.8rem;color:#4ecca3;margin-bottom:6px}}
-    .sub{{color:#888;margin-bottom:20px;font-size:.85rem}}
-    .addr{{background:#0f3460;border:1px solid #4ecca3;border-radius:8px;
-           padding:14px;margin:14px 0;font-size:1.2rem;color:#4ecca3;word-break:break-all}}
-    .stats{{display:flex;gap:12px;justify-content:center;margin:12px 0;flex-wrap:wrap}}
-    .stat-box{{background:#0f3460;border:1px solid #4ecca355;border-radius:8px;
-               padding:10px 18px;font-size:.9rem}}
-    .stat-box b{{color:#4ecca3;font-size:1.1rem}}
-    table{{width:100%;border-collapse:collapse;margin:14px 0;text-align:left}}
-    th{{color:#4ecca3;border-bottom:1px solid #0f3460;padding:8px 10px;font-size:.8rem}}
-    td{{padding:8px 10px;font-size:.88rem;border-bottom:1px solid #0f346033}}
-    .on{{color:#4ecca3}}
-    .dot{{display:inline-block;width:8px;height:8px;background:#4ecca3;
-          border-radius:50%;margin-right:5px;animation:pulse 1.5s infinite}}
-    @keyframes pulse{{0%,100%{{opacity:1}}50%{{opacity:.3}}}}
-    .badge{{display:inline-block;background:#0f3460;border:1px solid #4ecca3;
-            color:#4ecca3;font-size:.72rem;padding:2px 8px;border-radius:20px;margin:3px}}
-    .info{{font-size:.75rem;color:#555;margin-top:14px}}
+    body{{
+      background:var(--bg);color:var(--text);
+      font-family:'Share Tech Mono',monospace;
+      min-height:100vh;padding:20px;
+      background-image:
+        radial-gradient(ellipse 80% 60% at 50% -10%,#0a2a4a55,transparent),
+        repeating-linear-gradient(0deg,transparent,transparent 39px,#1e3a5f18 39px,#1e3a5f18 40px),
+        repeating-linear-gradient(90deg,transparent,transparent 39px,#1e3a5f18 39px,#1e3a5f18 40px);
+    }}
+    .wrap{{max-width:920px;margin:0 auto;display:flex;flex-direction:column;gap:14px}}
+
+    .header{{display:flex;align-items:center;justify-content:space-between;
+             border-bottom:1px solid var(--border);padding-bottom:12px}}
+    .logo{{font-family:'Rajdhani',sans-serif;font-size:1.7rem;font-weight:700;
+           color:var(--accent);letter-spacing:.08em;text-shadow:0 0 20px #00ffc855}}
+    .logo span{{color:var(--text);font-weight:400}}
+    .live-dot{{width:8px;height:8px;border-radius:50%;background:var(--accent);
+               display:inline-block;margin-right:6px;box-shadow:0 0 6px var(--accent);
+               animation:blink 1.4s ease-in-out infinite}}
+    @keyframes blink{{0%,100%{{opacity:1;transform:scale(1)}}50%{{opacity:.4;transform:scale(.7)}}}}
+
+    .addr-box{{background:linear-gradient(135deg,#0a2a4a,#0a1a35);
+               border:1px solid var(--accent);border-radius:8px;
+               padding:12px 18px;display:flex;align-items:center;gap:14px;
+               box-shadow:0 0 24px #00ffc81a}}
+    .addr-lbl{{font-size:.68rem;color:var(--dim);white-space:nowrap}}
+    .addr-val{{font-size:1.25rem;color:var(--accent);flex:1;word-break:break-all;
+               text-shadow:0 0 12px #00ffc844}}
+    .copy-btn{{background:#00ffc815;border:1px solid var(--accent);color:var(--accent);
+               border-radius:6px;padding:6px 14px;font-size:.73rem;cursor:pointer;
+               font-family:'Share Tech Mono',monospace;transition:all .15s;white-space:nowrap}}
+    .copy-btn:hover{{background:var(--accent);color:#000}}
+
+    .stats{{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}}
+    .stat{{background:var(--panel);border:1px solid var(--border);
+           border-radius:8px;padding:14px 16px;position:relative;overflow:hidden}}
+    .stat::before{{content:'';position:absolute;inset:0;
+                   background:linear-gradient(135deg,#00ffc808,transparent);pointer-events:none}}
+    .stat-val{{font-size:2rem;color:var(--accent);font-family:'Rajdhani',sans-serif;
+               font-weight:700;line-height:1}}
+    .stat-lbl{{font-size:.68rem;color:var(--dim);margin-top:4px}}
+
+    .panel{{background:var(--panel);border:1px solid var(--border);border-radius:8px;overflow:hidden}}
+    .panel-hdr{{display:flex;align-items:center;justify-content:space-between;
+                padding:9px 16px;border-bottom:1px solid var(--border);background:#0a1428}}
+    .panel-hdr-title{{font-size:.72rem;color:var(--accent);letter-spacing:.1em;text-transform:uppercase}}
+    table{{width:100%;border-collapse:collapse}}
+    th{{color:var(--dim);font-size:.68rem;padding:7px 16px;text-align:left;
+        text-transform:uppercase;letter-spacing:.08em;background:#0a1428;
+        border-bottom:1px solid var(--border)}}
+    td{{padding:8px 16px;font-size:.82rem;border-bottom:1px solid #1e3a5f33}}
+    tr:last-child td{{border-bottom:none}}
+    tr:hover td{{background:#1e3a5f22}}
+    .sdot{{width:7px;height:7px;border-radius:50%;background:var(--accent);
+           display:inline-block;margin-right:6px;box-shadow:0 0 5px var(--accent);
+           animation:blink 1.4s infinite}}
+    .son{{color:var(--accent)}}
+    .badges{{display:flex;flex-wrap:wrap;gap:6px;padding:12px 16px;
+             border-top:1px solid var(--border)}}
+    .badge{{background:#00ffc808;border:1px solid #00ffc830;color:var(--accent);
+            font-size:.63rem;padding:3px 10px;border-radius:20px;letter-spacing:.05em}}
+
+    /* ── Console ── */
+    .con-toolbar{{display:flex;align-items:center;justify-content:space-between;
+                  padding:7px 14px;background:#070d1a;border-bottom:1px solid var(--border)}}
+    .win-btns{{display:flex;gap:6px}}
+    .wb{{width:10px;height:10px;border-radius:50%}}
+    .wb-r{{background:#ff5f56}} .wb-y{{background:#ffbd2e}} .wb-g{{background:#27c93f}}
+    .con-title{{font-size:.68rem;color:var(--dim);letter-spacing:.1em;margin-left:8px}}
+    .con-right{{display:flex;align-items:center;gap:8px}}
+    .flt{{background:transparent;border:1px solid var(--border);color:var(--dim);
+          font-family:'Share Tech Mono',monospace;font-size:.63rem;
+          border-radius:4px;padding:3px 8px;cursor:pointer;transition:all .15s}}
+    .flt.on{{border-color:var(--accent);color:var(--accent)}}
+    .flt:hover{{border-color:var(--accent2);color:var(--accent2)}}
+    .clr{{background:transparent;border:1px solid var(--border);color:var(--dim);
+          font-family:'Share Tech Mono',monospace;font-size:.63rem;
+          border-radius:4px;padding:3px 8px;cursor:pointer;transition:all .15s}}
+    .clr:hover{{border-color:var(--err);color:var(--err)}}
+    .sse-ind{{display:flex;align-items:center;gap:4px;font-size:.62rem;color:var(--dim)}}
+    .sse-d{{width:6px;height:6px;border-radius:50%;background:var(--dim)}}
+    .sse-d.live{{background:var(--accent);box-shadow:0 0 4px var(--accent)}}
+    #con{{background:#070d1a;height:320px;overflow-y:auto;
+          padding:10px 14px;font-size:.76rem;line-height:1.75;scroll-behavior:smooth}}
+    #con::-webkit-scrollbar{{width:4px}}
+    #con::-webkit-scrollbar-track{{background:#0a0f1e}}
+    #con::-webkit-scrollbar-thumb{{background:#1e3a5f;border-radius:3px}}
+    .ll{{display:flex;gap:8px}}
+    .lt{{color:var(--dim);flex-shrink:0;font-size:.66rem;padding-top:1px}}
+    .lm{{word-break:break-all;flex:1}}
+    @media(max-width:600px){{.stats{{grid-template-columns:repeat(2,1fr)}}
+      .addr-val{{font-size:1rem}}.flt{{display:none}}}}
   </style>
 </head>
 <body>
-<div class="card">
-  <h1>Minecraft Distributed Engine</h1>
-  <p class="sub">wc-yccy.onrender.com &bull; Ana Proxy &bull; bore.pub Tunnel</p>
+<div class="wrap">
+
+  <div class="header">
+    <div class="logo">⛏ WC<span>-ENGINE</span></div>
+    <div style="font-size:.72rem;color:var(--dim)" id="hdr-status">
+      <span class="live-dot"></span>
+      {mode_label} &bull; <span id="hdr-players">{player_count}</span> oyuncu aktif
+    </div>
+  </div>
+
   {addr_block}
+
   <div class="stats">
-    <div class="stat-box">Toplam Oyuncu<br><b>{player_count}</b></div>
-    <div class="stat-box">Blok Degisikligi<br><b>{block_count}</b></div>
-    <div class="stat-box">Game Server<br><b>{server_count}</b></div>
+    <div class="stat"><div class="stat-val" id="s-players">{player_count}</div><div class="stat-lbl">Toplam Oyuncu</div></div>
+    <div class="stat"><div class="stat-val" id="s-blocks">{block_count}</div><div class="stat-lbl">Blok Değişikliği</div></div>
+    <div class="stat"><div class="stat-val" id="s-servers">{server_count}</div><div class="stat-lbl">Game Server</div></div>
   </div>
-  <table>
-    <tr><th>Game Server</th><th>Oyuncu</th><th>Durum</th></tr>
-    {rows}
-  </table>
-  <div style="margin-top:14px">
-    <span class="badge">Ultra Hafif</span>
-    <span class="badge">Crack Girisi</span>
-    <span class="badge">Ortak Dunya</span>
-    <span class="badge">Cross-Server Chat</span>
-    <span class="badge">Cross-Server PvP</span>
-    <span class="badge">Blok Senkron</span>
-    <span class="badge">999 Oyuncu</span>
+
+  <div class="panel">
+    <div class="panel-hdr">
+      <span class="panel-hdr-title">Game Servers</span>
+      <span style="font-size:.68rem;color:var(--dim)">otomatik yenilenir</span>
+    </div>
+    <table id="srv-tbl">
+      <tr><th>Sunucu</th><th>Oyuncu</th><th>Durum</th></tr>
+      {rows}
+    </table>
+    <div class="badges">
+      <span class="badge">Ultra Hafif</span><span class="badge">Crack Girişi</span>
+      <span class="badge">Ortak Dünya</span><span class="badge">Cross-Server Chat</span>
+      <span class="badge">Cross-Server PvP</span><span class="badge">Blok Senkron</span>
+      <span class="badge">999 Oyuncu</span>
+    </div>
   </div>
-  <div class="info">Her 5 saniyede otomatik yenilenir</div>
-</div></body></html>"""
+
+  <div class="panel">
+    <div class="con-toolbar">
+      <div style="display:flex;align-items:center">
+        <div class="win-btns"><div class="wb wb-r"></div><div class="wb wb-y"></div><div class="wb wb-g"></div></div>
+        <span class="con-title">CANLI KONSOL</span>
+      </div>
+      <div class="con-right">
+        <button class="flt on"  data-f="">TÜMÜ</button>
+        <button class="flt"     data-f="ERR">HATA</button>
+        <button class="flt"     data-f="WARN">UYARI</button>
+        <button class="flt"     data-f="CONN,JOIN,QUIT">OYUNCU</button>
+        <button class="flt"     data-f="BORE,REG">TUNNEL</button>
+        <button class="flt"     data-f="MC">MC</button>
+        <button class="clr"     id="clrBtn">TEMİZLE</button>
+        <div class="sse-ind"><div class="sse-d" id="sseDot"></div><span id="sseLbl">bağlanıyor</span></div>
+      </div>
+    </div>
+    <div id="con"><div style="color:#2a4a6a;font-size:.73rem">— konsol yükleniyor —</div></div>
+  </div>
+
+</div>
+<script>
+(function(){{
+  const con=document.getElementById('con');
+  const dot=document.getElementById('sseDot');
+  const lbl=document.getElementById('sseLbl');
+  let autoScroll=true, activeFilter='', allLines=[];
+
+  con.addEventListener('scroll',()=>{{
+    autoScroll=con.scrollTop+con.clientHeight>=con.scrollHeight-30;
+  }});
+
+  function esc(s){{return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}}
+
+  function renderLine(e){{
+    const d=document.createElement('div');
+    d.className='ll'; d.dataset.msg=e.msg;
+    d.innerHTML='<span class="lt">'+e.ts+'</span><span class="lm" style="color:'+e.color+'">'+esc(e.msg)+'</span>';
+    return d;
+  }}
+
+  function applyFilter(){{
+    const f=activeFilter;
+    con.querySelectorAll('.ll').forEach(el=>{{
+      const m=el.dataset.msg||'';
+      el.style.display=(!f||f.split(',').some(k=>m.includes('['+k+']')))?'':'none';
+    }});
+  }}
+
+  document.querySelectorAll('.flt').forEach(btn=>{{
+    btn.addEventListener('click',()=>{{
+      document.querySelectorAll('.flt').forEach(b=>b.classList.remove('on'));
+      btn.classList.add('on');
+      activeFilter=btn.dataset.f;
+      applyFilter();
+    }});
+  }});
+
+  document.getElementById('clrBtn').addEventListener('click',()=>{{con.innerHTML='';allLines=[];}});
+
+  function addLine(e){{
+    allLines.push(e);
+    if(allLines.length>600){{allLines.shift();const f=con.querySelector('.ll');if(f)f.remove();}}
+    const el=renderLine(e);
+    const f=activeFilter;
+    if(f&&!f.split(',').some(k=>e.msg.includes('['+k+']')))el.style.display='none';
+    con.appendChild(el);
+    if(autoScroll)con.scrollTop=con.scrollHeight;
+  }}
+
+  fetch('/api/logs/history').then(r=>r.json()).then(arr=>{{
+    con.innerHTML='';arr.forEach(e=>addLine(e));
+  }}).catch(()=>{{}});
+
+  function connectSSE(){{
+    dot.className='sse-d'; lbl.textContent='bağlanıyor...';
+    const es=new EventSource('/api/logs/stream');
+    es.onopen=()=>{{dot.className='sse-d live';lbl.textContent='canlı';}};
+    es.onmessage=e=>{{try{{addLine(JSON.parse(e.data));}}catch(x){{}}}};
+    es.onerror=()=>{{dot.className='sse-d';lbl.textContent='yeniden bağlanıyor...';
+      es.close();setTimeout(connectSSE,3000);}};
+  }}
+  connectSSE();
+
+  function refreshStats(){{
+    fetch('/api/status').then(r=>r.json()).then(d=>{{
+      document.getElementById('s-players').textContent=d.players;
+      document.getElementById('s-blocks').textContent=d.blocks;
+      document.getElementById('s-servers').textContent=d.servers;
+      document.getElementById('hdr-players').textContent=d.players;
+      const t=document.getElementById('srv-tbl');
+      if(t)t.innerHTML='<tr><th>Sunucu</th><th>Oyuncu</th><th>Durum</th></tr>'+d.table_rows;
+      if(d.addr){{const av=document.querySelector('.addr-val');if(av)av.textContent=d.addr;}}
+    }}).catch(()=>{{}});
+  }}
+  setInterval(refreshStats,5000);
+}})();
+</script>
+</body></html>"""
 
 
-def _build_html():
-    try:
-        bore = pathlib.Path(BORE_FILE).read_text().strip()
-        addr_block = (f'<div class="addr">{bore}</div>'
-                      f'<p style="color:#aaa;font-size:.85rem">'
-                      f'Minecraft → Sunucu Ekle → bu adresi gir</p>')
-    except Exception:
-        addr_block = '<p style="color:#f8b400">Tunnel baslatiliyor...</p>'
-
+def _build_rows():
     backends = load_backends()
     counts = {}
     for c in list(_active):
         k = f"{c.backend_host}:{c.backend_port}"
         counts[k] = counts.get(k, 0) + 1
-
     rows = ""
     for b in backends:
         k     = f"{b['host']}:{b['port']}"
         n     = counts.get(k, 0)
         label = b.get("label", k)
         rows += (f'<tr><td>{label}</td><td>{n} oyuncu</td>'
-                 f'<td><span class="dot"></span><span class="on">Aktif</span></td></tr>')
+                 f'<td><span class="sdot"></span><span class="son">Aktif</span></td></tr>')
     if not rows:
-        rows = '<tr><td colspan="3" style="color:#888;text-align:center">Game server bekleniyor...</td></tr>'
+        rows = '<tr><td colspan="3" style="color:#4a5568;text-align:center;padding:18px">Game server bekleniyor...</td></tr>'
+    return rows, backends
 
+
+def _get_bore():
+    try:    return pathlib.Path(BORE_FILE).read_text().strip()
+    except: return None
+
+
+def _build_html():
+    bore = _get_bore()
+    if bore:
+        addr_block = (
+            f'<div class="addr-box">'
+            f'<div><div class="addr-lbl">MİNECRAFT ADRESİ — Sunucu Ekle → bu adresi gir</div>'
+            f'<div class="addr-val">{bore}</div></div>'
+            f'<button class="copy-btn" '
+            f'onclick="navigator.clipboard.writeText(\'{bore}\');'
+            f'this.textContent=\'✓ Kopyalandı\';'
+            f'setTimeout(()=>this.textContent=\'Kopyala\',1500)">Kopyala</button>'
+            f'</div>')
+    else:
+        addr_block = ('<div class="addr-box" style="border-color:var(--warn)">'
+                      '<div class="addr-val" style="color:var(--warn);font-size:.9rem">'
+                      '⏳ Tunnel başlatılıyor...</div></div>')
+
+    rows, backends = _build_rows()
     return HTML.format(
-        addr_block=addr_block,
-        player_count=len(_active),
-        block_count=len(world_state.blocks),
-        server_count=len(backends),
-        rows=rows,
+        addr_block   = addr_block,
+        player_count = len(_active),
+        block_count  = len(world_state.blocks),
+        server_count = len(backends),
+        rows         = rows,
+        mode_label   = MODE.upper(),
     )
 
 
 class _H(http.server.BaseHTTPRequestHandler):
+
     def do_GET(self):
+        # ── SSE: canlı log akışı ──────────────────────────────
+        if self.path == "/api/logs/stream":
+            import queue as _q
+            q = _q.Queue(maxsize=200)
+            with _SSE_LOCK:
+                _SSE_CLIENTS.append(q)
+            self.send_response(200)
+            self.send_header("Content-Type",  "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+            try:
+                while True:
+                    try:
+                        payload = q.get(timeout=25)
+                        self.wfile.write(payload.encode())
+                        self.wfile.flush()
+                    except _q.Empty:
+                        self.wfile.write(b": ping\n\n")
+                        self.wfile.flush()
+            except Exception:
+                pass
+            finally:
+                with _SSE_LOCK:
+                    if q in _SSE_CLIENTS: _SSE_CLIENTS.remove(q)
+            return
+
+        # ── Log geçmişi ───────────────────────────────────────
+        if self.path == "/api/logs/history":
+            with _LOG_LOCK:
+                data = list(_LOG_BUF)
+            body = json.dumps(data).encode()
+            self.send_response(200)
+            self.send_header("Content-Type",   "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers(); self.wfile.write(body)
+            return
+
+        # ── Canlı stats (AJAX) ────────────────────────────────
+        if self.path == "/api/status":
+            rows, backends = _build_rows()
+            bore = _get_bore()
+            payload = {
+                "players":    len(_active),
+                "blocks":     len(world_state.blocks),
+                "servers":    len(backends),
+                "mode":       MODE.upper(),
+                "addr":       bore or "",
+                "table_rows": rows,
+            }
+            body = json.dumps(payload).encode()
+            self.send_response(200)
+            self.send_header("Content-Type",   "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers(); self.wfile.write(body)
+            return
+
+        # ── Ana sayfa ─────────────────────────────────────────
         body = _build_html().encode()
         self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Type",   "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers(); self.wfile.write(body)
 
@@ -867,15 +1187,10 @@ class _H(http.server.BaseHTTPRequestHandler):
             label = data.get("label", f"{host}:{port}")
             if not host or not port: self._r(400, "missing host/port"); return
             backends = load_backends()
-            # Benzersiz anahtar LABEL — bore port her koptuğunda değişir,
-            # host:port bazlı eşleştirme stale girişlerin birikmesine yol açar
             found = False
             for b in backends:
                 if b.get("label") == label:
-                    b["host"] = host
-                    b["port"] = int(port)
-                    found = True
-                    break
+                    b["host"] = host; b["port"] = int(port); found = True; break
             if not found:
                 backends.append({"host": host, "port": int(port), "label": label})
             save_backends(backends)
