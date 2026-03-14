@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: cuberite-minecraft
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+
+    # Render.com en düşük plan (512MB RAM) yeterli
+    plan: free          # free = 512MB RAM, 0.1 CPU
+    # Daha iyi performans için: starter (512MB), standard (2GB)
+
+    # Render.com HTTP port
+    envVars:
+      - key: PORT
+        value: "8080"
+
+    # Disk: Cuberite ~30MB, world data ~20MB → 1GB yeter
+    disk:
+      name: mc-data
+      mountPath: /server/world
+      sizeGB: 1           # Minimum disk (dünya verisi burada kalıcı)
+
+    # Sağlık kontrolü
+    healthCheckPath: /
+
+    # Auto-deploy: her push'ta yeniden dağıt
+    autoDeploy: true
