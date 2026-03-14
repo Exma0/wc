@@ -71,6 +71,8 @@ BORE_FILE     = "/tmp/bore_address.txt"
 STATE_FILE    = f"{DATA_DIR}/world_state.json"
 BACKENDS_FILE = f"{DATA_DIR}/backends.json"
 
+_current_bore_addr = None   # son bilinen bore adresi (heartbeat için)
+
 # OPTİMİZASYON: NetworkCompressionThreshold 256'ya çekildi, gereksiz işlemci yükü azaltıldı.
 SETTINGS_INI = """
 [Authentication]
@@ -1050,12 +1052,16 @@ def _build_rows():
             k = f"{c.backend_host}:{c.backend_port}"
             counts[k] = counts.get(k, 0) + 1
     rows = ""
+    now = int(time.time())
     for b in backends:
         k     = f"{b['host']}:{b['port']}"
         n     = counts.get(k, 0)
         label = b.get("label", k)
+        ls    = b.get("last_seen", 0)
+        age   = f"{(now - ls)//60}dk önce" if ls else "?"
         rows += (f'<tr><td>{label}</td><td>{n} oyuncu</td>'
-                 f'<td><span class="sdot"></span><span class="son">Aktif</span></td></tr>')
+                 f'<td><span class="sdot"></span><span class="son">Aktif</span>'
+                 f' <span style="color:var(--dim);font-size:.7rem">({age})</span></td></tr>')
     if not rows:
         rows = ('<tr><td colspan="3" style="color:#4a5568;text-align:center;padding:18px">'
                 'Game server bekleniyor...</td></tr>')
@@ -1124,6 +1130,14 @@ class _H(http.server.BaseHTTPRequestHandler):
             if self.path == "/api/logs/history":
                 with _LOG_LOCK: data = list(_LOG_BUF)
                 body = json.dumps(data).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers(); self.wfile.write(body)
+                return
+
+            if self.path == "/api/backends":
+                body = json.dumps(load_backends(), indent=2).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
@@ -1222,21 +1236,36 @@ def run_http():
 
 
 def _health_check_loop():
+    """60s'de bir backend'leri kontrol eder.
+    3 arka arkaya başarısız olursa siler (geçici kopuklukta silmez)."""
     import socket
+    _fail_counts: dict = {}   # label → peş peşe hata sayısı
     while True:
         time.sleep(60)
         try:
             backends = load_backends()
             alive = []
             for b in backends:
+                key = b.get("label") or f"{b['host']}:{b['port']}"
                 try:
                     s = socket.create_connection((b["host"], b["port"]), timeout=5)
                     s.close()
+                    _fail_counts[key] = 0    # başarılı → sayacı sıfırla
                     alive.append(b)
                 except Exception:
-                    print(f"[HEALTH] Olu backend kaldirildi: {b.get('label','?')} ({b['host']}:{b['port']})")
-            if len(alive) != len(backends): save_backends(alive)
-        except Exception as e: print(f"[HEALTH] Hata: {e}")
+                    _fail_counts[key] = _fail_counts.get(key, 0) + 1
+                    fails = _fail_counts[key]
+                    if fails < 3:
+                        print(f"[HEALTH] Ulasilamadi ({fails}/3 deneme): {key} "
+                              f"({b['host']}:{b['port']}) — bekleniyor...")
+                        alive.append(b)     # henüz silme
+                    else:
+                        print(f"[HEALTH] Olu backend kaldirildi ({fails}. hata): {key}")
+                        _fail_counts.pop(key, None)
+            if len(alive) != len(backends):
+                save_backends(alive)
+        except Exception as e:
+            print(f"[HEALTH] Hata: {e}")
 
 
 # ══════════════════════════════════════════════════════════
@@ -1258,6 +1287,7 @@ def _wait_for_port(port, timeout=60):
     return False
 
 def run_bore(port=MC_PORT):
+    global _current_bore_addr
     import re
     if MODE == "gameserver":
         print(f"[BORE] Cuberite port {port} bekleniyor...")
@@ -1276,28 +1306,37 @@ def run_bore(port=MC_PORT):
                 if m:
                     addr = f"bore.pub:{m.group(1)}"
                     pathlib.Path(BORE_FILE).write_text(addr)
+                    _current_bore_addr = addr      # global güncelle
                     if MODE == "gameserver": _register_with_proxy(addr)
             proc.wait()
-            if MODE == "gameserver": _unregister_from_proxy()
-        except FileNotFoundError: print("[BORE] bore bulunamadi...")
+            _current_bore_addr = None              # bore düştü
+            # NOT: Kasıtlı olarak _unregister_from_proxy() ÇAĞIRILMIYOR.
+            # Health check eski/ölü adresi zaten temizler.
+            # Bore yeniden bağlandığında kayıt güncellenir.
+        except FileNotFoundError: print("[BORE] bore bulunamadi, PATH'i kontrol et...")
         except Exception as e: print(f"[BORE] hata: {e}")
         time.sleep(10)
 
-def _register_with_proxy(bore_addr, retries=5):
+def _register_with_proxy(bore_addr, retries=10):
+    """Proxy'e gameserver adresini kaydet. Render cold-start için uzun timeout."""
     proxy_url = os.environ.get("PROXY_URL", "")
-    if not proxy_url: return
+    if not proxy_url: return False
     label = os.environ.get("SERVER_LABEL", "GameServer")
     host, port_str = bore_addr.split(":")
-    body = json.dumps({"host": host, "port": int(port_str), "label": label}).encode()
+    body = json.dumps({"host": host, "port": int(port_str), "label": label,
+                       "last_seen": int(time.time())}).encode()
     for attempt in range(1, retries + 1):
         try:
-            req = urllib.request.Request(f"{proxy_url}/api/register", data=body, headers={"Content-Type": "application/json"})
-            urllib.request.urlopen(req, timeout=10)
-            print(f"[REG] Proxy kayit: {proxy_url} ({label})")
-            return
+            req = urllib.request.Request(f"{proxy_url}/api/register", data=body,
+                                         headers={"Content-Type": "application/json"})
+            urllib.request.urlopen(req, timeout=25)   # 25s: Render cold-start ~30s alır
+            print(f"[REG] Proxy kayit OK: {proxy_url} → {bore_addr} ({label})")
+            return True
         except Exception as e:
             print(f"[REG] Kayit hatasi (deneme {attempt}/{retries}): {e}")
-            if attempt < retries: time.sleep(5 * attempt)
+            if attempt < retries: time.sleep(min(30, 5 * attempt))
+    print(f"[REG] HATA: {retries} denemede kayit basarisiz! Proxy uyanda mi?")
+    return False
 
 def _unregister_from_proxy():
     proxy_url = os.environ.get("PROXY_URL", "")
@@ -1432,6 +1471,16 @@ async def run_proxy_async():
 #  MAIN
 # ══════════════════════════════════════════════════════════
 
+def _heartbeat_loop():
+    """Gameserver'ın proxy'de kayıtlı kalmasını garantiler.
+    Proxy restart, ağ kesintisi veya ilk kayıt başarısızlığını telafi eder."""
+    time.sleep(90)   # ilk başlatmaya zaman tanı
+    while True:
+        if _current_bore_addr:
+            _register_with_proxy(_current_bore_addr, retries=3)
+        time.sleep(30)
+
+
 def main():
     print(f"""
 +--------------------------------------------------+
@@ -1450,6 +1499,7 @@ def main():
         asyncio.run(run_proxy_async())
     elif MODE == "gameserver":
         threading.Thread(target=run_bore, args=(MC_PORT,), daemon=True).start()
+        threading.Thread(target=_heartbeat_loop, daemon=True).start()  # proxy'de kayıtlı kal
         run_cuberite()
     elif MODE == "all":
         threading.Thread(target=run_bore, args=(MC_PORT,), daemon=True).start()
