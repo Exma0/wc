@@ -15,16 +15,18 @@ echo "[✓] Config dosyaları yazılıyor..."
 python3 /server.py config
 
 # ─── 2. Cuberite binary'yi bul ──────────────────────
-cd /server
-if [ -f "Cuberite" ]; then
-    BINARY="./Cuberite"
-elif [ -f "Server/Cuberite" ]; then
-    cd Server; BINARY="./Cuberite"
-else
-    echo "[HATA] Cuberite binary bulunamadı!"; ls -la; exit 1
+# find komutuyla nerede olursa olsun bul
+MC_BIN=$(find /server -name "Cuberite" -type f | head -1)
+if [ -z "$MC_BIN" ]; then
+    echo "[HATA] Cuberite binary bulunamadı!"
+    find /server -type f | head -30
+    exit 1
 fi
-chmod +x "$BINARY" 2>/dev/null || true
-echo "[✓] Cuberite binary: $BINARY"
+MC_DIR=$(dirname "$MC_BIN")
+chmod +x "$MC_BIN"
+cd "$MC_DIR"
+BINARY="$MC_BIN"
+echo "[✓] Cuberite binary: $BINARY (dizin: $MC_DIR)"
 
 # ─── 3. HTTP Durum Sayfası (port 8080) ──────────────
 echo "[✓] HTTP durum sayfası başlatılıyor..."

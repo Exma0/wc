@@ -107,7 +107,15 @@ Inherits=Default
 # ──────────────────────────────────────────────────────────────
 
 def write_configs(server_dir: str = "/server") -> None:
-    """Tüm .ini dosyalarını Cuberite'nin beklediği yerlere yazar."""
+    """Tüm .ini dosyalarını Cuberite'nin beklediği yerlere yazar.
+    server_dir: Cuberite binary'sinin bulunduğu dizin."""
+
+    # Binary'yi bul, gerçek dizine yaz
+    import glob
+    bins = glob.glob("/server/**/Cuberite", recursive=True)
+    if bins:
+        server_dir = str(pathlib.Path(bins[0]).parent)
+        print(f"[CFG] Cuberite dizini tespit edildi: {server_dir}")
 
     files = {
         f"{server_dir}/settings.ini":      SETTINGS_INI,

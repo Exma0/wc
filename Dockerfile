@@ -16,12 +16,13 @@ RUN BORE_VER=$(curl -s https://api.github.com/repos/ekzhang/bore/releases/latest
     && rm /tmp/bore.tar.gz \
     && chmod +x /usr/local/bin/bore
 
-# Cuberite (resmi prebuilt binary)
+# Cuberite (resmi canonical download URL — daima güncel)
 WORKDIR /server
 RUN wget -qO /tmp/cuberite.tar.gz \
-        "https://builds.cuberite.org/job/Cuberite/job/master/job/Linux/job/x64/lastSuccessfulBuild/artifact/Cuberite.tar.gz" \
-    && tar xzf /tmp/cuberite.tar.gz -C /server --strip-components=0 \
-    && rm /tmp/cuberite.tar.gz
+        "https://download.cuberite.org/linux-x86_64/Cuberite.tar.gz" \
+    && tar xzf /tmp/cuberite.tar.gz -C /server \
+    && rm /tmp/cuberite.tar.gz \
+    && find /server -name "Cuberite" -type f
 
 # Tek Python dosyası — tüm config + HTTP sunucu burada
 COPY server.py /server.py
