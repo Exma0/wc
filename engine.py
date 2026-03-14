@@ -492,7 +492,7 @@ def pick_backend():
         counts[k] = counts.get(k, 0) + 1
     for b in sorted(backends,
                     key=lambda x: counts.get(f"{x['host']}:{x['port']}", 0),
-                    reverse=True):
+                    reverse=False):  # En az dolu sunucuyu seç
         if counts.get(f"{b['host']}:{b['port']}", 0) < 998:
             return b
     return backends[0]
@@ -867,16 +867,30 @@ class _H(http.server.BaseHTTPRequestHandler):
             label = data.get("label", f"{host}:{port}")
             if not host or not port: self._r(400, "missing host/port"); return
             backends = load_backends()
-            key   = f"{host}:{port}"
+            # Benzersiz anahtar LABEL — bore port her koptuğunda değişir,
+            # host:port bazlı eşleştirme stale girişlerin birikmesine yol açar
             found = False
             for b in backends:
-                if f"{b['host']}:{b['port']}" == key:
-                    b["label"] = label; found = True; break
+                if b.get("label") == label:
+                    b["host"] = host
+                    b["port"] = int(port)
+                    found = True
+                    break
             if not found:
                 backends.append({"host": host, "port": int(port), "label": label})
             save_backends(backends)
-            print(f"[REG] {label} ({key})")
+            print(f"[REG] {label} ({host}:{port})")
             self._r(200, "ok")
+
+        elif self.path == "/api/unregister":
+            label = data.get("label", "")
+            if not label: self._r(400, "missing label"); return
+            backends = load_backends()
+            backends = [b for b in backends if b.get("label") != label]
+            save_backends(backends)
+            print(f"[UNREG] {label}")
+            self._r(200, "ok")
+
         else:
             self._r(404, "not found")
 
@@ -893,6 +907,27 @@ def run_http():
     srv = http.server.HTTPServer(("0.0.0.0", HTTP_PORT), _H)
     print(f"[HTTP] Port {HTTP_PORT}")
     srv.serve_forever()
+
+
+def _health_check_loop():
+    """Periyodik olarak backends.json'daki ölü girişleri temizle."""
+    import socket
+    while True:
+        time.sleep(60)
+        try:
+            backends = load_backends()
+            alive = []
+            for b in backends:
+                try:
+                    s = socket.create_connection((b["host"], b["port"]), timeout=5)
+                    s.close()
+                    alive.append(b)
+                except Exception:
+                    print(f"[HEALTH] Ölü backend kaldırıldı: {b.get('label','?')} ({b['host']}:{b['port']})")
+            if len(alive) != len(backends):
+                save_backends(alive)
+        except Exception as e:
+            print(f"[HEALTH] Hata: {e}")
 
 
 # ══════════════════════════════════════════════════════════
@@ -917,6 +952,9 @@ def run_bore(port=MC_PORT):
                     if MODE == "gameserver":
                         _register_with_proxy(addr)
             proc.wait()
+            # Bore koptu — gameserver modundaysa önce unregister et
+            if MODE == "gameserver":
+                _unregister_from_proxy()
         except FileNotFoundError:
             print("[BORE] bore bulunamadi, 10sn bekleniyor...")
         except Exception as e:
@@ -938,6 +976,21 @@ def _register_with_proxy(bore_addr):
         print(f"[REG] Proxy kayit: {proxy_url} ({label})")
     except Exception as e:
         print(f"[REG] Kayit hatasi: {e}")
+
+
+def _unregister_from_proxy():
+    proxy_url = os.environ.get("PROXY_URL", "")
+    if not proxy_url: return
+    label = os.environ.get("SERVER_LABEL", "GameServer")
+    try:
+        body = json.dumps({"label": label}).encode()
+        req  = urllib.request.Request(
+            f"{proxy_url}/api/unregister", data=body,
+            headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=5)
+        print(f"[UNREG] Proxy kayit silindi: {label}")
+    except Exception as e:
+        print(f"[UNREG] Silme hatasi: {e}")
 
 
 # ══════════════════════════════════════════════════════════
@@ -1008,6 +1061,7 @@ def main():
 
     if MODE == "proxy":
         threading.Thread(target=run_bore, args=(MC_PORT,), daemon=True).start()
+        threading.Thread(target=_health_check_loop, daemon=True).start()
         asyncio.run(run_proxy_async())
 
     elif MODE == "gameserver":
