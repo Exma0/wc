@@ -24,7 +24,13 @@ MC_DIR=$(dirname "$MC_BIN")
 chmod +x "$MC_BIN"
 echo "[✓] Cuberite: $MC_BIN  |  Dizin: $MC_DIR"
 
-# ─── 3. HTTP Durum Sayfası ──────────────────────────
+# ─── 3. Eski dünya verisini sil ─────────────────────
+echo "[✓] Eski dünya verisi temizleniyor..."
+rm -rf "$MC_DIR/world"
+mkdir -p "$MC_DIR/world"
+echo "[✓] Dünya klasörü sıfırlandı."
+
+# ─── 4. HTTP Durum Sayfası ──────────────────────────
 echo "[✓] HTTP durum sayfası başlatılıyor (port 8080)..."
 python3 /server.py http &
 
