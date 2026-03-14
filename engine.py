@@ -791,7 +791,7 @@ HTML = """\
 <body>
 <div class="card">
   <h1>Minecraft Distributed Engine</h1>
-  <p class="sub">wc-tsgd.onrender.com &bull; Ana Proxy &bull; bore.pub Tunnel</p>
+  <p class="sub">wc-yccy.onrender.com &bull; Ana Proxy &bull; bore.pub Tunnel</p>
   {addr_block}
   <div class="stats">
     <div class="stat-box">Toplam Oyuncu<br><b>{player_count}</b></div>
