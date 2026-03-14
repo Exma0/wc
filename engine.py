@@ -9,16 +9,12 @@
       - Birbirlerine SALDIRABILIR (PvP)
       - Blok değişiklikleri tüm sunucularda senkron
       - Chat tüm sunuculara iletilir
+  • Merkezi Envanter: Cuberite Lua Plugin + Proxy API
   • Oyuncu limiti: 999
-  • Otomatik backend kaydı (wc-tsgd ana proxy)
-
-  ENGINE_MODE=proxy      → Ana proxy (wc-tsgd)
-  ENGINE_MODE=gameserver → Cuberite instance
-  ENGINE_MODE=all        → Test: hepsi tek container
 """
 
 import asyncio, json, os, pathlib, struct, sys
-import threading, zlib, time, http.server, urllib.request
+import threading, zlib, time, http.server, urllib.request, urllib.parse
 import subprocess, glob, uuid as _uuid_mod
 from collections import deque
 import datetime
@@ -41,6 +37,7 @@ _LOG_COLORS = {
     "[STATE]":  "#555",    "[ERR]":    "#ff6b6b",
     "[WARN]":   "#f8b400", "[HEALTH]": "#f8b400",
     "[PVP]":    "#ff6b6b", "[START]":  "#4ecca3",
+    "[SYNC]":   "#c5a3ff",
 }
 
 def _log_color(line):
@@ -85,6 +82,9 @@ Authenticate=0
 OnlineMode=0
 ServerID=CuberiteEngine
 PlayerRestrictIP=0
+
+[Plugins]
+Plugin=WCSync
 
 [Server]
 Description=Distributed World Engine
@@ -172,22 +172,78 @@ Color=c
 Inherits=Default
 """.strip()
 
+PLUGIN_INFO = """
+g_PluginInfo = {
+    Name = "WCSync",
+    Version = "1",
+    Date = "2026-03-14",
+    Description = "Merkezi Envanter ve Veri Senkronizasyonu"
+}
+"""
+
+PLUGIN_MAIN = """
+function Initialize(Plugin)
+    Plugin:SetName("WCSync")
+    Plugin:SetVersion(1)
+    cPluginManager:AddHook(cPluginManager.HOOK_PLAYER_JOINED, OnPlayerJoined)
+    cPluginManager:AddHook(cPluginManager.HOOK_PLAYER_DESTROYED, OnPlayerDestroyed)
+    LOG("[SYNC] WCSync (Merkezi Senkronizasyon) basariyla yuklendi!")
+    return true
+end
+
+function OnPlayerJoined(Player)
+    local proxy = os.getenv("PROXY_URL")
+    if proxy and proxy ~= "" then
+        local uuid = Player:GetUUID()
+        local path = "world/players/" .. uuid .. ".json"
+        local name = Player:GetName()
+        -- Sunucudan dosyayi indir
+        local cmd = "curl -s -f -o " .. path .. " " .. proxy .. "/api/player?name=" .. name
+        os.execute(cmd)
+        -- Cuberite'in yeni dosyayi okumasini sagla (Envanter, Zirh, Can, XP esitlenir)
+        Player:LoadFromDisk()
+        LOG("[SYNC] " .. name .. " verileri merkezden cekildi.")
+    end
+end
+
+function OnPlayerDestroyed(Player)
+    local proxy = os.getenv("PROXY_URL")
+    if proxy and proxy ~= "" then
+        -- Cikarken Cuberite'in son durumu diske yazmasini zorla
+        Player:SaveToDisk()
+        local uuid = Player:GetUUID()
+        local path = "world/players/" .. uuid .. ".json"
+        local name = Player:GetName()
+        -- Arka planda API'ye gonder (sunucuyu dondurmamak icin komut sonuna & koyuyoruz)
+        local cmd = "curl -s -X POST -H 'Content-Type: application/json' -d @" .. path .. " " .. proxy .. "/api/player?name=" .. name .. " &"
+        os.execute(cmd)
+        LOG("[SYNC] " .. name .. " verileri merkeze gonderildi.")
+    end
+end
+"""
+
 
 def write_configs(server_dir=SERVER_DIR):
     bins = glob.glob(f"{server_dir}/**/Cuberite", recursive=True)
     if bins:
         server_dir = str(pathlib.Path(bins[0]).parent)
+    
+    # Proxy sunucusunda veritabani (oyuncu) dosyalarini saklayacagimiz klasor
+    pathlib.Path(f"{DATA_DIR}/players").mkdir(parents=True, exist_ok=True)
+    
     files = {
         f"{server_dir}/settings.ini":    SETTINGS_INI,
         f"{server_dir}/webadmin.ini":    WEBADMIN_INI,
         f"{server_dir}/world/world.ini": WORLD_INI,
         f"{server_dir}/groups.ini":      GROUPS_INI,
+        f"{server_dir}/Plugins/WCSync/Info.lua": PLUGIN_INFO,
+        f"{server_dir}/Plugins/WCSync/main.lua": PLUGIN_MAIN,
         "/server/world/world.ini":       WORLD_INI,
     }
     for path, content in files.items():
         try:
             pathlib.Path(path).parent.mkdir(parents=True, exist_ok=True)
-            pathlib.Path(path).write_text(content + "\n", encoding="utf-8")
+            pathlib.Path(path).write_text(content.strip() + "\n", encoding="utf-8")
         except Exception as e:
             print(f"[CFG] HATA {path}: {e}")
 
@@ -532,20 +588,6 @@ def save_backends(b):
     pathlib.Path(BACKENDS_FILE).parent.mkdir(parents=True, exist_ok=True)
     pathlib.Path(BACKENDS_FILE).write_text(json.dumps(b, indent=2))
 
-def pick_backend():
-    backends = load_backends()
-    if not backends: return None
-    counts = {}
-    for c in list(_active):
-        k = f"{c.backend_host}:{c.backend_port}"
-        counts[k] = counts.get(k, 0) + 1
-    for b in sorted(backends,
-                    key=lambda x: counts.get(f"{x['host']}:{x['port']}", 0),
-                    reverse=False):  # En az dolu sunucuyu seç
-        if counts.get(f"{b['host']}:{b['port']}", 0) < 998:
-            return b
-    return backends[0]
-
 
 # ══════════════════════════════════════════════════════════
 #  OYUNCU BAGLANTISI  (MITM Proxy)
@@ -668,8 +710,7 @@ class PlayerConn:
                         try:
                             self.username, _ = mc_str_dec(payload)
                             self.cs_info = cs_state.register(self.username, self)
-                            print(f"[JOIN] {self.username} -> "
-                                  f"{self.backend_host}:{self.backend_port}")
+                            print(f"[JOIN] {self.username}")
                         except Exception: pass
                     self.server_w.write(raw); await self.server_w.drain()
                     continue
@@ -780,17 +821,38 @@ class PlayerConn:
                 except Exception: pass
 
     async def run(self):
-        b = pick_backend()
-        if not b:
-            # Sadece ping atan servislere "backend yok" hatasi basma sessizce kapat
+        backends = load_backends()
+        if not backends:
+            # Hic sunucu yoksa sessizce kapat
             self.client_w.close(); return
-        try:
-            await self.connect_backend(b)
-        except Exception as e:
-            self.client_w.close(); return
+
+        # En az oyuncu olan sunucudan baslayarak sirala
+        counts = {}
+        for c in list(_active):
+            if c.username != "?":
+                k = f"{c.backend_host}:{c.backend_port}"
+                counts[k] = counts.get(k, 0) + 1
+                
+        sorted_backends = sorted(backends, key=lambda x: counts.get(f"{x['host']}:{x['port']}", 0))
+
+        # Aktif/uyanik bir sunucu bulana kadar hepsini dene
+        connected = False
+        for b in sorted_backends:
+            try:
+                await self.connect_backend(b)
+                connected = True
+                break # Baglanti basarili, donguden cik
+            except Exception as e:
+                continue
+
+        # Eger listedeki HICBIR sunucu uyanik degilse baglantiyi kes
+        if not connected:
+            self.client_w.close()
+            return
+
         async with _active_lock:
             _active.append(self)
-        # [CONN] spam'ini engellemek için buradan kaldırdık
+        
         await asyncio.gather(self.pipe_s2c(), self.pipe_c2s())
 
 
@@ -799,7 +861,7 @@ async def handle_player(cr, cw):
 
 
 # ══════════════════════════════════════════════════════════
-#  HTTP DURUM SAYFASI
+#  HTTP DURUM SAYFASI VE API
 # ══════════════════════════════════════════════════════════
 
 HTML = """\
@@ -904,7 +966,7 @@ HTML = """\
         <button class="flt on" data-f="">TÜMÜ</button>
         <button class="flt" data-f="ERR">HATA</button>
         <button class="flt" data-f="WARN">UYARI</button>
-        <button class="flt" data-f="CONN,JOIN,QUIT">OYUNCU</button>
+        <button class="flt" data-f="CONN,JOIN,QUIT,SYNC">OYUNCU</button>
         <button class="flt" data-f="BORE,REG">TUNNEL</button>
         <button class="flt" data-f="MC">MC</button>
         <button class="clr" id="clrBtn">TEMİZLE</button>
@@ -971,8 +1033,10 @@ def _build_rows():
     backends = load_backends()
     counts = {}
     for c in list(_active):
-        k = f"{c.backend_host}:{c.backend_port}"
-        counts[k] = counts.get(k, 0) + 1
+        # Sadece oyuna tam girenleri ("?" olmayanları) say
+        if c.username != "?":
+            k = f"{c.backend_host}:{c.backend_port}"
+            counts[k] = counts.get(k, 0) + 1
     rows = ""
     for b in backends:
         k     = f"{b['host']}:{b['port']}"
@@ -1009,9 +1073,12 @@ def _build_html():
                       '⏳ Tunnel başlatılıyor...</div></div>')
 
     rows, backends = _build_rows()
+    # Toplam listeyi degil, sadece isimsiz olmayanlari sayiyoruz
+    real_player_count = sum(1 for c in list(_active) if c.username != "?")
+
     return HTML.format(
         addr_block   = addr_block,
-        player_count = len(_active),
+        player_count = real_player_count,
         block_count  = len(world_state.blocks),
         server_count = len(backends),
         rows         = rows,
@@ -1023,6 +1090,24 @@ class _H(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         try:
+            # === PLAYER DB FETCH (LUA EKLENTISI BURAYA SORAR) ===
+            if self.path.startswith("/api/player?name="):
+                name = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get('name', [''])[0]
+                name = "".join(c for c in name if c.isalnum() or c in "-_")
+                filepath = f"{DATA_DIR}/players/{name}.json"
+                
+                if os.path.exists(filepath):
+                    body = pathlib.Path(filepath).read_bytes()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+                return
+
             if self.path == "/api/logs/stream":
                 import queue as _q
                 q = _q.Queue(maxsize=200)
@@ -1060,8 +1145,10 @@ class _H(http.server.BaseHTTPRequestHandler):
             if self.path == "/api/status":
                 rows, backends = _build_rows()
                 bore = _get_bore()
+                # API icin de sadece gercek oyunculari saydiriyoruz
+                real_player_count = sum(1 for c in list(_active) if c.username != "?")
                 payload = {
-                    "players":    len(_active),
+                    "players":    real_player_count,
                     "blocks":     len(world_state.blocks),
                     "servers":    len(backends),
                     "mode":       MODE.upper(),
@@ -1099,6 +1186,22 @@ class _H(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         try:
+            # === PLAYER DB SAVE (LUA EKLENTISI BURAYA KAYDEDER) ===
+            if self.path.startswith("/api/player?name="):
+                name = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get('name', [''])[0]
+                name = "".join(c for c in name if c.isalnum() or c in "-_")
+                filepath = f"{DATA_DIR}/players/{name}.json"
+                pathlib.Path(f"{DATA_DIR}/players").mkdir(parents=True, exist_ok=True)
+                
+                length = int(self.headers.get("Content-Length", 0))
+                data = self.rfile.read(length)
+                if data:
+                    pathlib.Path(filepath).write_bytes(data)
+                    self._r(200, "ok")
+                else:
+                    self._r(400, "empty")
+                return
+
             length = int(self.headers.get("Content-Length", 0))
             try: data = json.loads(self.rfile.read(length))
             except Exception: self._r(400, "bad json"); return
