@@ -5,6 +5,7 @@
   • MC 1.8 offline protokol MITM (şifresiz → tam kontrol)
   • Cross-server entity sync (PvP, Chat, Blok)
   • Merkezi Envanter: Python Log Avcısı + Cuberite Stdin
+  • Anti-Dupe: 10 Saniyede Bir Otomatik Kayıt
   • Akıllı Failover: Uyuyan sunuculari pingler ve uyandirir
 """
 
@@ -172,7 +173,7 @@ g_PluginInfo = {
     Name = "WCSync",
     Version = "1",
     Date = "2026-03-14",
-    Description = "Merkezi Envanter Senkronizasyonu"
+    Description = "Merkezi Envanter Senkronizasyonu (Anti-Dupe)"
 }
 """
 
@@ -183,23 +184,32 @@ function Initialize(Plugin)
     cPluginManager:AddHook(cPluginManager.HOOK_PLAYER_JOINED, OnPlayerJoined)
     cPluginManager:AddHook(cPluginManager.HOOK_PLAYER_DESTROYED, OnPlayerDestroyed)
     cPluginManager:BindConsoleCommand("wcreload", HandleConsoleReload, "Python tetikleyici")
-    LOG("[SYNC] WCSync aktif! OS Sandbox bypass edildi.")
+    
+    -- Anti-Dupe: Her 10 saniyede bir tum oyunculari diske yaz
+    cRoot:Get():GetDefaultWorld():ScheduleTask(200, PeriodicSave)
+    
+    LOG("[SYNC] WCSync aktif! Anti-Dupe periyodik kayit devrede.")
     return true
 end
 
+function PeriodicSave(World)
+    World:ForEachPlayer(function(Player)
+        Player:SaveToDisk()
+        LOG("WCSYNC_SAVE:" .. Player:GetName() .. ":" .. Player:GetUUID())
+    end)
+    World:ScheduleTask(200, PeriodicSave)
+end
+
 function OnPlayerJoined(Player)
-    -- Log'a basiyoruz, disaridaki Python bu logu avlayip API indirmesi yapacak!
     LOG("WCSYNC_JOIN:" .. Player:GetName() .. ":" .. Player:GetUUID())
 end
 
 function OnPlayerDestroyed(Player)
     Player:SaveToDisk()
-    -- Python bunu gorup diske inen son veriyi buluta firlatacak
     LOG("WCSYNC_QUIT:" .. Player:GetName() .. ":" .. Player:GetUUID())
 end
 
 function HandleConsoleReload(Split)
-    -- Python API'den veriyi indirince bu komutu tetikler!
     if #Split > 1 then
         local name = Split[2]
         cRoot:Get():FindAndDoWithPlayer(name, function(P)
@@ -210,7 +220,6 @@ function HandleConsoleReload(Split)
     return true
 end
 """
-
 
 def write_configs(server_dir=SERVER_DIR):
     bins = glob.glob(f"{server_dir}/**/Cuberite", recursive=True)
@@ -313,11 +322,9 @@ def pos_dec(data, pos=0):
     return x, y, z, pos + 8
 
 def pkt_kick(reason, comp=-1):
-    # Paket 0x00 Login Kick (Kullanici oyuna girmeden kirmizi ekran verir)
     payload = mc_str_enc(json.dumps({"text": reason, "color": "yellow"}))
     return pkt_make(0x00, payload, comp)
 
-# Paket ID'leri (MC 1.8 / protocol 47)
 PID_JOIN_GAME     = 0x01
 PID_CHAT_SC       = 0x02
 PID_UPDATE_HEALTH = 0x06
@@ -450,7 +457,6 @@ class CrossServerState:
 cs_state = CrossServerState()
 
 
-# -- Paket builder'lar ----------------------------------------
 def _ang(deg): return struct.pack("B", int(deg / 360.0 * 256) & 0xFF)
 def _fp(coord): return struct.pack(">i", int(coord * 32))
 
@@ -550,11 +556,6 @@ def save_backends(b):
     pathlib.Path(BACKENDS_FILE).write_text(json.dumps(b, indent=2))
 
 async def check_backend_alive(host, port):
-    """
-    Sadece portun acik olup olmadigina bakmaz!
-    Gercek Minecraft Status Request (Ping) paketi atar. 
-    Sunucu uykudaysa (hibernate) Timeout yer ve False doner.
-    """
     try:
         reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=2.0)
         hs = vi_enc(47) + mc_str_enc("127.0.0.1") + struct.pack(">H", int(port)) + vi_enc(1)
@@ -774,8 +775,6 @@ class PlayerConn:
         connected = False
         for b in sorted_backends:
             lbl = b.get("label", "")
-            
-            # SUNUCU UYKUDAYSA UYANDIRMA SINYALI AT
             if "onrender.com" in lbl:
                 async def wakeup(u):
                     try:
@@ -786,7 +785,6 @@ class PlayerConn:
                     except: pass
                 asyncio.ensure_future(wakeup(lbl))
 
-            # HAYALET TÜNELE KARŞI GERÇEK SAĞLIK KONTROLÜ
             if await check_backend_alive(b["host"], b["port"]):
                 try:
                     await self.connect_backend(b)
@@ -906,12 +904,6 @@ HTML = """\
   <div class="panel">
     <div class="panel-hdr"><span class="panel-hdr-title">Game Servers</span><span style="font-size:.68rem;color:var(--dim)">otomatik yenilenir</span></div>
     <table id="srv-tbl"><tr><th>Sunucu</th><th>Oyuncu</th><th>Durum</th></tr>{rows}</table>
-    <div class="badges">
-      <span class="badge">Ultra Hafif</span><span class="badge">Crack Girişi</span>
-      <span class="badge">Ortak Dünya</span><span class="badge">Cross-Server Chat</span>
-      <span class="badge">Cross-Server PvP</span><span class="badge">Blok Senkron</span>
-      <span class="badge">999 Oyuncu</span>
-    </div>
   </div>
   <div class="panel">
     <div class="con-toolbar">
@@ -1029,7 +1021,6 @@ class _H(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         try:
-            # === MERKEZİ ENVANTER İNDİRME API'Sİ ===
             if self.path.startswith("/api/player?name="):
                 name = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get('name', [''])[0]
                 name = "".join(c for c in name if c.isalnum() or c in "-_")
@@ -1107,7 +1098,6 @@ class _H(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         try:
-            # === MERKEZİ ENVANTER YÜKLEME API'Sİ ===
             if self.path.startswith("/api/player?name="):
                 name = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get('name', [''])[0]
                 name = "".join(c for c in name if c.isalnum() or c in "-_")
@@ -1295,39 +1285,67 @@ def run_cuberite():
             if not line: continue
             print(f"{prefix} {line}")
             
-            # LUA "Biri girdi" dediginde -> Python dosyayi ceker, Cuberite'a 'yenile' komutu verir!
+            # --- 1. GİRİŞ (Dosya indirme işlemi) ---
             if "WCSYNC_JOIN:" in line:
                 def _do_join(ln):
                     try:
                         parts = ln.split("WCSYNC_JOIN:")[1].strip().split(":")
                         name, uuid = parts[0], parts[1]
+                        uuid_clean = uuid.replace("-", "")
+                        
                         req = urllib.request.Request(f"{proxy_url}/api/player?name={name}")
                         resp = urllib.request.urlopen(req, timeout=5)
                         data = resp.read()
-                        p = pathlib.Path(f"/server/world/players/{uuid}.json")
-                        p.parent.mkdir(parents=True, exist_ok=True)
-                        p.write_bytes(data)
+                        
+                        paths = [
+                            pathlib.Path(f"/server/world/players/{uuid}.json"),
+                            pathlib.Path(f"/server/world/players/{uuid_clean}.json")
+                        ]
+                        for p in paths:
+                            p.parent.mkdir(parents=True, exist_ok=True)
+                            p.write_bytes(data)
+                            
                         proc.stdin.write(f"wcreload {name}\n")
                         proc.stdin.flush()
                         print(f"[SYNC] {name} envanteri merkezden indirildi.")
-                    except Exception: pass
+                    except Exception as e:
+                        if "404" not in str(e):
+                            print(f"[SYNC] Hata (Join): {e}")
+
                 threading.Thread(target=_do_join, args=(line,), daemon=True).start()
                 
-            # LUA "Biri cikti, diske yazdim" dediginde -> Python dosyayi merkeze firlatir!
-            elif "WCSYNC_QUIT:" in line:
-                def _do_quit(ln):
+            # --- 2. ÇIKIŞ & PERİYODİK KAYIT (Merkeze veri gönderme) ---
+            elif "WCSYNC_QUIT:" in line or "WCSYNC_SAVE:" in line:
+                def _do_upload(ln):
                     try:
-                        parts = ln.split("WCSYNC_QUIT:")[1].strip().split(":")
+                        time.sleep(1.5) # Diske yazma payı (Race Condition onleyici)
+                        
+                        tag = "WCSYNC_QUIT:" if "WCSYNC_QUIT:" in ln else "WCSYNC_SAVE:"
+                        parts = ln.split(tag)[1].strip().split(":")
                         name, uuid = parts[0], parts[1]
-                        p = pathlib.Path(f"/server/world/players/{uuid}.json")
-                        if p.exists():
-                            data = p.read_bytes()
+                        uuid_clean = uuid.replace("-", "")
+                        
+                        p1 = pathlib.Path(f"/server/world/players/{uuid}.json")
+                        p2 = pathlib.Path(f"/server/world/players/{uuid_clean}.json")
+                        target_p = p1 if p1.exists() else (p2 if p2.exists() else None)
+                        
+                        if target_p:
+                            data = target_p.read_bytes()
                             req = urllib.request.Request(f"{proxy_url}/api/player?name={name}", data=data, method="POST")
                             req.add_header("Content-Type", "application/json")
                             urllib.request.urlopen(req, timeout=5)
-                            print(f"[SYNC] {name} envanteri merkeze kaydedildi.")
-                    except Exception: pass
-                threading.Thread(target=_do_quit, args=(line,), daemon=True).start()
+                            
+                            # Log kirliligi yapmamasi adina periyodik save'leri yazdirmayabiliriz. 
+                            # Cikis yapildiginda loga mutlaka basilir.
+                            if "QUIT" in tag:
+                                print(f"[SYNC] {name} envanteri merkeze kaydedildi. ({target_p.name})")
+                        else:
+                            if "QUIT" in tag:
+                                print(f"[WARN] Senkronizasyon Atlandı: {name} kayit dosyasi bulunamadi!")
+                    except Exception as e: 
+                        print(f"[SYNC] Hata (Upload): {e}")
+
+                threading.Thread(target=_do_upload, args=(line,), daemon=True).start()
 
     while True:
         print(f"[MC] Cuberite baslatiliyor: {mc_bin}")
