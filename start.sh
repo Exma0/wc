@@ -24,27 +24,34 @@ MC_DIR=$(dirname "$MC_BIN")
 chmod +x "$MC_BIN"
 echo "[✓] Cuberite: $MC_BIN  |  Dizin: $MC_DIR"
 
-# ─── 3. Sadece chunk verisini sil, oyuncu verisini KORU ───
-# Cuberite dünya klasörü yapısı:
-#   world/regions/   ← chunk/terrain verisi  → SİL (yeni dünya)
-#   world/players/   ← envanter/konum        → KORU
-#   world/world.ini  ← config                → KORU (server.py yazar)
+# ─── 3. Dünya sıfırlama — SADECE İLK SEFERINDE ────────
+# Yapılar da regions/ içinde saklanır, bu yüzden bir kez sil
+# ve bayrak dosyası bırak → bir daha asla silme
 #
-echo "[✓] Chunk verisi temizleniyor (oyuncu verisi korunuyor)..."
-for WORLD_PATH in "/server/world" "/server/Server/world" "$MC_DIR/world"; do
-    if [ -d "$WORLD_PATH" ]; then
-        # Sadece terrain/chunk klasörlerini sil
-        rm -rf "$WORLD_PATH/regions"      2>/dev/null || true
-        rm -rf "$WORLD_PATH/nether"       2>/dev/null || true
-        rm -rf "$WORLD_PATH/nether_nether" 2>/dev/null || true
-        rm -rf "$WORLD_PATH/end"          2>/dev/null || true
-        rm -f  "$WORLD_PATH"/*.mca        2>/dev/null || true
-        rm -f  "$WORLD_PATH"/*.mcr        2>/dev/null || true
-        echo "[✓] Chunk temizlendi: $WORLD_PATH  (players/ korundu)"
-    fi
-done
-mkdir -p /server/world/players
-echo "[✓] Oyuncu verisi güvende, yeni dünya oluşturulacak."
+#   world/regions/      ← terrain + oyuncu yapıları  → İLK SEFERDE SİL
+#   world/players/      ← envanter, can, konum       → HİÇ DOKUNMA
+#   world/.initialized  ← bayrak dosyası             → sonraki açılışlarda atla
+#
+FLAG="/server/world/.void_initialized"
+
+if [ ! -f "$FLAG" ]; then
+    echo "[✓] İlk başlatma: eski dünya temizleniyor..."
+    for WORLD_PATH in "/server/world" "/server/Server/world" "$MC_DIR/world"; do
+        if [ -d "$WORLD_PATH" ]; then
+            rm -rf "$WORLD_PATH/regions"       2>/dev/null || true
+            rm -rf "$WORLD_PATH/nether"        2>/dev/null || true
+            rm -rf "$WORLD_PATH/end"           2>/dev/null || true
+            rm -f  "$WORLD_PATH"/*.mca         2>/dev/null || true
+            rm -f  "$WORLD_PATH"/*.mcr         2>/dev/null || true
+            echo "[✓] Eski terrain silindi: $WORLD_PATH"
+        fi
+    done
+    mkdir -p /server/world/players
+    touch "$FLAG"
+    echo "[✓] Yeni void dünya hazır. Bayrak bırakıldı → bir daha silinmeyecek."
+else
+    echo "[✓] Dünya verisi korunuyor (yapılar + oyuncu verisi güvende)."
+fi
 
 # ─── 4. HTTP Durum Sayfası ──────────────────────────
 echo "[✓] HTTP durum sayfası başlatılıyor (port 8080)..."
