@@ -32,7 +32,7 @@ _LOG_COLORS = {
     "[STATE]":  "#555",    "[ERR]":    "#ff6b6b",
     "[WARN]":   "#f8b400", "[HEALTH]": "#f8b400",
     "[PVP]":    "#ff6b6b", "[START]":  "#4ecca3",
-    "[SYNC]":   "#c5a3ff", "[YAVER]":  "#f9a8d4",
+    "[SYNC]":   "#c5a3ff",
 }
 
 def _log_color(line):
@@ -81,7 +81,6 @@ PlayerRestrictIP=0
 
 [Plugins]
 Plugin=WCSync
-Plugin=Yaver
 
 [Server]
 Description=Distributed World Engine
@@ -131,11 +130,11 @@ Z=0
 AnimatedTimeSpeed=20
 
 [Mobs]
-AnimalsOn=1
-MaxAnimals=20
-MaxMonsters=15
-MonstersOn=1
-WolvesOn=1
+AnimalsOn=0
+MaxAnimals=0
+MaxMonsters=0
+MonstersOn=0
+WolvesOn=0
 
 [Weather]
 ChangeWeather=0
@@ -173,299 +172,6 @@ g_PluginInfo = {
     Date = "2026-03-14",
     Description = "Merkezi Envanter Senkronizasyonu (Anti-Dupe)"
 }
-"""
-
-YAVER_PLUGIN_INFO = """
-g_PluginInfo = {
-    Name = "Yaver",
-    Version = "3",
-    Date = "2026-03-14",
-    Description = "Gelismis Yaver (Dost Kurt) Sistemi — Savaş Zekası, Çanta, Seviye"
-}
-"""
-
-YAVER_PLUGIN_MAIN = """
-local Yaverler = {}
-local IsimDegistirenler = {}
-local TickSayaci = 0
-
-function Initialize(Plugin)
-    Plugin:SetName("Yaver")
-    Plugin:SetVersion(3)
-
-    cPluginManager:AddHook(cPluginManager.HOOK_PLAYER_JOINED,           OnPlayerJoined)
-    cPluginManager:AddHook(cPluginManager.HOOK_PLAYER_USING_ITEM,       OnPlayerUsingItem)
-    cPluginManager:AddHook(cPluginManager.HOOK_PLAYER_WINDOW_CLICK,     OnPlayerWindowClick)
-    cPluginManager:AddHook(cPluginManager.HOOK_PLAYER_TOSSED_ITEM,      OnPlayerTossedItem)
-    cPluginManager:AddHook(cPluginManager.HOOK_CHAT,                    OnChat)
-    cPluginManager:AddHook(cPluginManager.HOOK_PLAYER_RIGHT_CLICKED_ENTITY, OnRightClickEntity)
-    cPluginManager:AddHook(cPluginManager.HOOK_PLAYER_BROKEN_BLOCK,     OnBlockBroken)
-    cPluginManager:AddHook(cPluginManager.HOOK_ENTITY_TAKE_DAMAGE,      OnEntityTakeDamage)
-    cPluginManager:AddHook(cPluginManager.HOOK_TICK,                    OnTick)
-
-    LOG("[YAVER] Gelismis Zeka, Q Kisayolu ve Savas modulleri aktif!")
-    return true
-end
-
--- Oyuncu girisinde envanterinin 9. slotuna Yaver Menusu esyasini ver
-function OnPlayerJoined(Player)
-    local menuEsyasi = cItem(E_ITEM_NETHER_STAR)
-    menuEsyasi.m_CustomName = "\\xc2\\xa7eYaver Menusu \\xc2\\xa77(Sag Tik / Q Tusu)"
-    Player:GetInventory():SetHotbarSlot(8, menuEsyasi)
-    -- Proxy'e bildir (WCSync ile uyumlu)
-    LOG("YAVER_JOIN:" .. Player:GetName() .. ":" .. Player:GetUUID())
-end
-
--- Q tusu ile canta acma (esya firlatma hook'u araciligiyla)
-function OnPlayerTossedItem(Player, ItemX, ItemY, ItemZ, Item)
-    if Item.m_ItemType == E_ITEM_NETHER_STAR
-       and Item.m_CustomName == "\\xc2\\xa7eYaver Menusu \\xc2\\xa77(Sag Tik / Q Tusu)" then
-        local uuid = Player:GetUUID()
-        if Yaverler[uuid] and Yaverler[uuid].Inventory then
-            Player:OpenWindow(Yaverler[uuid].Inventory)
-            Player:SendMessageSuccess("Yaver cantasi acildi!")
-        else
-            Player:SendMessageFailure("Once menuye sag tiklayip yaverini cagirmalisin!")
-        end
-        return true  -- Esyanin yere dusmesini engeller
-    end
-    return false
-end
-
--- Sag tik ile ana menu
-function OnPlayerUsingItem(Player, BlockX, BlockY, BlockZ, BlockFace, CursorX, CursorY, CursorZ)
-    local item = Player:GetEquippedItem()
-    if item.m_ItemType == E_ITEM_NETHER_STAR
-       and item.m_CustomName == "\\xc2\\xa7eYaver Menusu \\xc2\\xa77(Sag Tik / Q Tusu)" then
-        ArayuzAc(Player)
-        return true
-    end
-    return false
-end
-
-function ArayuzAc(Player)
-    local Window = cLuaWindow:Create(cWindow.wtChest, 1, 9, "\\xc2\\xa7lYaver Yonetimi")
-
-    local cagir = cItem(E_ITEM_BONE)
-    cagir.m_CustomName = "\\xc2\\xa7aYaveri Cagir / Bilgi"
-    Window:SetSlot(0, 2, cagir)
-
-    local canta = cItem(E_BLOCK_CHEST)
-    canta.m_CustomName = "\\xc2\\xa76Cantayi Ac (Kisayol: Q)"
-    Window:SetSlot(0, 4, canta)
-
-    local isim = cItem(E_ITEM_NAME_TAG)
-    isim.m_CustomName = "\\xc2\\xa7dIsim Degistir"
-    Window:SetSlot(0, 6, isim)
-
-    Player:OpenWindow(Window)
-end
-
-function OnPlayerWindowClick(Player, Window, SlotNum, ClickAction, ClickedItem)
-    if Window:GetWindowTitle() == "\\xc2\\xa7lYaver Yonetimi" then
-        local uuid = Player:GetUUID()
-
-        -- Slot 2: Yaveri cagir veya bilgileri goster
-        if SlotNum == 2 then
-            if not Yaverler[uuid] then
-                local entityID = Player:GetWorld():SpawnMob(
-                    Player:GetPosX(), Player:GetPosY(), Player:GetPosZ(), cMonster.mtWolf)
-                Player:GetWorld():DoWithEntityByID(entityID, function(Entity)
-                    local Wolf = tolua.cast(Entity, "cWolf")
-                    Wolf:SetIsTame(true)
-                    Wolf:SetOwner(Player:GetName())
-                    Wolf:SetCustomName(Player:GetName() .. "'in Yaveri")
-                    Wolf:SetCustomNameAlwaysVisible(true)
-                    Yaverler[uuid] = {
-                        EntityID  = entityID,
-                        Level     = 1,
-                        XP        = 0,
-                        Inventory = cLuaWindow:Create(cWindow.wtChest, 3, 9, "Yaver Cantasi")
-                    }
-                    Player:SendMessageSuccess("Yaverin savasa hazir!")
-                    LOG("YAVER_SPAWN:" .. Player:GetName() .. ":Sv1")
-                end)
-            else
-                local y = Yaverler[uuid]
-                Player:SendMessageInfo("\\xc2\\xa7a--- Yaver Bilgileri ---")
-                Player:SendMessageInfo("Seviye: " .. y.Level .. " | XP: " .. y.XP
-                    .. "/" .. (y.Level * 100))
-            end
-
-        -- Slot 4: Cantayi ac
-        elseif SlotNum == 4 then
-            if Yaverler[uuid] and Yaverler[uuid].Inventory then
-                Player:CloseWindow()
-                Player:OpenWindow(Yaverler[uuid].Inventory)
-                return true
-            end
-
-        -- Slot 6: Isim degistir
-        elseif SlotNum == 6 then
-            if Yaverler[uuid] then
-                IsimDegistirenler[uuid] = true
-                Player:CloseWindow()
-                Player:SendMessageInfo(
-                    "\\xc2\\xa7eLutfen sohbete (chat) yaverinin yeni ismini yazin.")
-                return true
-            end
-        end
-
-        Player:CloseWindow()
-        return true
-    end
-    return false
-end
-
--- Chat'ten isim degistirme
-function OnChat(Player, Message)
-    local uuid = Player:GetUUID()
-    if IsimDegistirenler[uuid] then
-        if Yaverler[uuid] then
-            Player:GetWorld():DoWithEntityByID(Yaverler[uuid].EntityID, function(Entity)
-                Entity:SetCustomName(Message)
-                Entity:SetCustomNameAlwaysVisible(true)
-                Player:SendMessageSuccess("Yaverinin ismi '" .. Message .. "' oldu!")
-            end)
-        end
-        IsimDegistirenler[uuid] = nil
-        return true  -- Mesaji sohbete dusmesini engeller
-    end
-    return false
-end
-
--- Kurt sahibine sag tiklaninca canta acar
-function OnRightClickEntity(Player, Entity)
-    if not Entity:IsMob() or Entity:GetMobType() ~= cMonster.mtWolf then return false end
-    local Wolf = tolua.cast(Entity, "cWolf")
-    if Wolf:GetOwnerName() ~= Player:GetName() then return false end
-    local uuid = Player:GetUUID()
-    if Yaverler[uuid] and Yaverler[uuid].Inventory then
-        Player:OpenWindow(Yaverler[uuid].Inventory)
-        return true
-    end
-    return false
-end
-
--- Blok kirma yardimi + XP kazanma
-function OnBlockBroken(Player, BlockX, BlockY, BlockZ, BlockFace, BlockType, BlockMeta)
-    local uuid = Player:GetUUID()
-    if not Yaverler[uuid] then return false end
-    local World    = Player:GetWorld()
-    local isNear   = false
-
-    World:DoWithEntityByID(Yaverler[uuid].EntityID, function(Entity)
-        local dist = (Entity:GetPosX() - BlockX)^2 + (Entity:GetPosZ() - BlockZ)^2
-        if dist < 64 then isNear = true end
-    end)
-
-    if not isNear then return false end
-
-    -- Seviye basvuru bonusu: Sv1=%7, Sv5=%15, vs.
-    local yardimIhtimali = 5 + (Yaverler[uuid].Level * 2)
-
-    if math.random(1, 100) <= yardimIhtimali then
-        if BlockType == E_BLOCK_LOG or BlockType == E_BLOCK_LOG_UPDATE then
-            World:SpawnItemPickups(cItems(cItem(E_BLOCK_LOG, 1, BlockMeta)), BlockX, BlockY, BlockZ)
-            Yaverler[uuid].XP = Yaverler[uuid].XP + 2
-        elseif BlockType == E_BLOCK_IRON_ORE
-            or BlockType == E_BLOCK_GOLD_ORE
-            or BlockType == E_BLOCK_DIAMOND_ORE then
-            World:SpawnItemPickups(cItems(cItem(BlockType, 1, BlockMeta)), BlockX, BlockY, BlockZ)
-            Yaverler[uuid].XP = Yaverler[uuid].XP + 5
-        end
-        CheckLevelUp(Player, Yaverler[uuid], nil)
-    end
-    return false
-end
-
--- Savas Zekasi: Hasar carpani (sv basa +1 hasar) ve olum tespiti
-function OnEntityTakeDamage(Receiver, Attacker, RawDamageType, RawDamage, DamageCalc)
-    -- Yaver saldiriyorsa seviyeye gore ekstra hasar ekle
-    if Attacker ~= nil
-       and Attacker:IsMob()
-       and Attacker:GetMobType() == cMonster.mtWolf then
-        local Wolf = tolua.cast(Attacker, "cWolf")
-        cRoot:Get():FindAndDoWithPlayer(Wolf:GetOwnerName(), function(Player)
-            local yInfo = Yaverler[Player:GetUUID()]
-            if yInfo then
-                DamageCalc:AddDamage(yInfo.Level)  -- Sv basi +1 hasar
-            end
-        end)
-    end
-
-    -- Yaver hasar aliyorsa ve olurse kaydi temizle
-    if Receiver:IsMob() and Receiver:GetMobType() == cMonster.mtWolf then
-        local Wolf = tolua.cast(Receiver, "cWolf")
-        if Wolf:GetHealth() - DamageCalc:GetFinalDamage() <= 0 then
-            cRoot:Get():FindAndDoWithPlayer(Wolf:GetOwnerName(), function(Player)
-                local uuid = Player:GetUUID()
-                LOG("YAVER_DEAD:" .. Player:GetName())
-                Yaverler[uuid] = nil
-                Player:SendMessageFailure(
-                    "Yaverin agir yaralandi! Onu arayuzden tekrar cagirmalisin.")
-            end)
-        end
-    end
-    return false
-end
-
--- Gelismis Zeka: Otomatik yemek yeme (saniyede 1 kontrol)
-function OnTick(TimeDelta)
-    TickSayaci = TickSayaci + 1
-    if TickSayaci < 20 then return end
-    TickSayaci = 0
-
-    for uuid, yInfo in pairs(Yaverler) do
-        cRoot:Get():FindAndDoWithPlayer(uuid, function(Player)
-            Player:GetWorld():DoWithEntityByID(yInfo.EntityID, function(Entity)
-                local Wolf   = tolua.cast(Entity, "cWolf")
-                local hp     = Wolf:GetHealth()
-                local maxHp  = Wolf:GetMaxHealth()
-
-                if hp < (maxHp / 2) then
-                    local envanter = yInfo.Inventory
-                    for i = 0, 26 do
-                        local item = envanter:GetSlot(0, i)
-                        if item.m_ItemType == E_ITEM_COOKED_BEEF
-                           or item.m_ItemType == E_ITEM_RAW_BEEF then
-                            item.m_ItemCount = item.m_ItemCount - 1
-                            if item.m_ItemCount <= 0 then item:Empty() end
-                            envanter:SetSlot(0, i, item)
-                            Wolf:Heal(8)
-                            Player:SendMessageInfo(
-                                "\\xc2\\xa7aYaverin cantasindaki eti yedi ve canini yeniledi!")
-                            break
-                        end
-                    end
-                end
-            end)
-        end)
-    end
-end
-
-function CheckLevelUp(Player, yInfo, EntityInstance)
-    local reqXP = yInfo.Level * 100
-    if yInfo.XP < reqXP then return end
-
-    yInfo.Level = yInfo.Level + 1
-    yInfo.XP    = 0
-    Player:SendMessageSuccess(
-        "\\xc2\\xa76Tebrikler! Yaverin Seviye " .. yInfo.Level
-        .. " oldu! Artik daha sert vuruyor.")
-    LOG("YAVER_LEVELUP:" .. Player:GetName() .. ":Sv" .. yInfo.Level)
-
-    local function applyBuff(Ent)
-        Ent:SetMaxHealth(20 + (yInfo.Level * 5))
-        Ent:Heal(100)
-    end
-
-    if EntityInstance then
-        applyBuff(EntityInstance)
-    else
-        Player:GetWorld():DoWithEntityByID(yInfo.EntityID, applyBuff)
-    end
-end
 """
 
 PLUGIN_MAIN = """
@@ -524,10 +230,8 @@ def write_configs(server_dir=SERVER_DIR):
         f"{server_dir}/webadmin.ini":    WEBADMIN_INI,
         f"{server_dir}/world/world.ini": WORLD_INI,
         f"{server_dir}/groups.ini":      GROUPS_INI,
-        f"{server_dir}/Plugins/WCSync/Info.lua":  PLUGIN_INFO,
-        f"{server_dir}/Plugins/WCSync/main.lua":  PLUGIN_MAIN,
-        f"{server_dir}/Plugins/Yaver/Info.lua":   YAVER_PLUGIN_INFO,
-        f"{server_dir}/Plugins/Yaver/main.lua":   YAVER_PLUGIN_MAIN,
+        f"{server_dir}/Plugins/WCSync/Info.lua": PLUGIN_INFO,
+        f"{server_dir}/Plugins/WCSync/main.lua": PLUGIN_MAIN,
         "/server/world/world.ini":       WORLD_INI,
     }
     for path, content in files.items():
@@ -949,6 +653,9 @@ class PlayerConn:
         try:
             while True:
                 pid, payload, raw = await pkt_read(self.client_r, self.comp)
+                # Handshake ve Login Start zaten _pre_read_client_hello tarafindan
+                # okundu ve backend'e gonderildi. Buraya artik play paketi gelir.
+                # Yine de state makinesini guvenceye alalim:
                 if self.state == "handshake":
                     if pid == 0x00:
                         try:
@@ -1052,10 +759,66 @@ class PlayerConn:
                 try: w.close()
                 except Exception: pass
 
+    async def _pre_read_client_hello(self):
+        """Backend aramadan ONCE istemcinin Handshake + Login Start paketlerini
+        oku. Boylece self.state ve self.username dogru set edilir, kick
+        gonderilebilir hale gelir."""
+        self._client_buf = []
+        try:
+            pid, payload, raw = await asyncio.wait_for(
+                pkt_read(self.client_r, -1), timeout=5.0)
+            self._client_buf.append(raw)
+            if pid == 0x00:
+                try:
+                    p = 0
+                    _, p = vi_dec(payload, p)
+                    _, p = mc_str_dec(payload, p)
+                    p += 2
+                    ns, _ = vi_dec(payload, p)
+                    if ns == 2:
+                        self.state = "login"
+                except Exception:
+                    pass
+            if self.state == "login":
+                pid2, payload2, raw2 = await asyncio.wait_for(
+                    pkt_read(self.client_r, -1), timeout=5.0)
+                self._client_buf.append(raw2)
+                if pid2 == 0x00:
+                    try:
+                        self.username, _ = mc_str_dec(payload2)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    async def _flush_client_buf(self):
+        """Tampona alinan ilk paketleri backend'e gonder."""
+        for raw in getattr(self, "_client_buf", []):
+            try:
+                self.server_w.write(raw)
+            except Exception:
+                pass
+        if getattr(self, "_client_buf", []):
+            try:
+                await self.server_w.drain()
+            except Exception:
+                pass
+        self._client_buf = []
+
     async def run(self):
+        # 1. Istemcinin ilk paketlerini backend aramadan once oku
+        await self._pre_read_client_hello()
+
         backends = load_backends()
         if not backends:
-            self.client_w.close(); return
+            try:
+                self.client_w.write(pkt_kick(
+                    "Hic aktif GameServer bulunamadi. Lutfen daha sonra tekrar deneyin.", -1))
+                await self.client_w.drain()
+            except Exception:
+                pass
+            self.client_w.close()
+            return
 
         counts = {}
         for c in list(_active):
@@ -1075,7 +838,8 @@ class PlayerConn:
                         writer.write(f"GET /api/status HTTP/1.1\r\nHost: {u}\r\nConnection: close\r\n\r\n".encode())
                         await writer.drain()
                         writer.close()
-                    except: pass
+                    except Exception:
+                        pass
                 asyncio.ensure_future(wakeup(lbl))
 
             if await check_backend_alive(b["host"], b["port"]):
@@ -1083,20 +847,27 @@ class PlayerConn:
                     await self.connect_backend(b)
                     connected = True
                     break
-                except Exception: pass
+                except Exception:
+                    pass
             else:
                 print(f"[WARN] Uykuda olan/Ölü sunucu atlandi: {lbl} ({b['host']}:{b['port']})")
 
+        # 2. Hic backend bulunamadi — state ne olursa olsun kick gonder
         if not connected:
             print("[ERR] Gecerli/Uyanik GameServer bulunamadi!")
-            if self.state == "login":
-                msg = "Sunucular uykudaydi ve su an UYANDIRILIYOR!\n\nLutfen 40 saniye sonra TEKRAR GIRIS YAPIN."
-                try:
-                    self.client_w.write(pkt_kick(msg, self.comp))
-                    await self.client_w.drain()
-                except: pass
+            msg = ("Sunucular uykudaydi ve su an UYANDIRILIYOR!\n\n"
+                   "Lutfen 40 saniye sonra TEKRAR GIRIS YAPIN.")
+            try:
+                # comp=-1: login asamasinda henuz sikilstirma yok
+                self.client_w.write(pkt_kick(msg, -1))
+                await self.client_w.drain()
+            except Exception:
+                pass
             self.client_w.close()
             return
+
+        # 3. Backend bulundu — tampondaki paketleri gonder, pipe baslat
+        await self._flush_client_buf()
 
         async with _active_lock:
             _active.append(self)
@@ -1605,22 +1376,7 @@ def run_cuberite():
                             print(f"[SYNC] Hata (Join): {e}")
 
                 threading.Thread(target=_do_join, args=(line,), daemon=True).start()
-
-            elif "YAVER_SPAWN:" in line or "YAVER_DEAD:" in line or "YAVER_LEVELUP:" in line:
-                # Yaver olaylarını loglara yansıt (ileride istatistik için genişletilebilir)
-                try:
-                    if "YAVER_SPAWN:" in line:
-                        player = line.split("YAVER_SPAWN:")[1].strip().split(":")[0]
-                        print(f"[YAVER] {player} yeni yaver cagirdi.")
-                    elif "YAVER_DEAD:" in line:
-                        player = line.split("YAVER_DEAD:")[1].strip()
-                        print(f"[YAVER] {player}'in yaveri oldu.")
-                    elif "YAVER_LEVELUP:" in line:
-                        parts = line.split("YAVER_LEVELUP:")[1].strip().split(":")
-                        print(f"[YAVER] {parts[0]} yaveri {parts[1] if len(parts)>1 else '?'} oldu!")
-                except Exception as e:
-                    print(f"[YAVER] Log parse hatasi: {e}")
-
+                
             elif "WCSYNC_QUIT:" in line or "WCSYNC_SAVE:" in line:
                 def _do_upload(ln):
                     try:
