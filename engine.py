@@ -5,7 +5,7 @@
   • MC 1.8 offline protokol MITM (şifresiz → tam kontrol)
   • Cross-server entity sync (PvP, Chat, Blok)
   • Anti-Dupe: 10 Saniyede Bir Otomatik Kayıt
-  • MAX PERFORMANCE: ViewDistance=4, Network Threshold Tweak
+  • Stabilizasyon: Race Condition, Drain Lock ve RAM Sızıntı korumaları
 """
 
 import asyncio, json, os, pathlib, struct, sys
@@ -18,7 +18,7 @@ import datetime
 #  CANLI LOG TAMPONU  (SSE konsolu için)
 # ══════════════════════════════════════════════════════════
 
-_LOG_BUF     = deque(maxlen=300) # RAM tasarrufu için 500'den 300'e çekildi
+_LOG_BUF     = deque(maxlen=300) 
 _LOG_LOCK    = threading.Lock()
 _SSE_CLIENTS = []
 _SSE_LOCK    = threading.Lock()
@@ -62,12 +62,7 @@ class _TeeLogger:
 sys.stdout = _TeeLogger(sys.stdout)
 sys.stderr = _TeeLogger(sys.stderr)
 
-# ══════════════════════════════════════════════════════════
-#  MOD ZORLAMASI (RENDER YAML YERİNE BURADAN OKUR)
-# ══════════════════════════════════════════════════════════
 MODE          = os.environ.get("ENGINE_MODE", "gameserver")
-
-# Eğer sunucu wc-yccy ise zorla 'all' modunda (proxy + sunucu) başlat.
 if "wc-yccy" in os.environ.get("RENDER_EXTERNAL_HOSTNAME", ""):
     MODE = "all"
 
@@ -79,9 +74,8 @@ BORE_FILE     = "/tmp/bore_address.txt"
 STATE_FILE    = f"{DATA_DIR}/world_state.json"
 BACKENDS_FILE = f"{DATA_DIR}/backends.json"
 
-_current_bore_addr = None   # son bilinen bore adresi (heartbeat için)
+_current_bore_addr = None
 
-# OPTİMİZASYON: NetworkCompressionThreshold 256'ya çekildi, gereksiz işlemci yükü azaltıldı.
 SETTINGS_INI = """
 [Authentication]
 Authenticate=0
@@ -118,7 +112,6 @@ Enabled=0
 
 WEBADMIN_INI = "[WebAdmin]\nEnabled=0\nPort=8081"
 
-# OPTİMİZASYON: MaxViewDistance 4 yapıldı. Render 512MB RAM'de devasa fark yaratır!
 WORLD_INI = """
 [General]
 Gamemode=1
@@ -192,9 +185,7 @@ function Initialize(Plugin)
     cPluginManager:AddHook(cPluginManager.HOOK_PLAYER_DESTROYED, OnPlayerDestroyed)
     cPluginManager:BindConsoleCommand("wcreload", HandleConsoleReload, "Python tetikleyici")
     
-    -- Anti-Dupe: Her 10 saniyede bir tum oyunculari diske yaz
     cRoot:Get():GetDefaultWorld():ScheduleTask(200, PeriodicSave)
-    
     LOG("[SYNC] WCSync aktif! Anti-Dupe devrede.")
     return true
 end
@@ -252,9 +243,7 @@ def write_configs(server_dir=SERVER_DIR):
         try:
             pathlib.Path(path).parent.mkdir(parents=True, exist_ok=True)
             pathlib.Path(path).write_text(content.strip() + "\n", encoding="utf-8")
-        except Exception as e:
-            print(f"[CFG] HATA {path}: {e}")
-
+        except Exception as e: pass
 
 # ══════════════════════════════════════════════════════════
 #  MC 1.8 PROTOKOLü  (protocol 47, offline = sifresiz)
@@ -354,9 +343,8 @@ PID_PLAYER_POS    = 0x04
 PID_PLAYER_LOOK   = 0x05
 PID_PLAYER_PL     = 0x06
 
-
 # ══════════════════════════════════════════════════════════
-#  PAYLAŞIMLI DÜNYA STATE
+#  PAYLAŞIMLI DÜNYA STATE (RAM LIMIT: MAX 50,000 BLOK)
 # ══════════════════════════════════════════════════════════
 
 class WorldState:
@@ -369,7 +357,11 @@ class WorldState:
         key = f"{x},{y},{z}"
         with self._lock:
             if bid == 0: self.blocks.pop(key, None)
-            else:        self.blocks[key] = bid
+            else:        
+                self.blocks[key] = bid
+                # STABILIZASYON 3: Memory Leak Koruması (Aşırı RAM tüketimini engeller)
+                if len(self.blocks) > 50000: 
+                    self.blocks.pop(next(iter(self.blocks)))
         self._save()
 
     def record_multi(self, cx, cz, recs):
@@ -377,7 +369,10 @@ class WorldState:
             for rx, ry, rz, bid in recs:
                 key = f"{cx*16+rx},{ry},{cz*16+rz}"
                 if bid == 0: self.blocks.pop(key, None)
-                else:        self.blocks[key] = bid
+                else:        
+                    self.blocks[key] = bid
+                    if len(self.blocks) > 50000:
+                        self.blocks.pop(next(iter(self.blocks)))
         self._save()
 
     def replay_pkts(self, comp=-1):
@@ -405,7 +400,6 @@ class WorldState:
         except Exception: self.blocks = {}
 
 world_state = WorldState()
-
 
 # ══════════════════════════════════════════════════════════
 #  CROSS-SERVER OYUNCU KAYITCISI
@@ -468,28 +462,25 @@ class CrossServerState:
 
 cs_state = CrossServerState()
 
-
 def _ang(deg): return struct.pack("B", int(deg / 360.0 * 256) & 0xFF)
 def _fp(coord): return struct.pack(">i", int(coord * 32))
 
 def pkt_player_info_add(info, comp=-1):
     u = _uuid_mod.UUID(info.uuid_str)
-    action = vi_enc(0) # 0 = Add Player
+    action = vi_enc(0) 
     count = vi_enc(1)
-    # UUID (16 bytes) + Name (String) + Prop Count (0) + Gamemode (0) + Ping (0) + Has Display Name (0)
     player = u.bytes + mc_str_enc(info.username) + vi_enc(0) + vi_enc(0) + vi_enc(0) + bytes([0])
     return pkt_make(PID_PLAYER_INFO, action + count + player, comp)
 
 def pkt_player_info_remove(info, comp=-1):
     u = _uuid_mod.UUID(info.uuid_str)
-    action = vi_enc(4) # 4 = Remove Player
+    action = vi_enc(4) 
     count = vi_enc(1)
     player = u.bytes
     return pkt_make(PID_PLAYER_INFO, action + count + player, comp)
 
 def pkt_spawn_player(info, comp=-1):
     u = _uuid_mod.UUID(info.uuid_str)
-    # 1.8 Protokolü: EID + UUID(16 byte) + X + Y + Z + Yaw + Pitch + Item(Short) + Metadata End(0x7F)
     payload = (vi_enc(info.virtual_eid) + u.bytes +
         _fp(info.x) + _fp(info.y) + _fp(info.z) + _ang(info.yaw) + _ang(info.pitch) +
         struct.pack(">h", 0) + bytes([0x7F]))
@@ -512,9 +503,8 @@ def pkt_update_health(hp, comp=-1):
 def pkt_chat_msg(text, color="yellow", comp=-1):
     return pkt_make(PID_CHAT_SC, mc_str_enc(json.dumps({"text": text, "color": color})) + bytes([0]), comp)
 
-
 # ══════════════════════════════════════════════════════════
-#  AKTIF BAGLANTILAR + BROADCAST
+#  AKTIF BAGLANTILAR + BROADCAST (NON-BLOCKING)
 # ══════════════════════════════════════════════════════════
 
 _active_lock = asyncio.Lock()
@@ -526,9 +516,8 @@ def _cross_peers(conn):
     return [c for c in snap if c is not conn and c.play_state and c.cs_info is not None and 
            (c.backend_host != conn.backend_host or c.backend_port != conn.backend_port)]
 
-async def bcast_spawn(new_conn):
-    info = new_conn.cs_info
-    if not info: return
+# STABILIZASYON 1: "await drain()" çakışmaları engellendi. (Fire-and-forget writes)
+async def bcast_spawn(new_conn, info):
     peers = _cross_peers(new_conn)
     for c in peers:
         if c.cs_info:
@@ -536,45 +525,29 @@ async def bcast_spawn(new_conn):
                 new_conn.client_w.write(pkt_player_info_add(c.cs_info, new_conn.comp))
                 new_conn.client_w.write(pkt_spawn_player(c.cs_info, new_conn.comp))
             except Exception: pass
-    if peers:
-        try: await new_conn.client_w.drain()
-        except Exception: pass
     for c in peers:
         try:
             c.client_w.write(pkt_player_info_add(info, c.comp))
             c.client_w.write(pkt_spawn_player(info, c.comp))
-            await c.client_w.drain()
         except Exception: pass
 
-async def bcast_move(mover):
-    info = mover.cs_info
-    if not info: return
-    peers = _cross_peers(mover)
+async def bcast_move(info, peers):
     for c in peers:
         try:
             c.client_w.write(pkt_entity_teleport(info, c.comp))
-            await c.client_w.drain()
         except Exception: pass
 
-async def bcast_despawn(leaver):
-    info = leaver.cs_info
-    if not info: return
-    peers = _cross_peers(leaver)
+async def bcast_despawn(info, peers):
     for c in peers:
         try:
             c.client_w.write(pkt_destroy_entity(info.virtual_eid, c.comp))
             c.client_w.write(pkt_player_info_remove(info, c.comp))
-            await c.client_w.drain()
         except Exception: pass
 
-async def bcast_chat(sender, msg):
-    peers = _cross_peers(sender)
+async def bcast_chat(sender_name, msg, peers):
     for c in peers:
-        try:
-            c.client_w.write(pkt_chat_msg(msg, "white", c.comp))
-            await c.client_w.drain()
+        try: c.client_w.write(pkt_chat_msg(msg, "white", c.comp))
         except Exception: pass
-
 
 # ══════════════════════════════════════════════════════════
 #  BACKEND YONETIMI + GERCEK PING (HEALTH CHECK)
@@ -601,7 +574,6 @@ async def check_backend_alive(host, port):
     except Exception:
         return False
 
-
 # ══════════════════════════════════════════════════════════
 #  OYUNCU BAGLANTISI  (MITM Proxy)
 # ══════════════════════════════════════════════════════════
@@ -622,11 +594,6 @@ class PlayerConn:
         self._replay_sent  = False
         self._spawned      = False
         self.cs_info       = None
-
-    @property
-    def s2c_comp(self): return self.comp
-    @property
-    def c2s_comp(self): return self.comp
 
     async def connect_backend(self, b):
         self.backend_host = b["host"]
@@ -677,12 +644,12 @@ class PlayerConn:
                         self._spawned = True
                         self.play_state = True
                         print(f"[JOIN] {self.username} → {self.backend_host}:{self.backend_port}")
-                        asyncio.ensure_future(bcast_spawn(self))
+                        asyncio.ensure_future(bcast_spawn(self, self.cs_info))
                     continue
 
                 self.client_w.write(raw)
                 await self.client_w.drain()
-        except (asyncio.IncompleteReadError, ConnectionResetError): pass
+        except (asyncio.IncompleteReadError, ConnectionResetError, BrokenPipeError, ConnectionAbortedError, TimeoutError): pass
         except Exception as e: print(f"[S->C] {self.username}: {e}")
         finally: await self._cleanup()
 
@@ -690,9 +657,6 @@ class PlayerConn:
         try:
             while True:
                 pid, payload, raw = await pkt_read(self.client_r, self.comp)
-                # Handshake ve Login Start zaten _pre_read_client_hello tarafindan
-                # okundu ve backend'e gonderildi. Buraya artik play paketi gelir.
-                # Yine de state makinesini guvenceye alalim:
                 if self.state == "handshake":
                     if pid == 0x00:
                         try:
@@ -705,9 +669,6 @@ class PlayerConn:
                     continue
 
                 if self.state == "login":
-                    # Login Start zaten _pre_read_client_hello'da okundu ve cs_info set edildi.
-                    # Bu noktaya offline modda hic paket gelmez (sifreleme yok).
-                    # Yine de her paketi backend'e ilet.
                     self.server_w.write(raw); await self.server_w.drain()
                     continue
 
@@ -715,7 +676,7 @@ class PlayerConn:
                     try:
                         x, y, z = struct.unpack_from(">ddd", payload, 0)
                         cs_state.update_pos(self.username, x=x, y=y, z=z)
-                        if self._spawned: asyncio.ensure_future(bcast_move(self))
+                        if self._spawned: asyncio.ensure_future(bcast_move(self.cs_info, _cross_peers(self)))
                     except Exception: pass
                 elif pid == PID_PLAYER_LOOK and len(payload) >= 9:
                     try:
@@ -727,7 +688,7 @@ class PlayerConn:
                         x, y, z = struct.unpack_from(">ddd", payload, 0)
                         yaw, pitch = struct.unpack_from(">ff", payload, 24)
                         cs_state.update_pos(self.username, x=x, y=y, z=z, yaw=yaw, pitch=pitch)
-                        if self._spawned: asyncio.ensure_future(bcast_move(self))
+                        if self._spawned: asyncio.ensure_future(bcast_move(self.cs_info, _cross_peers(self)))
                     except Exception: pass
                 elif pid == PID_USE_ENTITY:
                     try:
@@ -742,11 +703,11 @@ class PlayerConn:
                 elif pid == 0x01 and self.play_state:
                     try:
                         msg, _ = mc_str_dec(payload)
-                        asyncio.ensure_future(bcast_chat(self, f"[{self.username}] {msg}"))
+                        asyncio.ensure_future(bcast_chat(self.username, f"[{self.username}] {msg}", _cross_peers(self)))
                     except Exception: pass
 
                 self.server_w.write(raw); await self.server_w.drain()
-        except (asyncio.IncompleteReadError, ConnectionResetError): pass
+        except (asyncio.IncompleteReadError, ConnectionResetError, BrokenPipeError, ConnectionAbortedError, TimeoutError): pass
         except Exception as e: print(f"[C->S] {self.username}: {e}")
         finally: await self._cleanup()
 
@@ -758,11 +719,9 @@ class PlayerConn:
         try:
             tc.client_w.write(pkt_entity_hurt(tc.cs_info.real_eid, tc.comp))
             tc.client_w.write(pkt_update_health(target.health, tc.comp))
-            await tc.client_w.drain()
         except Exception: pass
         try:
             self.client_w.write(pkt_entity_hurt(target.virtual_eid, self.comp))
-            await self.client_w.drain()
         except Exception: pass
         print(f"[PVP] {self.username} -> {target.username} ({target.health:.0f}/20 HP)")
         if target.health <= 0.0:
@@ -771,18 +730,20 @@ class PlayerConn:
             try:
                 tc.client_w.write(pkt_update_health(20.0, tc.comp))
                 tc.client_w.write(pkt_chat_msg(msg, "red", tc.comp))
-                await tc.client_w.drain()
             except Exception: pass
             try:
                 self.client_w.write(pkt_chat_msg(msg, "red", self.comp))
-                await self.client_w.drain()
             except Exception: pass
 
     async def _cleanup(self):
+        # STABILIZASYON 2: Race Condition (Hayalet Oyuncu) Koruması
         if self.cs_info:
-            asyncio.ensure_future(bcast_despawn(self))
-            cs_state.unregister(self.username)
+            info_snapshot = self.cs_info
+            peers_snapshot = _cross_peers(self)
             self.cs_info = None
+            cs_state.unregister(self.username)
+            asyncio.ensure_future(bcast_despawn(info_snapshot, peers_snapshot))
+            
         async with _active_lock:
             if self in _active:
                 _active.remove(self)
@@ -794,41 +755,27 @@ class PlayerConn:
                 except Exception: pass
 
     async def _pre_read_client_hello(self):
-        """Backend aramadan ONCE istemcinin Handshake + Login Start paketlerini
-        oku. Boylece self.state ve self.username dogru set edilir, kick
-        gonderilebilir hale gelir.
-
-        KRITIK: MC 1.8 her zaman once next_state=1 (status ping) yapar, SONRA
-        next_state=2 (login) ile gercek baglantiyi yapar. Status ping'e yanlis
-        paket gonderilirse client NullPointerException firlatir.
-        Bu fonksiyon status ping'i tamamen handle eder ve True dondurur.
-        Login paketi icin self.state='login' set eder, False dondurur.
-        """
         self._client_buf = []
         self._is_status  = False
         try:
             pid, payload, raw = await asyncio.wait_for(
                 pkt_read(self.client_r, -1), timeout=8.0)
             if pid != 0x00:
-                return   # beklenmedik paket, baglantiyi kapat
+                return   
 
-            # Handshake paketini parse et: proto_ver, host, port, next_state
             p = 0
             _proto, p = vi_dec(payload, p)
             _host,  p = mc_str_dec(payload, p)
-            p += 2                        # port (2 byte)
+            p += 2                        
             next_state, _ = vi_dec(payload, p)
 
             if next_state == 1:
-                # ── STATUS PING ──────────────────────────────────────────────
-                # Status Request paketi oku (0x00, bos)
                 self._is_status = True
                 try:
                     await asyncio.wait_for(pkt_read(self.client_r, -1), timeout=3.0)
                 except Exception:
                     pass
 
-                # Gercek oyuncu sayisini hesapla
                 n_players = sum(1 for c in list(_active) if c.username != "?")
                 n_backends = len(load_backends())
 
@@ -837,11 +784,9 @@ class PlayerConn:
                     "players":     {"max": 999, "online": n_players, "sample": []},
                     "description": {"text": f"\u00a7aWC-Engine \u00a77\u2503 \u00a7e{n_backends} sunucu \u00a77| \u00a7f{n_players} oyuncu"}
                 })
-                # Status Response: 0x00 + String(JSON)
                 self.client_w.write(pkt_make(0x00, mc_str_enc(status_json), -1))
                 await self.client_w.drain()
 
-                # Ping-Pong: client 0x01 + 8-byte long gonderir, ayni longu geri don
                 try:
                     ppid, ppay, _ = await asyncio.wait_for(
                         pkt_read(self.client_r, -1), timeout=3.0)
@@ -850,22 +795,18 @@ class PlayerConn:
                         await self.client_w.drain()
                 except Exception:
                     pass
-                # Status bitti, baglanti kapanacak
                 return
 
             elif next_state == 2:
-                # ── LOGIN ────────────────────────────────────────────────────
                 self.state = "login"
-                self._client_buf.append(raw)   # Handshake'i buffer'a ekle
+                self._client_buf.append(raw)   
 
-                # Login Start paketini oku (0x00 + username)
                 pid2, payload2, raw2 = await asyncio.wait_for(
                     pkt_read(self.client_r, -1), timeout=8.0)
                 self._client_buf.append(raw2)
                 if pid2 == 0x00:
                     try:
                         self.username, _ = mc_str_dec(payload2)
-                        # cs_info'yu BURADA register et — pipe_c2s artik bu paketi gormez
                         self.cs_info = cs_state.register(self.username, self)
                     except Exception:
                         pass
@@ -873,30 +814,22 @@ class PlayerConn:
             pass
 
     async def _flush_client_buf(self):
-        """Tampona alinan ilk paketleri backend'e gonder."""
         for raw in getattr(self, "_client_buf", []):
-            try:
-                self.server_w.write(raw)
-            except Exception:
-                pass
+            try: self.server_w.write(raw)
+            except Exception: pass
         if getattr(self, "_client_buf", []):
-            try:
-                await self.server_w.drain()
-            except Exception:
-                pass
+            try: await self.server_w.drain()
+            except Exception: pass
         self._client_buf = []
 
     async def run(self):
-        # 1. Istemcinin ilk paketlerini backend aramadan once oku
         await self._pre_read_client_hello()
 
-        # Status ping'i _pre_read_client_hello tamamen handle etti, bitir
         if getattr(self, "_is_status", False):
             try: self.client_w.close()
             except Exception: pass
             return
 
-        # Login paketi alınamadıysa baglanti geçersiz, kapat
         if self.state != "login":
             try: self.client_w.close()
             except Exception: pass
@@ -908,8 +841,7 @@ class PlayerConn:
                 self.client_w.write(pkt_kick(
                     "Hic aktif GameServer bulunamadi. Lutfen daha sonra tekrar deneyin.", -1))
                 await self.client_w.drain()
-            except Exception:
-                pass
+            except Exception: pass
             self.client_w.close()
             return
 
@@ -931,8 +863,7 @@ class PlayerConn:
                         writer.write(f"GET /api/status HTTP/1.1\r\nHost: {u}\r\nConnection: close\r\n\r\n".encode())
                         await writer.drain()
                         writer.close()
-                    except Exception:
-                        pass
+                    except Exception: pass
                 asyncio.ensure_future(wakeup(lbl))
 
             if await check_backend_alive(b["host"], b["port"]):
@@ -940,25 +871,20 @@ class PlayerConn:
                     await self.connect_backend(b)
                     connected = True
                     break
-                except Exception:
-                    pass
+                except Exception: pass
             else:
                 print(f"[WARN] Uykuda olan/Olu sunucu atlandi: {lbl} ({b['host']}:{b['port']})")
 
-        # 2. Hic backend bulunamadi — Login state'deyiz, kick gonder
         if not connected:
             print(f"[ERR] Gecerli/Uyanik GameServer bulunamadi! ({self.username})")
-            msg = ("Sunucular su an UYANDIRILIYOR!\n\n"
-                   "Lutfen 30-40 saniye sonra TEKRAR GIRIS YAPIN.")
+            msg = ("Sunucular su an UYANDIRILIYOR!\n\nLutfen 30-40 saniye sonra TEKRAR GIRIS YAPIN.")
             try:
                 self.client_w.write(pkt_kick(msg, -1))
                 await self.client_w.drain()
-            except Exception:
-                pass
+            except Exception: pass
             self.client_w.close()
             return
 
-        # 3. Backend bulundu — tampondaki paketleri gonder, pipe baslat
         await self._flush_client_buf()
 
         async with _active_lock:
@@ -966,13 +892,11 @@ class PlayerConn:
         
         await asyncio.gather(self.pipe_s2c(), self.pipe_c2s())
 
-
 async def handle_player(cr, cw):
     await PlayerConn(cr, cw).run()
 
-
 # ══════════════════════════════════════════════════════════
-#  HTTP DURUM SAYFASI VE API (VERITABANI BURADA)
+#  HTTP DURUM SAYFASI VE API
 # ══════════════════════════════════════════════════════════
 
 HTML = """\
@@ -1133,7 +1057,6 @@ HTML = """\
 </script>
 </body></html>"""
 
-
 def _build_rows():
     backends = load_backends()
     counts = {}
@@ -1178,9 +1101,9 @@ def _build_html():
                        server_count=len(backends), rows=rows, mode_label=MODE.upper())
 
 class _H(http.server.BaseHTTPRequestHandler):
-
     def do_GET(self):
         try:
+            self.send_header("Access-Control-Allow-Origin", "*")
             if self.path.startswith("/api/player?name="):
                 name = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get('name', [''])[0]
                 name = "".join(c for c in name if c.isalnum() or c in "-_")
@@ -1266,6 +1189,7 @@ class _H(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         try:
+            self.send_header("Access-Control-Allow-Origin", "*")
             if self.path.startswith("/api/player?name="):
                 name = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get('name', [''])[0]
                 name = "".join(c for c in name if c.isalnum() or c in "-_")
@@ -1318,18 +1242,14 @@ class _H(http.server.BaseHTTPRequestHandler):
     def handle_error(self, request, client_address): pass
     def log_message(self, *_): pass
 
-
 def run_http():
     srv = http.server.ThreadingHTTPServer(("0.0.0.0", HTTP_PORT), _H)
     print(f"[HTTP] Port {HTTP_PORT}")
     srv.serve_forever()
 
-
 def _health_check_loop():
-    """60s'de bir backend'leri kontrol eder.
-    3 arka arkaya başarısız olursa siler (geçici kopuklukta silmez)."""
     import socket
-    _fail_counts: dict = {}   # label → peş peşe hata sayısı
+    _fail_counts: dict = {}   
     while True:
         time.sleep(60)
         try:
@@ -1340,7 +1260,7 @@ def _health_check_loop():
                 try:
                     s = socket.create_connection((b["host"], b["port"]), timeout=5)
                     s.close()
-                    _fail_counts[key] = 0    # başarılı → sayacı sıfırla
+                    _fail_counts[key] = 0    
                     alive.append(b)
                 except Exception:
                     _fail_counts[key] = _fail_counts.get(key, 0) + 1
@@ -1348,7 +1268,7 @@ def _health_check_loop():
                     if fails < 3:
                         print(f"[HEALTH] Ulasilamadi ({fails}/3 deneme): {key} "
                               f"({b['host']}:{b['port']}) — bekleniyor...")
-                        alive.append(b)     # henüz silme
+                        alive.append(b)     
                     else:
                         print(f"[HEALTH] Olu backend kaldirildi ({fails}. hata): {key}")
                         _fail_counts.pop(key, None)
@@ -1356,7 +1276,6 @@ def _health_check_loop():
                 save_backends(alive)
         except Exception as e:
             print(f"[HEALTH] Hata: {e}")
-
 
 # ══════════════════════════════════════════════════════════
 #  BORE TUNNEL
@@ -1396,19 +1315,15 @@ def run_bore(port=MC_PORT):
                 if m:
                     addr = f"bore.pub:{m.group(1)}"
                     pathlib.Path(BORE_FILE).write_text(addr)
-                    _current_bore_addr = addr      # global güncelle
+                    _current_bore_addr = addr      
                     if MODE == "gameserver": _register_with_proxy(addr)
             proc.wait()
-            _current_bore_addr = None              # bore düştü
-            # NOT: Kasıtlı olarak _unregister_from_proxy() ÇAĞIRILMIYOR.
-            # Health check eski/ölü adresi zaten temizler.
-            # Bore yeniden bağlandığında kayıt güncellenir.
+            _current_bore_addr = None              
         except FileNotFoundError: print("[BORE] bore bulunamadi, PATH'i kontrol et...")
         except Exception as e: print(f"[BORE] hata: {e}")
         time.sleep(10)
 
 def _register_with_proxy(bore_addr, retries=10):
-    """Proxy'e gameserver adresini kaydet. Render cold-start için uzun timeout."""
     proxy_url = os.environ.get("PROXY_URL", "")
     if not proxy_url: return False
     label = os.environ.get("SERVER_LABEL", "GameServer")
@@ -1419,7 +1334,7 @@ def _register_with_proxy(bore_addr, retries=10):
         try:
             req = urllib.request.Request(f"{proxy_url}/api/register", data=body,
                                          headers={"Content-Type": "application/json"})
-            urllib.request.urlopen(req, timeout=25)   # 25s: Render cold-start ~30s alır
+            urllib.request.urlopen(req, timeout=25)   
             print(f"[REG] Proxy kayit OK: {proxy_url} → {bore_addr} ({label})")
             return True
         except Exception as e:
@@ -1439,9 +1354,8 @@ def _unregister_from_proxy():
         print(f"[UNREG] Proxy kayit silindi: {label}")
     except Exception as e: print(f"[UNREG] Silme hatasi: {e}")
 
-
 # ══════════════════════════════════════════════════════════
-#  CUBERITE BASLATICI VE LOG AVCISI (PYTHON <-> LUA)
+#  CUBERITE BASLATICI VE LOG AVCISI
 # ══════════════════════════════════════════════════════════
 
 def run_cuberite():
@@ -1450,7 +1364,6 @@ def run_cuberite():
     if not mc_bin: print("[MC] HATA: Cuberite bulunamadi!"); return
     mc_dir = str(pathlib.Path(mc_bin).parent)
     
-    # ALL modundayken haritayı /data diskine kaydetmesini sağlıyoruz
     persistent_world = f"{DATA_DIR}/world" if MODE == "all" else "/server/world"
     target_world = f"{mc_dir}/world"
     
@@ -1503,8 +1416,7 @@ def run_cuberite():
                         proc.stdin.flush()
                         print(f"[SYNC] {name} envanteri merkezden indirildi.")
                     except Exception as e:
-                        if "404" not in str(e):
-                            print(f"[SYNC] Hata (Join): {e}")
+                        if "404" not in str(e): print(f"[SYNC] Hata (Join): {e}")
 
                 threading.Thread(target=_do_join, args=(line,), daemon=True).start()
                 
@@ -1512,7 +1424,6 @@ def run_cuberite():
                 def _do_upload(ln):
                     try:
                         time.sleep(1.5) 
-                        
                         tag = "WCSYNC_QUIT:" if "WCSYNC_QUIT:" in ln else "WCSYNC_SAVE:"
                         parts = ln.split(tag)[1].strip().split(":")
                         name, uuid = parts[0], parts[1]
@@ -1527,14 +1438,10 @@ def run_cuberite():
                             req = urllib.request.Request(f"{proxy_url}/api/player?name={name}", data=data, method="POST")
                             req.add_header("Content-Type", "application/json")
                             urllib.request.urlopen(req, timeout=5)
-                            
-                            if "QUIT" in tag:
-                                print(f"[SYNC] {name} envanteri merkeze kaydedildi. ({target_p.name})")
+                            if "QUIT" in tag: print(f"[SYNC] {name} envanteri merkeze kaydedildi. ({target_p.name})")
                         else:
-                            if "QUIT" in tag:
-                                print(f"[WARN] Senkronizasyon Atlandı: {name} kayit dosyasi bulunamadi!")
-                    except Exception as e: 
-                        print(f"[SYNC] Hata (Upload): {e}")
+                            if "QUIT" in tag: print(f"[WARN] Senkronizasyon Atlandi: {name} kayit dosyasi bulunamadi!")
+                    except Exception as e: print(f"[SYNC] Hata (Upload): {e}")
 
                 threading.Thread(target=_do_upload, args=(line,), daemon=True).start()
 
@@ -1545,7 +1452,6 @@ def run_cuberite():
         ret = proc.wait()
         print(f"[MC] Cuberite kapandi (kod={ret}), 5sn sonra yeniden baslatiliyor...")
         time.sleep(5)
-
 
 # ══════════════════════════════════════════════════════════
 #  ASYNC PROXY
@@ -1558,20 +1464,16 @@ async def run_proxy_async():
     print(f"[PROXY] Port {MC_PORT} - Cross-server entity sync + PvP AKTIF")
     async with server: await server.serve_forever()
 
-
 # ══════════════════════════════════════════════════════════
 #  MAIN
 # ══════════════════════════════════════════════════════════
 
 def _heartbeat_loop():
-    """Gameserver'ın proxy'de kayıtlı kalmasını garantiler.
-    Proxy restart, ağ kesintisi veya ilk kayıt başarısızlığını telafi eder."""
-    time.sleep(90)   # ilk başlatmaya zaman tanı
+    time.sleep(90)   
     while True:
         if _current_bore_addr:
             _register_with_proxy(_current_bore_addr, retries=3)
         time.sleep(30)
-
 
 def main():
     print(f"""
@@ -1591,7 +1493,7 @@ def main():
         asyncio.run(run_proxy_async())
     elif MODE == "gameserver":
         threading.Thread(target=run_bore, args=(MC_PORT,), daemon=True).start()
-        threading.Thread(target=_heartbeat_loop, daemon=True).start()  # proxy'de kayıtlı kal
+        threading.Thread(target=_heartbeat_loop, daemon=True).start()  
         run_cuberite()
     elif MODE == "all":
         threading.Thread(target=run_bore, args=(MC_PORT,), daemon=True).start()
