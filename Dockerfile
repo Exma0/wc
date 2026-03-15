@@ -4,8 +4,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     wget curl ca-certificates python3 python3-pip libstdc++6 \
     && rm -rf /var/lib/apt/lists/*
 
-# Veritabani icin asenkron SQLite kutuphanesi
-RUN pip3 install aiosqlite --break-system-packages
+# MySQL icin asenkron ve senkron kutuphaneler
+RUN pip3 install aiomysql pymysql --break-system-packages
 
 # Bore tunnel
 RUN BORE_VER=$(curl -s https://api.github.com/repos/ekzhang/bore/releases/latest \
