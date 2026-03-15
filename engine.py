@@ -2,10 +2,10 @@
 """
 ⛏️  Minecraft Ultimate Bungee Network & Anti-Dupe Engine
 ═══════════════════════════════════════════════════════════
-  • Tünel Çakışması ve DB Zaman Uyuşmazlığı (KICK Hatası) ÇÖZÜLDÜ!
-  • WCSync: Merkezi Envanter Senkronizasyonu GERİ EKLENDİ (API Entegreli)
+  • Tünel Çakışması ve DB Zaman Uyuşmazlığı ÇÖZÜLDÜ!
+  • WCSync: Merkezi Envanter Senkronizasyonu (API Entegreli)
   • WCHub: Pusula ile Sunucular Arası Kesintisiz Geçiş
-  • Race Condition Engellendi (DB Kilit Sistemi)
+  • Ana Web Adresinde JSON Formatında IP Gösterimi Eklendi
 """
 
 import asyncio, json, os, pathlib, struct, sys
@@ -32,10 +32,10 @@ DB_FILE       = f"{DATA_DIR}/hub.db"
 
 _proxy_bore_addr = None
 _active_players  = []
-_DB_LOCK         = threading.Lock() # Race condition önleyici kilit
+_DB_LOCK         = threading.Lock()
 
 # ══════════════════════════════════════════════════════════
-#  VERİTABANI İŞLEMLERİ (YENİLENDİ: Saat Uyuşmazlığı Çözüldü)
+#  VERİTABANI İŞLEMLERİ
 # ══════════════════════════════════════════════════════════
 
 async def init_db():
@@ -60,7 +60,7 @@ async def init_db():
         print(f"[DB] HATA: Veritabani Olusturulamadi -> {e}")
 
 # ══════════════════════════════════════════════════════════
-#  LUA EKLENTİLERİ (WCSync, WCHub, Yaver Desteği)
+#  LUA EKLENTİLERİ (WCSync, WCHub)
 # ══════════════════════════════════════════════════════════
 
 SETTINGS_INI = f"""
@@ -82,7 +82,6 @@ Ports={CUBERITE_PORT}
 NetworkCompressionThreshold=-1
 """
 
-# WCSync: Oyuncu girip çıktığında Python tetikleyicisi için log atar
 WCSYNC_MAIN = """
 function Initialize(Plugin)
     Plugin:SetName("WCSync")
@@ -121,7 +120,6 @@ function HandleConsoleReload(Split)
 end
 """
 
-# WCHub: GUI menüsü ve Pusula
 WCHUB_MAIN = """
 local ProxyURL = "http://127.0.0.1:8080"
 if os.getenv("PROXY_URL") then ProxyURL = os.getenv("PROXY_URL") end
@@ -190,7 +188,7 @@ def write_configs(server_dir=SERVER_DIR):
         except Exception: pass
 
 # ══════════════════════════════════════════════════════════
-#  PROTOKOL & PAKET İŞLEME
+#  PROTOKOL
 # ══════════════════════════════════════════════════════════
 
 def vi_enc(v):
@@ -252,7 +250,7 @@ def mc_str_dec(data, pos=0):
     return data[pos:pos+n].decode("utf-8", errors="replace"), pos+n
 
 # ══════════════════════════════════════════════════════════
-#  PROXY: YÖNLENDİRİCİ VE ENVANTER KORUMALI HOT-SWAP
+#  PROXY: YÖNLENDİRİCİ
 # ══════════════════════════════════════════════════════════
 
 class PlayerConn:
@@ -293,18 +291,15 @@ class PlayerConn:
         self.is_swapping = True
         self.play_state = False
         
-        # Oyuncuya bildirim gonder
         msg = json.dumps({"text": f"§a{target_label} sunucusuna geciliyor... Envanter senkronize ediliyor.", "color": "yellow"})
         self.client_w.write(pkt_make(0x02, mc_str_enc(msg) + bytes([0]), self.comp))
         await self.client_w.drain()
 
-        # Eski sunucuyu kapat ki WCSYNC_QUIT calissin ve Json merkeze yollansin!
         if self.server_w:
             self.server_w.close()
             self.server_w = None
             self.server_r = None
             
-        # Json merkeze islensin diye WCSYNC icin zorunlu bekleme suresi (Kritik Anti-Dupe Taktigi)
         await asyncio.sleep(2.5)
         
         srv = await self.get_target_server(target_label)
@@ -435,11 +430,40 @@ async def handle_player(cr, cw):
     await PlayerConn(cr, cw).run()
 
 # ══════════════════════════════════════════════════════════
-#  HTTP API VE DOSYA SENKRONİZASYONU
+#  HTTP API VE JSON PANEL EKLENTİSİ
 # ══════════════════════════════════════════════════════════
 
 class HttpHandler(http.server.BaseHTTPRequestHandler):
+    def end_headers(self):
+        self.send_header("Access-Control-Allow-Origin", "*")
+        super().end_headers()
+
     def do_GET(self):
+        # 1. Ana ekranda IP gosteren JSON Paneli
+        if self.path == "/":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.end_headers()
+            
+            try:
+                conn = sqlite3.connect(DB_FILE)
+                conn.row_factory = sqlite3.Row
+                cur = conn.cursor()
+                cur.execute("SELECT label, players FROM servers WHERE (? - last_seen) < 60", (int(time.time()),))
+                servers = [{"sunucu": r["label"], "oyuncu_sayisi": r["players"]} for r in cur.fetchall()]
+                conn.close()
+            except:
+                servers = []
+
+            response = {
+                "sistem": "WC Bungee Network Aktif",
+                "minecraft_baglanti_adresi": _proxy_bore_addr if _proxy_bore_addr else "Tunnel baglantisi bekleniyor...",
+                "toplam_oyuncu": len(_active_players),
+                "aktif_sunucular": servers
+            }
+            self.wfile.write(json.dumps(response, indent=4).encode('utf-8'))
+            return
+
         if self.path.startswith("/api/player_file?name="):
             name = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get('name', [''])[0]
             name = "".join(c for c in name if c.isalnum() or c in "-_")
@@ -478,7 +502,7 @@ class HttpHandler(http.server.BaseHTTPRequestHandler):
                 host, port = s_data['host'], s_data['port']
                 now = int(time.time())
                 
-                with _DB_LOCK: # Race Condition Kilidi!
+                with _DB_LOCK: 
                     conn = sqlite3.connect(DB_FILE)
                     cur = conn.cursor()
                     cur.execute("SELECT label FROM servers WHERE host=? AND port=?", (host, port))
@@ -500,7 +524,7 @@ class HttpHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format, *args): pass
 
 # ══════════════════════════════════════════════════════════
-#  BAŞLATICI YÖNTEMLER, CUBERITE VE TÜNEL
+#  BAŞLATICI YÖNTEMLER
 # ══════════════════════════════════════════════════════════
 
 def run_http():
@@ -571,7 +595,6 @@ def run_cuberite():
             line = raw.rstrip() if isinstance(raw, str) else raw.decode("utf-8", "replace").rstrip()
             if not line: continue
             
-            # WCSync Tetikleyicileri (Envanter İndir/Yükle)
             if "WCSYNC_JOIN:" in line:
                 def _do_join(ln):
                     try:
