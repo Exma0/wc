@@ -2,9 +2,8 @@
 """
 ⛏️  Minecraft Ultimate Bungee Network & Anti-Dupe Engine
 ═══════════════════════════════════════════════════════════
-  • FIX: Cuberite Loglari terminalde gorunur
-  • FIX: Pusula geri eklendi, artik tiklanabilir chat menusunu aciyor!
-  • FIX: Oyuna giriste menuyu otomatik gosterme eklendi
+  • FIX: Pusula tamamen kaldirildi (Saf Sohbet UI)
+  • FIX: Oyuna giriste otomatik tiklanabilir liste gonderilir
 """
 
 import asyncio, json, os, pathlib, struct, sys
@@ -141,67 +140,20 @@ end
 
 function Initialize(Plugin)
     Plugin:SetName("WCHub")
-    Plugin:SetVersion(11)
+    Plugin:SetVersion(12)
 
     cPluginManager:AddHook(cPluginManager.HOOK_PLAYER_SPAWNED, OnPlayerSpawned)
-    cPluginManager:AddHook(cPluginManager.HOOK_PLAYER_RIGHT_CLICK, OnRightClick)
-    cPluginManager:AddHook(cPluginManager.HOOK_PLAYER_USING_ITEM, OnRightClick)
-    cPluginManager:AddHook(cPluginManager.HOOK_PLAYER_TOSS_ITEM, OnPlayerTossItem)
-    cPluginManager:AddHook(cPluginManager.HOOK_KILLED, OnKilled)
     cPluginManager:AddHook(cPluginManager.HOOK_EXECUTE_COMMAND, OnCommand)
 
-    LOG("[HUB] WCHub Chat+Pusula Hibrit Sistemi Aktif!")
+    LOG("[HUB] WCHub Saf Sohbet Sistemi Aktif (Pusulalar kaldirildi)!")
     return true
 end
 
 function OnPlayerSpawned(Player)
-    GiveRing(Player)
     -- Oyuna giris yaptiginda 1 saniye (20 tick) sonra menuyu otomatik gonder
     Player:GetWorld():ScheduleTask(20, function()
         SendServerList(Player)
     end)
-end
-
-function GiveRing(Player)
-    local inv = Player:GetInventory()
-    local hasRing = false
-    for i=0, 35 do
-        if inv:GetSlot(i).m_ItemType == E_ITEM_COMPASS then hasRing = true break end
-    end
-    if not hasRing then
-        local ring = cItem(E_ITEM_COMPASS, 1)
-        ring.m_CustomName = "§eSunucu Secici §7(Sag Tik)"
-        inv:SetHotbarSlot(8, ring)
-    end
-end
-
-function OnPlayerTossItem(Player, NumTicks, Item)
-    if Item.m_ItemType == E_ITEM_COMPASS then
-        Player:SendMessageWarning("§cPusulayi yere atamazsin!")
-        return true
-    end
-    return false
-end
-
-function OnKilled(Victim, TCA, CustomDeathMessage)
-    if Victim:IsPlayer() then
-        local inv = Victim:GetInventory()
-        for i=0, 35 do
-            if inv:GetSlot(i).m_ItemType == E_ITEM_COMPASS then
-                inv:SetSlot(i, cItem(E_ITEM_EMPTY, 0))
-            end
-        end
-    end
-    return false
-end
-
-function OnRightClick(Player, ...)
-    local item = Player:GetEquippedItem()
-    if item.m_ItemType == E_ITEM_COMPASS then
-        SendServerList(Player)
-        return true
-    end
-    return false
 end
 
 function OnCommand(Player, CommandSplit, EntireCommand)
