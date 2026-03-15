@@ -2,8 +2,9 @@
 """
 ⛏️  Minecraft Ultimate Bungee Network & Anti-Dupe Engine
 ═══════════════════════════════════════════════════════════
-  • FIX: Kurt dogmama ve /kurt cökme (Crash) sorunlari pcall ile zırhlandı!
-  • WEB: Canli Konsol (Terminal) ve Komut Gonderme aktif.
+  • FIX: Kurt (/kurt) sistemi icin Ultra-Zirhli Hata Ayiklama
+  • FIX: Lua cokmeleri dogrudan oyuncu chat'ine yansitilacak
+  • WEB: Canli Konsol (Terminal) aktif.
   • GUI: Saf Sohbet UI & Hub Menüsü devrede.
 """
 
@@ -38,7 +39,6 @@ _cuberite_proc    = None
 SYSTEM_LOGS = deque(maxlen=200)
 
 def log_msg(text):
-    """Hem terminale yazar hem de Web Paneli konsolu icin kaydeder."""
     stamp = datetime.datetime.now().strftime("%H:%M:%S")
     line = f"[{stamp}] {text}"
     SYSTEM_LOGS.append(line)
@@ -204,7 +204,7 @@ end
 
 function Initialize(Plugin)
     Plugin:SetName("yaver")
-    Plugin:SetVersion(4)
+    Plugin:SetVersion(5)
     
     Ini = cIniFile()
     Ini:ReadFile("YaverData.ini")
@@ -218,7 +218,7 @@ function Initialize(Plugin)
     cPluginManager:BindCommand("/kurt", "", HandleKurtCommand, "Koruyucu kurdunu yanina cagirir.")
     
     cRoot:Get():GetDefaultWorld():ScheduleTask(20 * 3, PeriodicWolfTask)
-    LOG("[YAVER] Zirhli Koruyucu Kurt sistemi aktif!")
+    LOG("[YAVER] Ultra Zirhli Koruyucu Kurt sistemi aktif!")
     return true
 end
 
@@ -241,10 +241,12 @@ function AddWolfXP(UUID, Amount)
             local WolfID = ActiveWolves[UUID]
             if WolfID then
                 Player:GetWorld():DoWithEntityByID(WolfID, function(Ent)
-                    Ent:SetCustomName("§b" .. Player:GetName() .. " §7Kurdu §e[Lv " .. lvl .. "] §8| §a(Shift+Tık: Menü)")
-                    local maxHp = 20 + (lvl * 2)
-                    Ent:SetMaxHealth(maxHp)
-                    Ent:SetHealth(maxHp)
+                    pcall(function() Ent:SetCustomName("§b" .. Player:GetName() .. " §7Kurdu §e[Lv " .. lvl .. "] §8| §a(Shift+Tık)") end)
+                    pcall(function() 
+                        local maxHp = 20 + (lvl * 2)
+                        Ent:SetMaxHealth(maxHp)
+                        Ent:Heal(maxHp)
+                    end)
                     pcall(function() Player:GetWorld():BroadcastEntityAnimation(Ent, 18) end)
                 end)
             end
@@ -289,15 +291,27 @@ function SpawnWolfForPlayer(Player)
     local World = Player:GetWorld()
     
     if ActiveWolves[UUID] then
-        World:DoWithEntityByID(ActiveWolves[UUID], function(Ent) Ent:Destroy() end)
+        pcall(function() World:DoWithEntityByID(ActiveWolves[UUID], function(Ent) Ent:Destroy() end) end)
     end
     
-    local WolfID = World:SpawnMob(Player:GetPosX(), Player:GetPosY() + 1.0, Player:GetPosZ(), cMonster.mtWolf)
+    -- Geriye donuk uyumluluk icin type id (95 = Wolf)
+    local WolfType = cMonster.mtWolf or 95 
+    local WolfID = World:SpawnMob(Player:GetPosX(), Player:GetPosY() + 1.0, Player:GetPosZ(), WolfType)
     
-    if WolfID ~= cEntity.INVALID_ID then
+    if WolfID and WolfID > 0 then
         ActiveWolves[UUID] = WolfID
         World:DoWithEntityByID(WolfID, function(Ent)
-            -- Çökmeye karsi tehlikeli (surume ozel) kodlari koruma altina aldik
+            -- Her bir ozelligi ayri pcall icine aldik ki biri cokerse digeri calismaya devam etsin!
+            local lvl = GetWolfLevel(UUID)
+            
+            pcall(function() Ent:SetCustomName("§b" .. Player:GetName() .. " §7Kurdu §e[Lv " .. lvl .. "] §8| §a(Shift+Tık)") end)
+            pcall(function() Ent:SetCustomNameAlwaysVisible(true) end)
+            pcall(function()
+                local maxHp = 20 + (lvl * 2)
+                Ent:SetMaxHealth(maxHp)
+                Ent:SetHealth(maxHp)
+            end)
+            
             pcall(function()
                 local Wolf = tolua.cast(Ent, "cWolf")
                 if Wolf then
@@ -306,28 +320,20 @@ function SpawnWolfForPlayer(Player)
                     Wolf:SetIsSitting(false)
                 end
             end)
-            
-            -- Her surumde calisan guvenli komutlar:
-            local lvl = GetWolfLevel(UUID)
-            Ent:SetCustomName("§b" .. Player:GetName() .. " §7Kurdu §e[Lv " .. lvl .. "] §8| §a(Shift+Tık: Menü)")
-            Ent:SetCustomNameAlwaysVisible(true)
-            local maxHp = 20 + (lvl * 2)
-            Ent:SetMaxHealth(maxHp)
-            Ent:SetHealth(maxHp)
         end)
     else
-        LOGWARNING("[YAVER] Kurt spawn edilemedi! Hata olustu.")
+        error("SpawnMob komutu " .. tostring(WolfID) .. " dondurdu. (Oyun motoru canavar uretmeyi reddetti)")
     end
 end
 
--- MANUEL KURT CAGIRMA KOMUTU (TAM KORUMALI)
+-- MANUEL KURT CAGIRMA KOMUTU (TAM KORUMALI VE HATA RAPORLAYICI)
 function HandleKurtCommand(Split, Player)
     local isSuccess, err = pcall(function()
         local UUID = Player:GetUUID()
         if ActiveWolves[UUID] then
             Player:SendMessageWarning("§eKurdun zaten aktif! Yanina isinlaniyor...")
             Player:GetWorld():DoWithEntityByID(ActiveWolves[UUID], function(Ent)
-                Ent:TeleportToEntity(Player)
+                pcall(function() Ent:TeleportToEntity(Player) end)
             end)
         else
             SpawnWolfForPlayer(Player)
@@ -335,9 +341,10 @@ function HandleKurtCommand(Split, Player)
         end
     end)
     
+    -- Eger bir hata olursa OYUNCU CHATINE DIREKT YAZDIRIYORUZ!
     if not isSuccess then
-        LOGWARNING("[YAVER] /kurt komutunda ic hata: " .. tostring(err))
-        Player:SendMessageFailure("§cKurt cagirma islemi surum uyumsuzlugundan etkilendi. Konsolu kontrol et.")
+        Player:SendMessageFailure("§c[LUA HATASI DETAYI] -> " .. tostring(err))
+        LOGWARNING("[YAVER] /kurt Hata: " .. tostring(err))
     end
     return true
 end
@@ -347,7 +354,7 @@ function OnPlayerSpawned(Player)
     if not ActiveWolves[UUID] then
         Player:GetWorld():ScheduleTask(40, function()
             local P = cRoot:Get():GetPlayerByUUID(UUID)
-            if P then SpawnWolfForPlayer(P) end
+            if P then pcall(function() SpawnWolfForPlayer(P) end) end
         end)
     end
 end
@@ -356,7 +363,7 @@ function OnPlayerDestroyed(Player)
     local UUID = Player:GetUUID()
     local WolfID = ActiveWolves[UUID]
     if WolfID then
-        Player:GetWorld():DoWithEntityByID(WolfID, function(Ent) Ent:Destroy() end)
+        pcall(function() Player:GetWorld():DoWithEntityByID(WolfID, function(Ent) Ent:Destroy() end) end)
         ActiveWolves[UUID] = nil
     end
 end
@@ -364,7 +371,7 @@ end
 -- ================= Etkilesim =================
 function OnRightClickingEntity(Player, Entity)
     local isSuccess, err = pcall(function()
-        if Entity:IsMob() and Entity:GetMobType() == cMonster.mtWolf then
+        if Entity:IsMob() and Entity:GetMobType() == (cMonster.mtWolf or 95) then
             local UUID = Player:GetUUID()
             if ActiveWolves[UUID] == Entity:GetUniqueID() then
                 if Player:IsCrouched() then
@@ -377,7 +384,7 @@ function OnRightClickingEntity(Player, Entity)
                     Item.m_ItemCount = Item.m_ItemCount - 1
                     if Item.m_ItemCount <= 0 then Item:Empty() end
                     Player:GetInventory():SetEquippedItem(Item)
-                    Entity:Heal(10)
+                    pcall(function() Entity:Heal(10) end)
                     pcall(function() Player:GetWorld():BroadcastEntityAnimation(Entity, 18) end)
                     AddWolfXP(UUID, 50)
                     Player:SendMessageInfo("§6[Yaver] §aKurdunu besledin! (+50 XP, +10 Can)")
@@ -389,6 +396,7 @@ function OnRightClickingEntity(Player, Entity)
             end
         end
     end)
+    if not isSuccess then Player:SendMessageFailure("§c[LUA TIKLAMA HATASI] " .. tostring(err)) end
     return false
 end
 
@@ -397,7 +405,7 @@ function OnTakeDamage(Receiver, TCA)
     pcall(function()
         local Attacker = TCA.Attacker
         if not Attacker then return end
-        if Attacker:IsMob() and Attacker:GetMobType() == cMonster.mtWolf then
+        if Attacker:IsMob() and Attacker:GetMobType() == (cMonster.mtWolf or 95) then
             for uuid, wid in pairs(ActiveWolves) do
                 if wid == Attacker:GetUniqueID() then
                     local lvl = GetWolfLevel(uuid)
@@ -424,7 +432,7 @@ end
 function OnKilled(Victim, TCA, CustomDeathMessage)
     pcall(function()
         local Attacker = TCA.Attacker
-        if Victim:IsMob() and Victim:GetMobType() == cMonster.mtWolf then
+        if Victim:IsMob() and Victim:GetMobType() == (cMonster.mtWolf or 95) then
             for uuid, wid in pairs(ActiveWolves) do
                 if wid == Victim:GetUniqueID() then
                     ActiveWolves[uuid] = nil
@@ -433,7 +441,7 @@ function OnKilled(Victim, TCA, CustomDeathMessage)
                     Victim:GetWorld():ScheduleTask(20 * 30, function()
                         local Player = cRoot:Get():GetPlayerByUUID(uuid)
                         if Player then
-                            SpawnWolfForPlayer(Player)
+                            pcall(function() SpawnWolfForPlayer(Player) end)
                             Player:SendMessageSuccess("§aKoruyucu kurdun iyileşti ve yanına döndü!")
                         end
                     end)
@@ -457,13 +465,13 @@ function PeriodicWolfTask(World)
             if WolfID then
                 World:DoWithEntityByID(WolfID, function(Ent)
                     local dist = (Ent:GetPosition() - Player:GetPosition()):Length()
-                    if dist > 25 then Ent:TeleportToEntity(Player) end
+                    if dist > 25 then pcall(function() Ent:TeleportToEntity(Player) end) end
                     
                     local lvl = GetWolfLevel(UUID)
-                    if lvl >= 5 then Player:AddEntityEffect(cEntityEffect.effSpeed, 20*6, 0) end
-                    if lvl >= 10 then Player:AddEntityEffect(cEntityEffect.effStrength, 20*6, 0) end
-                    if lvl >= 20 then Player:AddEntityEffect(cEntityEffect.effRegeneration, 20*6, 0) end
-                    if Ent:GetHealth() < Ent:GetMaxHealth() then Ent:Heal(1) end
+                    if lvl >= 5 then pcall(function() Player:AddEntityEffect(cEntityEffect.effSpeed, 20*6, 0) end) end
+                    if lvl >= 10 then pcall(function() Player:AddEntityEffect(cEntityEffect.effStrength, 20*6, 0) end) end
+                    if lvl >= 20 then pcall(function() Player:AddEntityEffect(cEntityEffect.effRegeneration, 20*6, 0) end) end
+                    pcall(function() if Ent:GetHealth() < Ent:GetMaxHealth() then Ent:Heal(1) end end)
                 end)
             end
         end)
@@ -479,7 +487,7 @@ def write_configs(server_dir=SERVER_DIR):
         f"{server_dir}/Plugins/WCSync/main.lua": WCSYNC_MAIN.strip(),
         f"{server_dir}/Plugins/WCHub/Info.lua": 'g_PluginInfo = {Name="WCHub", Version="5"}',
         f"{server_dir}/Plugins/WCHub/main.lua": _make_wchub_lua(HTTP_PORT).strip(),
-        f"{server_dir}/Plugins/yaver/Info.lua": 'g_PluginInfo = {Name="yaver", Version="4"}',
+        f"{server_dir}/Plugins/yaver/Info.lua": 'g_PluginInfo = {Name="yaver", Version="5"}',
         f"{server_dir}/Plugins/yaver/main.lua": YAVER_MAIN.strip(),
     }
     for path, content in files.items():
