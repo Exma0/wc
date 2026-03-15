@@ -2,9 +2,8 @@
 """
 ⛏️  Minecraft Ultimate Bungee Network & Anti-Dupe Engine
 ═══════════════════════════════════════════════════════════
-  • FIX: 1.8.9 Client Oyundan Atilma (Disconnect) Tame-UUID hatasi cozuldu.
-  • FIX: 'eMonsterType expected' hatasi cMonster.mtWolf kullanilarak giderildi.
-  • YENİ: Yabani kurtlar icin ozel Yapay Zeka (Dost Atesi Korumasi) yazildi.
+  • FIX: MySQL iptal edildi, Tam Otomatik SQLite (Tak-Çalıştır) geri döndü!
+  • FIX: Kurt (/kurt) sistemi icin 'GetWolfType' Tarayicisi devrede.
   • WEB: Canli Konsol (Terminal) aktif.
   • GUI: Saf Sohbet UI & Hub Menüsü devrede.
 """
@@ -46,7 +45,7 @@ def log_msg(text):
     print(line)
 
 # ══════════════════════════════════════════════════════════
-#  VERİTABANI İŞLEMLERİ
+#  VERİTABANI İŞLEMLERİ (Tam Otomatik SQLite)
 # ══════════════════════════════════════════════════════════
 
 async def init_db():
@@ -73,7 +72,7 @@ async def init_db():
             """)
             await db.execute("DELETE FROM servers WHERE (? - last_seen) > 45", (int(time.time()),))
             await db.commit()
-        log_msg("[DB] SQLite Merkez Veritabani Hazir.")
+        log_msg("[DB] SQLite Merkez Veritabani Otomatik Kuruldu ve Hazir.")
     except Exception as e:
         log_msg(f"[DB] HATA: Veritabani Olusturulamadi -> {e}")
 
@@ -103,7 +102,7 @@ NetworkCompressionThreshold=-1
 WCSYNC_MAIN = """
 function Initialize(Plugin)
     Plugin:SetName("WCSync")
-    Plugin:SetVersion(2)
+    Plugin:SetVersion(3)
     cPluginManager:AddHook(cPluginManager.HOOK_PLAYER_JOINED, OnPlayerJoined)
     cPluginManager:AddHook(cPluginManager.HOOK_PLAYER_DESTROYED, OnPlayerDestroyed)
     cPluginManager:BindConsoleCommand("wcreload", HandleConsoleReload, "Python tetikleyici")
@@ -112,18 +111,18 @@ function Initialize(Plugin)
     return true
 end
 function PeriodicSave(World)
-    World:ForEachPlayer(function(Player) Player:SaveToDisk() end)
+    World:ForEachPlayer(function(Player)
+        LOG("WCSYNC_SAVE:" .. Player:GetName() .. ":" .. Player:GetUUID())
+    end)
     World:ScheduleTask(200, PeriodicSave)
 end
 function OnPlayerJoined(Player) LOG("WCSYNC_JOIN:" .. Player:GetName() .. ":" .. Player:GetUUID()) end
 function OnPlayerDestroyed(Player)
-    Player:SaveToDisk()
     LOG("WCSYNC_QUIT:" .. Player:GetName() .. ":" .. Player:GetUUID())
 end
 function HandleConsoleReload(Split)
     if #Split > 1 then
         cRoot:Get():FindAndDoWithPlayer(Split[2], function(P)
-            P:LoadFromDisk()
             P:SendMessageSuccess("Envanteriniz merkezden esitlendi!")
         end)
     end
@@ -203,14 +202,35 @@ local function Split(str, sep)
     return res
 end
 
+local function DoWithPlayer(UUID, Callback)
+    cRoot:Get():ForEachPlayer(function(P)
+        if P:GetUUID() == UUID then Callback(P) end
+    end)
+end
+
+local function GetWolfType()
+    if cMonster and cMonster.mtWolf then return cMonster.mtWolf end
+    local wt = nil
+    if cMonster and cMonster.StringToMobType then
+        pcall(function() wt = cMonster.StringToMobType("wolf") end)
+        if wt and wt ~= -1 then return wt end
+        pcall(function() wt = cMonster.StringToMobType("Wolf") end)
+        if wt and wt ~= -1 then return wt end
+    end
+    if mtWolf then return mtWolf end
+    return 95 
+end
+
 local function IsWolf(Entity)
     if not Entity or not Entity:IsMob() then return false end
-    return Entity:GetMobType() == cMonster.mtWolf
+    local t = Entity:GetMobType()
+    local wt = GetWolfType()
+    return (t == wt) or (t == 95)
 end
 
 function Initialize(Plugin)
     Plugin:SetName("yaver")
-    Plugin:SetVersion(10)
+    Plugin:SetVersion(11)
     
     Ini = cIniFile()
     Ini:ReadFile("YaverData.ini")
@@ -224,7 +244,7 @@ function Initialize(Plugin)
     cPluginManager:BindCommand("/kurt", "", HandleKurtCommand, "Koruyucu kurdunu yanina cagirir.")
     
     cRoot:Get():GetDefaultWorld():ScheduleTask(20 * 2, PeriodicWolfTask)
-    LOG("[YAVER] Saf Obje Modu ve Anti-Disconnect Sistemi Aktif!")
+    LOG("[YAVER] Saf Obje Modu, Anti-Disconnect ve NIL Fix Sistemi Aktif!")
     return true
 end
 
@@ -241,8 +261,8 @@ function AddWolfXP(UUID, Amount)
         lvl = lvl + 1
         xp = 0
         Ini:SetValueI(UUID, "Level", lvl)
-        local Player = cRoot:Get():GetPlayerByUUID(UUID)
-        if Player then
+        
+        DoWithPlayer(UUID, function(Player)
             Player:SendMessageSuccess("§6[Yaver] §aKoruyucu Kurdun Seviye Atladi! Yeni Seviye: §e" .. lvl)
             local WolfID = ActiveWolves[UUID]
             if WolfID then
@@ -254,10 +274,10 @@ function AddWolfXP(UUID, Amount)
                         Monster:SetMaxHealth(maxHp)
                         Monster:Heal(maxHp)
                     end
-                    Player:GetWorld():BroadcastEntityAnimation(Ent, 18)
+                    pcall(function() Player:GetWorld():BroadcastEntityAnimation(Ent, 18) end)
                 end)
             end
-        end
+        end)
     end
     Ini:SetValueI(UUID, "XP", xp)
     Ini:WriteFile("YaverData.ini")
@@ -302,12 +322,8 @@ function SpawnWolfForPlayer(Player)
         ActiveWolves[UUID] = nil
     end
     
-    if not cMonster or not cMonster.mtWolf then
-        Player:SendMessageFailure("§cSunucu motoru mtWolf objesini desteklemiyor.")
-        return
-    end
-
-    local WolfID = World:SpawnMob(Player:GetPosX(), Player:GetPosY() + 1.0, Player:GetPosZ(), cMonster.mtWolf)
+    local WolfType = GetWolfType()
+    local WolfID = World:SpawnMob(Player:GetPosX(), Player:GetPosY() + 1.0, Player:GetPosZ(), WolfType)
     
     if WolfID and WolfID ~= cEntity.INVALID_ID then
         ActiveWolves[UUID] = WolfID
@@ -323,10 +339,6 @@ function SpawnWolfForPlayer(Player)
                 Monster:SetMaxHealth(maxHp)
                 Monster:SetHealth(maxHp)
             end
-            
-            -- DIKKAT: SetIsTame(true) ve SetOwner() KESINLIKLE KULLANILMIYOR! 
-            -- 1.8.9 istemcisinde sahibi UUID olmayan evcil hayvanlar 'Internal Exception' ile oyundan atar. 
-            -- Kurt yabani kalacak ama Lua AI (Yapay Zeka) sayesinde sahibine saldirmayip, onu koruyacak.
         end)
     else
         Player:SendMessageFailure("§cOyun motoru kurt uretemedi.")
@@ -352,8 +364,7 @@ function OnPlayerSpawned(Player)
     local UUID = Player:GetUUID()
     if not ActiveWolves[UUID] then
         Player:GetWorld():ScheduleTask(40, function()
-            local P = cRoot:Get():GetPlayerByUUID(UUID)
-            if P then SpawnWolfForPlayer(P) end
+            DoWithPlayer(UUID, function(P) SpawnWolfForPlayer(P) end)
         end)
     end
 end
@@ -373,13 +384,11 @@ function OnRightClickingEntity(Player, Entity)
         local UUID = Player:GetUUID()
         if ActiveWolves[UUID] == Entity:GetUniqueID() then
             
-            -- Menü Açma (Eğilirken)
             if Player:IsCrouched() then
                 Player:ExecuteCommand("/hub")
                 return true
             end
             
-            -- Besleme
             local Item = Player:GetEquippedItem()
             local MeatIDs = { [319]=true, [320]=true, [363]=true, [364]=true, [365]=true, [366]=true, [367]=true, [423]=true, [424]=true, [411]=true, [412]=true }
             
@@ -391,11 +400,10 @@ function OnRightClickingEntity(Player, Entity)
                 local Monster = tolua.cast(Entity, "cMonster")
                 if Monster then Monster:Heal(10) end
                 
-                Player:GetWorld():BroadcastEntityAnimation(Entity, 18)
+                pcall(function() Player:GetWorld():BroadcastEntityAnimation(Entity, 18) end)
                 AddWolfXP(UUID, 50)
                 Player:SendMessageInfo("§6[Yaver] §aKurdunu besledin! (+50 XP, +10 Can)")
             else
-                -- Cantayi Ac
                 local Window = GetBackpack(UUID)
                 Player:OpenWindow(Window)
             end
@@ -410,25 +418,22 @@ function OnTakeDamage(Receiver, TCA)
     local Attacker = TCA.Attacker
     if not Attacker then return false end
     
-    -- DOST ATEŞİ ENGELLEME: Oyuncu kendi kurduna vurursa
     if IsWolf(Receiver) and Attacker:IsPlayer() then
         for uuid, wid in pairs(ActiveWolves) do
             if wid == Receiver:GetUniqueID() and uuid == Attacker:GetUUID() then
-                return true -- Hasari tamamen iptal et (Vuramaz)
+                return true 
             end
         end
     end
     
-    -- DOST ATEŞİ ENGELLEME: Kurt yanlışlıkla sahibine vurursa
     if Receiver:IsPlayer() and IsWolf(Attacker) then
         for uuid, wid in pairs(ActiveWolves) do
             if wid == Attacker:GetUniqueID() and uuid == Receiver:GetUUID() then
-                return true -- Hasari tamamen iptal et (Isiramaz)
+                return true 
             end
         end
     end
     
-    -- Kurt baska bir mob'a veya dusmana vurursa ekstra hasar ekle
     if IsWolf(Attacker) then
         for uuid, wid in pairs(ActiveWolves) do
             if wid == Attacker:GetUniqueID() then
@@ -439,7 +444,6 @@ function OnTakeDamage(Receiver, TCA)
         end
     end
     
-    -- Sahibe baska bir canavar vurursa kurt derhal saldirir (korur)
     if Receiver:IsPlayer() then
         local UUID = Receiver:GetUUID()
         local WolfID = ActiveWolves[UUID]
@@ -455,27 +459,25 @@ end
 function OnKilled(Victim, TCA, CustomDeathMessage)
     local Attacker = TCA.Attacker
     
-    -- Kurt Ölürse
     if IsWolf(Victim) then
         for uuid, wid in pairs(ActiveWolves) do
             if wid == Victim:GetUniqueID() then
                 ActiveWolves[uuid] = nil
-                local P = cRoot:Get():GetPlayerByUUID(uuid)
-                if P then P:SendMessageWarning("§cKoruyucu kurdun ağır yaralandı! 30 saniye içinde iyileşip dönecek.") end
+                DoWithPlayer(uuid, function(P)
+                    P:SendMessageWarning("§cKoruyucu kurdun ağır yaralandı! 30 saniye içinde iyileşip dönecek.")
+                end)
                 
                 Victim:GetWorld():ScheduleTask(20 * 30, function()
-                    local Player = cRoot:Get():GetPlayerByUUID(uuid)
-                    if Player then
+                    DoWithPlayer(uuid, function(Player)
                         SpawnWolfForPlayer(Player)
                         Player:SendMessageSuccess("§aKoruyucu kurdun iyileşti ve yanına döndü!")
-                    end
+                    end)
                 end)
                 break
             end
         end
     end
     
-    -- Sahip birini öldürürse kurt XP kazanır
     if Attacker and Attacker:IsPlayer() then
         local uuid = Attacker:GetUUID()
         if ActiveWolves[uuid] then AddWolfXP(uuid, 25) end
@@ -491,11 +493,9 @@ function PeriodicWolfTask(World)
             World:DoWithEntityByID(WolfID, function(Ent)
                 local dist = (Ent:GetPosition() - Player:GetPosition()):Length()
                 
-                -- Yapay Zeka: Oyuncu cok uzaklasirsa yanina isinla!
                 if dist > 15 then 
                     Ent:TeleportToEntity(Player) 
                 elseif dist > 4 then
-                    -- Eger isinlanacak kadar uzak degilse pesinden kostur
                     local Wolf = tolua.cast(Ent, "cMonster")
                     if Wolf then Wolf:MoveToPosition(Player:GetPosition()) end
                 end
@@ -517,11 +517,11 @@ end
 def write_configs(server_dir=SERVER_DIR):
     files = {
         f"{server_dir}/settings.ini": SETTINGS_INI.strip(),
-        f"{server_dir}/Plugins/WCSync/Info.lua": 'g_PluginInfo = {Name="WCSync", Version="2"}',
+        f"{server_dir}/Plugins/WCSync/Info.lua": 'g_PluginInfo = {Name="WCSync", Version="3"}',
         f"{server_dir}/Plugins/WCSync/main.lua": WCSYNC_MAIN.strip(),
-        f"{server_dir}/Plugins/WCHub/Info.lua": 'g_PluginInfo = {Name="WCHub", Version="5"}',
+        f"{server_dir}/Plugins/WCHub/Info.lua": 'g_PluginInfo = {Name="WCHub", Version="12"}',
         f"{server_dir}/Plugins/WCHub/main.lua": _make_wchub_lua(HTTP_PORT).strip(),
-        f"{server_dir}/Plugins/yaver/Info.lua": 'g_PluginInfo = {Name="yaver", Version="10"}',
+        f"{server_dir}/Plugins/yaver/Info.lua": 'g_PluginInfo = {Name="yaver", Version="11"}',
         f"{server_dir}/Plugins/yaver/main.lua": YAVER_MAIN.strip(),
     }
     for path, content in files.items():
@@ -680,7 +680,7 @@ class PlayerConn:
                 
                 import aiosqlite
                 async with aiosqlite.connect(DB_FILE) as db:
-                    await db.execute("UPDATE servers SET last_server=? WHERE username=?", (target_label, self.username))
+                    await db.execute("UPDATE players SET last_server=? WHERE username=?", (target_label, self.username))
                     await db.commit()
                 break
             
@@ -774,7 +774,7 @@ async def handle_player(cr, cw):
     await PlayerConn(cr, cw).run()
 
 # ══════════════════════════════════════════════════════════
-#  HTTP API VE JSON PANEL EKLENTİSİ
+#  HTTP API VE JSON PANEL EKLENTİSİ (SQLite UYARLI)
 # ══════════════════════════════════════════════════════════
 
 class HttpHandler(http.server.BaseHTTPRequestHandler):
@@ -788,9 +788,12 @@ class HttpHandler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
             try:
-                conn = sqlite3.connect(DB_FILE); conn.row_factory = sqlite3.Row; cur = conn.cursor()
+                conn = sqlite3.connect(DB_FILE)
+                conn.row_factory = sqlite3.Row
+                cur = conn.cursor()
                 cur.execute("SELECT label, players, host, port, last_seen FROM servers WHERE (? - last_seen) < 45 ORDER BY label ASC", (int(time.time()),))
-                servers = cur.fetchall(); conn.close()
+                servers = cur.fetchall()
+                conn.close()
             except: servers = []
             addr = _proxy_bore_addr if _proxy_bore_addr else "Tünel bekleniyor..."
             rows = ""
@@ -943,7 +946,9 @@ async function sendCommand() {{
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.end_headers()
             try:
-                conn = sqlite3.connect(DB_FILE); conn.row_factory = sqlite3.Row; cur = conn.cursor()
+                conn = sqlite3.connect(DB_FILE)
+                conn.row_factory = sqlite3.Row
+                cur = conn.cursor()
                 cur.execute("SELECT label, players FROM servers WHERE (? - last_seen) < 45 ORDER BY label ASC", (int(time.time()),))
                 servers = [{"sunucu": r["label"], "oyuncu_sayisi": r["players"]} for r in cur.fetchall()]
                 conn.close()
@@ -981,7 +986,9 @@ async function sendCommand() {{
                 return
 
             try:
-                conn = sqlite3.connect(DB_FILE); conn.row_factory = sqlite3.Row; cur = conn.cursor()
+                conn = sqlite3.connect(DB_FILE)
+                conn.row_factory = sqlite3.Row
+                cur = conn.cursor()
                 cur.execute("SELECT label, players FROM servers WHERE (? - last_seen) < 45 ORDER BY label ASC", (int(time.time()),))
                 resp = ";".join([f"{r['label']}:{r['players']}" for r in cur.fetchall()])
                 conn.close()
