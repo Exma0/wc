@@ -30,9 +30,10 @@ DATA_DIR      = os.environ.get("DATA_DIR", "/data")
 SERVER_DIR    = os.environ.get("SERVER_DIR", "/server")
 DB_FILE       = f"{DATA_DIR}/hub.db"
 
-_proxy_bore_addr = None
-_active_players  = []
-_DB_LOCK         = threading.Lock()
+_proxy_bore_addr  = None
+_active_players   = []
+_DB_LOCK          = threading.Lock()
+_cuberite_proc    = None   # Yerel Cuberite süreci (restart için)
 
 # ══════════════════════════════════════════════════════════
 #  VERİTABANI İŞLEMLERİ (Otomatik Hızlı Temizlik ve Benzersiz ID)
@@ -46,12 +47,15 @@ async def init_db():
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS servers (
                     label TEXT PRIMARY KEY, host TEXT, port INTEGER,
-                    players INTEGER DEFAULT 0, last_seen INTEGER
+                    players INTEGER DEFAULT 0, last_seen INTEGER,
+                    restart_pending INTEGER DEFAULT 0
                 )
             """)
             try:
-                # Tabloya sunuculari sonsuza dek tanimak icin server_id ekle
                 await db.execute("ALTER TABLE servers ADD COLUMN server_id TEXT")
+            except: pass
+            try:
+                await db.execute("ALTER TABLE servers ADD COLUMN restart_pending INTEGER DEFAULT 0")
             except: pass
             
             await db.execute("""
@@ -522,19 +526,111 @@ class HttpHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/":
             self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            try:
+                conn = sqlite3.connect(DB_FILE); conn.row_factory = sqlite3.Row; cur = conn.cursor()
+                cur.execute("SELECT label, players, host, port, last_seen FROM servers WHERE (? - last_seen) < 45 ORDER BY label ASC", (int(time.time()),))
+                servers = cur.fetchall(); conn.close()
+            except: servers = []
+            addr = _proxy_bore_addr if _proxy_bore_addr else "Tünel bekleniyor..."
+            rows = ""
+            for s in servers:
+                rows += f"""
+                <tr>
+                  <td><span class="badge">{'🌐 HUB' if s['host']=='127.0.0.1' else '🎮 GS'}</span> {s['label']}</td>
+                  <td>{s['host']}:{s['port']}</td>
+                  <td><span class="players">👥 {s['players']}</span></td>
+                  <td>
+                    <button class="btn btn-warn" onclick="restartOne('{s['label']}')">🔄 Yeniden Başlat</button>
+                  </td>
+                </tr>"""
+            html = f"""<!DOCTYPE html>
+<html lang="tr"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>WC Network Panel</title>
+<style>
+  *{{box-sizing:border-box;margin:0;padding:0}}
+  body{{background:#0d1117;color:#e6edf3;font-family:'Segoe UI',sans-serif;min-height:100vh;padding:24px}}
+  h1{{font-size:1.6rem;margin-bottom:4px;color:#58a6ff}}
+  .subtitle{{color:#8b949e;font-size:.85rem;margin-bottom:24px}}
+  .cards{{display:flex;gap:16px;flex-wrap:wrap;margin-bottom:28px}}
+  .card{{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:18px 24px;min-width:160px}}
+  .card .val{{font-size:2rem;font-weight:700;color:#58a6ff}}
+  .card .lbl{{font-size:.75rem;color:#8b949e;margin-top:4px}}
+  .addr{{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px 16px;margin-bottom:24px;font-family:monospace;color:#3fb950;font-size:.9rem}}
+  .addr span{{color:#8b949e;font-size:.75rem;display:block;margin-bottom:4px}}
+  table{{width:100%;border-collapse:collapse;background:#161b22;border-radius:10px;overflow:hidden;border:1px solid #30363d}}
+  th{{background:#21262d;padding:12px 16px;text-align:left;font-size:.75rem;color:#8b949e;text-transform:uppercase;letter-spacing:.05em}}
+  td{{padding:12px 16px;border-top:1px solid #21262d;font-size:.88rem}}
+  .badge{{background:#21262d;border-radius:4px;padding:2px 6px;font-size:.7rem;color:#8b949e}}
+  .players{{color:#3fb950;font-weight:600}}
+  .btn{{border:none;border-radius:6px;padding:6px 14px;cursor:pointer;font-size:.8rem;font-weight:600;transition:.15s}}
+  .btn-danger{{background:#da3633;color:#fff}} .btn-danger:hover{{background:#f85149}}
+  .btn-warn{{background:#9e6a03;color:#fff}} .btn-warn:hover{{background:#d29922}}
+  .btn-warn:disabled,.btn-danger:disabled{{opacity:.4;cursor:not-allowed}}
+  .actions{{display:flex;gap:10px;align-items:center;margin-bottom:20px}}
+  #toast{{position:fixed;bottom:24px;right:24px;background:#238636;color:#fff;padding:12px 20px;border-radius:8px;font-size:.85rem;display:none;z-index:99;border:1px solid #2ea043}}
+  #toast.err{{background:#da3633;border-color:#f85149}}
+  .section-title{{font-size:.8rem;color:#8b949e;text-transform:uppercase;letter-spacing:.06em;margin-bottom:10px}}
+</style></head><body>
+<h1>⛏️ WC Network Panel</h1>
+<p class="subtitle">Minecraft Bungee Network Yönetim Paneli</p>
+<div class="cards">
+  <div class="card"><div class="val">{len(_active_players)}</div><div class="lbl">Aktif Oyuncu</div></div>
+  <div class="card"><div class="val">{len(servers)}</div><div class="lbl">Aktif Sunucu</div></div>
+  <div class="card"><div class="val">{'🟢' if servers else '🔴'}</div><div class="lbl">Ağ Durumu</div></div>
+</div>
+<div class="addr"><span>Minecraft Bağlantı Adresi</span>{addr}</div>
+<div class="section-title">Sunucular</div>
+<div class="actions">
+  <button class="btn btn-danger" id="restartAllBtn" onclick="restartAll()">🔄 Tüm Sunucuları Yeniden Başlat</button>
+  <span id="statusMsg" style="color:#8b949e;font-size:.82rem"></span>
+</div>
+<table>
+  <thead><tr><th>Sunucu</th><th>Adres</th><th>Oyuncu</th><th>İşlem</th></tr></thead>
+  <tbody id="serverBody">{rows if rows else '<tr><td colspan="4" style="color:#8b949e;text-align:center;padding:28px">Aktif sunucu yok</td></tr>'}</tbody>
+</table>
+<div id="toast"></div>
+<script>
+function toast(msg,err=false){{
+  const t=document.getElementById('toast');
+  t.textContent=msg; t.className=err?'err':''; t.style.display='block';
+  setTimeout(()=>t.style.display='none',3500);
+}}
+async function restartAll(){{
+  const btn=document.getElementById('restartAllBtn');
+  const msg=document.getElementById('statusMsg');
+  btn.disabled=true; msg.textContent='Yeniden başlatma sinyali gönderiliyor...';
+  try{{
+    const r=await fetch('/api/restart_all',{{method:'POST'}});
+    const d=await r.json();
+    toast('✅ '+d.message); msg.textContent='Sinyal gönderildi!';
+  }}catch(e){{toast('❌ Hata: '+e,true); msg.textContent='';}}
+  setTimeout(()=>{{btn.disabled=false;msg.textContent='';}},5000);
+}}
+async function restartOne(label){{
+  if(!confirm(label+' sunucusunu yeniden başlatmak istiyor musunuz?'))return;
+  try{{
+    const r=await fetch('/api/restart?label='+encodeURIComponent(label),{{method:'POST'}});
+    const d=await r.json();
+    toast('✅ '+d.message);
+  }}catch(e){{toast('❌ Hata: '+e,true);}}
+}}
+setInterval(()=>location.reload(),15000);
+</script></body></html>"""
+            self.wfile.write(html.encode('utf-8'))
+            return
+
+        if self.path == "/api/status":
+            self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.end_headers()
-            
             try:
-                conn = sqlite3.connect(DB_FILE)
-                conn.row_factory = sqlite3.Row
-                cur = conn.cursor()
+                conn = sqlite3.connect(DB_FILE); conn.row_factory = sqlite3.Row; cur = conn.cursor()
                 cur.execute("SELECT label, players FROM servers WHERE (? - last_seen) < 45 ORDER BY label ASC", (int(time.time()),))
                 servers = [{"sunucu": r["label"], "oyuncu_sayisi": r["players"]} for r in cur.fetchall()]
                 conn.close()
-            except:
-                servers = []
-
+            except: servers = []
             response = {
                 "sistem": "WC Bungee Network Aktif",
                 "minecraft_baglanti_adresi": _proxy_bore_addr if _proxy_bore_addr else "Tunnel baglantisi bekleniyor...",
@@ -578,7 +674,50 @@ class HttpHandler(http.server.BaseHTTPRequestHandler):
             except Exception: self.send_response(500); self.end_headers()
 
     def do_POST(self):
-        if self.path.startswith("/api/player_file?name="):
+        # ── Tüm sunucuları yeniden başlat ──────────────────────────────
+        if self.path == "/api/restart_all":
+            count = 0
+            try:
+                with _DB_LOCK:
+                    conn = sqlite3.connect(DB_FILE)
+                    cur = conn.cursor()
+                    cur.execute("UPDATE servers SET restart_pending=1 WHERE (? - last_seen) < 45", (int(time.time()),))
+                    count = cur.rowcount
+                    conn.commit(); conn.close()
+                # Yerel Cuberite'i de hemen yeniden başlat (MODE=="all" durumunda)
+                _restart_local_cuberite()
+                print(f"[ADMIN] Tüm sunuculara ({count}) yeniden başlatma sinyali gönderildi.")
+                self.send_response(200); self.send_header("Content-Type","application/json"); self.end_headers()
+                self.wfile.write(json.dumps({"ok": True, "message": f"{count} sunucuya yeniden başlatma sinyali gönderildi."}).encode())
+            except Exception as e:
+                self.send_response(500); self.end_headers()
+                self.wfile.write(json.dumps({"ok": False, "message": str(e)}).encode())
+            return
+
+        # ── Tek sunucuyu yeniden başlat ────────────────────────────────
+        if self.path.startswith("/api/restart"):
+            label = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get('label', [''])[0]
+            if not label:
+                self.send_response(400); self.end_headers()
+                self.wfile.write(json.dumps({"ok": False, "message": "label parametresi eksik"}).encode())
+                return
+            try:
+                with _DB_LOCK:
+                    conn = sqlite3.connect(DB_FILE)
+                    conn.execute("UPDATE servers SET restart_pending=1 WHERE label=?", (label,))
+                    conn.commit(); conn.close()
+                # Yerel hub sunucusuysa hemen başlat
+                if label in ("LOCAL_HUB_01", "GM1") or MODE == "all":
+                    _restart_local_cuberite()
+                print(f"[ADMIN] '{label}' sunucusuna yeniden başlatma sinyali gönderildi.")
+                self.send_response(200); self.send_header("Content-Type","application/json"); self.end_headers()
+                self.wfile.write(json.dumps({"ok": True, "message": f"'{label}' sunucusuna sinyal gönderildi."}).encode())
+            except Exception as e:
+                self.send_response(500); self.end_headers()
+                self.wfile.write(json.dumps({"ok": False, "message": str(e)}).encode())
+            return
+
+
             name = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get('name', [''])[0]
             name = "".join(c for c in name if c.isalnum() or c in "-_")
             length = int(self.headers.get("Content-Length", 0))
@@ -601,28 +740,34 @@ class HttpHandler(http.server.BaseHTTPRequestHandler):
                     cur = conn.cursor()
                     
                     if server_id:
-                        cur.execute("SELECT label FROM servers WHERE server_id=?", (server_id,))
+                        cur.execute("SELECT label, restart_pending FROM servers WHERE server_id=?", (server_id,))
                         row = cur.fetchone()
                         if row:
                             label = row[0]
-                            conn.execute("UPDATE servers SET host=?, port=?, last_seen=? WHERE label=?", (host, port, now, label))
+                            restart_needed = bool(row[1])
+                            conn.execute("UPDATE servers SET host=?, port=?, last_seen=?, restart_pending=0 WHERE label=?", (host, port, now, label))
                         else:
+                            restart_needed = False
                             cur.execute("SELECT COUNT(*) FROM servers")
                             label = f"GM{cur.fetchone()[0] + 1}"
-                            # Eger PRAGMA ile server_id sutunu eklenmemisse hata vermemesi icin koruma:
                             try:
                                 conn.execute("INSERT INTO servers (label, server_id, host, port, last_seen) VALUES (?, ?, ?, ?, ?)", (label, server_id, host, port, now))
                             except:
                                 conn.execute("INSERT INTO servers (label, host, port, last_seen) VALUES (?, ?, ?, ?)", (label, host, port, now))
                     else:
+                        restart_needed = False
                         cur.execute("SELECT COUNT(*) FROM servers")
                         label = f"GM{cur.fetchone()[0] + 1}"
                         conn.execute("INSERT INTO servers (label, host, port, last_seen) VALUES (?, ?, ?, ?)", (label, host, port, now))
                         
                     conn.commit(); conn.close()
                 
-                self.send_response(200); self.end_headers(); self.wfile.write(json.dumps({"label": label}).encode())
-                print(f"[REG] Sunucu Aktif: {label} ({host}:{port})")
+                self.send_response(200); self.send_header("Content-Type","application/json"); self.end_headers()
+                self.wfile.write(json.dumps({"label": label, "restart": restart_needed}).encode())
+                if restart_needed:
+                    print(f"[REG] {label} sunucusuna restart komutu iletildi.")
+                else:
+                    print(f"[REG] Sunucu Aktif: {label} ({host}:{port})")
             except Exception as e:
                 print(f"[REG] Kayit Hatasi: {e}"); self.send_response(500); self.end_headers()
 
@@ -631,6 +776,21 @@ class HttpHandler(http.server.BaseHTTPRequestHandler):
 # ══════════════════════════════════════════════════════════
 #  BAŞLATICI YÖNTEMLER
 # ══════════════════════════════════════════════════════════
+
+def _restart_local_cuberite():
+    """Yerel Cuberite sürecini güvenli şekilde yeniden başlatır."""
+    global _cuberite_proc
+    if _cuberite_proc and _cuberite_proc.poll() is None:
+        print("[ADMIN] Yerel Cuberite yeniden başlatılıyor...")
+        try:
+            _cuberite_proc.terminate()
+            _cuberite_proc.wait(timeout=8)
+        except Exception:
+            try: _cuberite_proc.kill()
+            except: pass
+        _cuberite_proc = None
+    else:
+        print("[ADMIN] Yerel Cuberite zaten çalışmıyor, sinyal DB'de bekleniyor.")
 
 def run_http():
     http.server.ThreadingHTTPServer.allow_reuse_address = True
@@ -680,7 +840,12 @@ def run_bore_for_gameserver():
                     host, port_str = current_gs_bore.split(":")
                     payload = json.dumps({"host": host, "port": int(port_str), "server_id": server_id})
                     req = urllib.request.Request(f"{proxy_url}/api/register", data=payload.encode(), headers={"Content-Type": "application/json"})
-                    urllib.request.urlopen(req, timeout=5)
+                    resp = urllib.request.urlopen(req, timeout=5).read()
+                    resp_data = json.loads(resp)
+                    # Hub'dan restart sinyali gelirse Cuberite'i yeniden başlat
+                    if resp_data.get("restart"):
+                        print(f"[HEARTBEAT] Hub'dan restart komutu alındı! Cuberite yeniden başlatılıyor...")
+                        _restart_local_cuberite()
                 except Exception: pass
 
     threading.Thread(target=heartbeat, daemon=True).start()
@@ -752,9 +917,11 @@ def run_cuberite():
                 threading.Thread(target=_do_upload, args=(line,), daemon=True).start()
 
     while True:
+        global _cuberite_proc
         proc = subprocess.Popen([mc_bin], cwd=str(pathlib.Path(mc_bin).parent), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+        _cuberite_proc = proc
         threading.Thread(target=_pipe_output, args=(proc.stdout, proc), daemon=True).start()
-        proc.wait(); time.sleep(5)
+        proc.wait(); _cuberite_proc = None; time.sleep(5)
 
 def register_local_cuberite():
     while True:
