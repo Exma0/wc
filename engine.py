@@ -2,9 +2,9 @@
 """
 ⛏️  Minecraft Ultimate Bungee Network & Anti-Dupe Engine
 ═══════════════════════════════════════════════════════════
-  • FIX: Saf Sohbet UI (Chat Menu) Aktif.
-  • YENİ: Yaver (Koruyucu Kurt) Sistemi eklendi! (Level, Çanta, Buff)
-  • YENİ: Hub Menüsü kurda entegre edildi (Shift + Sağ Tık ile açılır)
+  • FIX: Kurt dogmama sorununa karsi /kurt komutu eklendi!
+  • YENİ: Web paneline Canli Konsol (Terminal) ve Komut Gonderme eklendi!
+  • Saf Sohbet UI & Hub Menüsü devam ediyor.
 """
 
 import asyncio, json, os, pathlib, struct, sys
@@ -34,6 +34,16 @@ _active_players   = []
 _DB_LOCK          = threading.Lock()
 _cuberite_proc    = None   
 
+# === CANLI KONSOL LOGLARI İÇİN TAMPON ===
+SYSTEM_LOGS = deque(maxlen=200)
+
+def log_msg(text):
+    """Hem terminale yazar hem de Web Paneli konsolu icin kaydeder."""
+    stamp = datetime.datetime.now().strftime("%H:%M:%S")
+    line = f"[{stamp}] {text}"
+    SYSTEM_LOGS.append(line)
+    print(line)
+
 # ══════════════════════════════════════════════════════════
 #  VERİTABANI İŞLEMLERİ
 # ══════════════════════════════════════════════════════════
@@ -62,7 +72,9 @@ async def init_db():
             """)
             await db.execute("DELETE FROM servers WHERE (? - last_seen) > 45", (int(time.time()),))
             await db.commit()
-    except Exception as e: pass
+        log_msg("[DB] SQLite Merkez Veritabani Hazir.")
+    except Exception as e:
+        log_msg(f"[DB] HATA: Veritabani Olusturulamadi -> {e}")
 
 # ══════════════════════════════════════════════════════════
 #  LUA EKLENTİLERİ (WCSync, WCHub, Yaver)
@@ -192,7 +204,7 @@ end
 
 function Initialize(Plugin)
     Plugin:SetName("yaver")
-    Plugin:SetVersion(2)
+    Plugin:SetVersion(3)
     
     Ini = cIniFile()
     Ini:ReadFile("YaverData.ini")
@@ -203,8 +215,11 @@ function Initialize(Plugin)
     cPluginManager:AddHook(cPluginManager.HOOK_TAKE_DAMAGE, OnTakeDamage)
     cPluginManager:AddHook(cPluginManager.HOOK_KILLED, OnKilled)
     
+    -- /kurt komutunu bagliyoruz
+    cPluginManager:BindCommand("/kurt", "", HandleKurtCommand, "Koruyucu kurdunu yanina cagirir.")
+    
     cRoot:Get():GetDefaultWorld():ScheduleTask(20 * 3, PeriodicWolfTask)
-    LOG("[YAVER] Koruyucu Kurt ve Gömülü Hub Menüsü aktif edildi!")
+    LOG("[YAVER] Koruyucu Kurt sistemi ve /kurt komutu aktif!")
     return true
 end
 
@@ -228,11 +243,11 @@ function AddWolfXP(UUID, Amount)
             if WolfID then
                 Player:GetWorld():DoWithEntityByID(WolfID, function(Ent)
                     local Wolf = tolua.cast(Ent, "cWolf")
-                    Wolf:SetCustomName("§b" .. Player:GetName() .. " §7Kurdu §e[Lv " .. lvl .. "] §8| §a(Shift+S.Tık: Menü)")
+                    Wolf:SetCustomName("§b" .. Player:GetName() .. " §7Kurdu §e[Lv " .. lvl .. "] §8| §a(Shift+Tık: Menü)")
                     local maxHp = 20 + (lvl * 2)
                     Wolf:SetMaxHealth(maxHp)
                     Wolf:Heal(maxHp)
-                    Player:GetWorld():BroadcastEntityAnimation(Wolf, 18) -- Kalp animasyonu
+                    Player:GetWorld():BroadcastEntityAnimation(Wolf, 18)
                 end)
             end
         end
@@ -246,7 +261,6 @@ function GetBackpack(UUID)
     local Window = cLuaWindow(cWindow.wtChest, 3, "§8Yaver Cantasi")
     local InvIni = cIniFile()
     InvIni:ReadFile("YaverInv.ini")
-    
     for i=0, 26 do
         local str = InvIni:GetValue(UUID, "Slot_"..i, "")
         if str ~= "" then
@@ -255,7 +269,6 @@ function GetBackpack(UUID)
             Window:SetSlot(nil, i, Itm)
         end
     end
-    
     Window:SetOnClosed(function(a_Window, a_Player)
         local Ini2 = cIniFile()
         Ini2:ReadFile("YaverInv.ini")
@@ -272,11 +285,18 @@ function GetBackpack(UUID)
     return Window
 end
 
--- ================= Kurt Çagirma ve Yonetim =================
+-- ================= Kurt Çagirma =================
 function SpawnWolfForPlayer(Player)
     local UUID = Player:GetUUID()
     local World = Player:GetWorld()
-    local WolfID = World:SpawnMob(Player:GetPosX(), Player:GetPosY() + 1, Player:GetPosZ(), cMonster.mtWolf)
+    
+    -- Eski kurdu sil (bugda kalmissa)
+    if ActiveWolves[UUID] then
+        World:DoWithEntityByID(ActiveWolves[UUID], function(Ent) Ent:Destroy() end)
+    end
+    
+    -- Bir blok yukarida dogur (harita icine sikismamasi icin)
+    local WolfID = World:SpawnMob(Player:GetPosX(), Player:GetPosY() + 1.0, Player:GetPosZ(), cMonster.mtWolf)
     
     if WolfID ~= cEntity.INVALID_ID then
         ActiveWolves[UUID] = WolfID
@@ -286,8 +306,7 @@ function SpawnWolfForPlayer(Player)
             Wolf:SetIsTame(true)
             Wolf:SetIsSitting(false)
             local lvl = GetWolfLevel(UUID)
-            -- KURDUN İSMİNE MENÜ BİLGİSİ EKLENDİ
-            Wolf:SetCustomName("§b" .. Player:GetName() .. " §7Kurdu §e[Lv " .. lvl .. "] §8| §a(Shift+S.Tık: Menü)")
+            Wolf:SetCustomName("§b" .. Player:GetName() .. " §7Kurdu §e[Lv " .. lvl .. "] §8| §a(Shift+Tık: Menü)")
             Wolf:SetCustomNameAlwaysVisible(true)
             local maxHp = 20 + (lvl * 2)
             Wolf:SetMaxHealth(maxHp)
@@ -296,10 +315,25 @@ function SpawnWolfForPlayer(Player)
     end
 end
 
+-- MANUEL KURT CAGIRMA KOMUTU
+function HandleKurtCommand(Split, Player)
+    local UUID = Player:GetUUID()
+    if ActiveWolves[UUID] then
+        Player:SendMessageWarning("§eKurdun zaten aktif! Yanina isinlaniyor...")
+        Player:GetWorld():DoWithEntityByID(ActiveWolves[UUID], function(Ent)
+            Ent:TeleportToEntity(Player)
+        end)
+    else
+        SpawnWolfForPlayer(Player)
+        Player:SendMessageSuccess("§aSadik kurdun yanina cagirildi!")
+    end
+    return true
+end
+
 function OnPlayerSpawned(Player)
     local UUID = Player:GetUUID()
     if not ActiveWolves[UUID] then
-        Player:GetWorld():ScheduleTask(20, function() SpawnWolfForPlayer(Player) end)
+        Player:GetWorld():ScheduleTask(40, function() SpawnWolfForPlayer(Player) end)
     end
 end
 
@@ -312,23 +346,18 @@ function OnPlayerDestroyed(Player)
     end
 end
 
--- ================= Etkilesim (Ağ Menüsü, Besleme & Canta) =================
+-- ================= Etkilesim =================
 function OnRightClickingEntity(Player, Entity)
     if Entity:IsMob() and Entity:GetMobType() == cMonster.mtWolf then
         local UUID = Player:GetUUID()
         if ActiveWolves[UUID] == Entity:GetUniqueID() then
-            
-            -- OYUNCU EĞİLİYORSA (SHIFT BASILIYSA) AĞ MENÜSÜNÜ AÇ
             if Player:IsCrouched() then
                 Player:ExecuteCommand("/hub")
                 return true
             end
-
             local Item = Player:GetEquippedItem()
             local MeatIDs = { [319]=true, [320]=true, [363]=true, [364]=true, [365]=true, [366]=true, [367]=true, [423]=true, [424]=true, [411]=true, [412]=true }
-            
             if MeatIDs[Item.m_ItemType] then
-                -- Kurdu Besle
                 Item.m_ItemCount = Item.m_ItemCount - 1
                 if Item.m_ItemCount <= 0 then Item:Empty() end
                 Player:GetInventory():SetEquippedItem(Item)
@@ -337,7 +366,6 @@ function OnRightClickingEntity(Player, Entity)
                 AddWolfXP(UUID, 50)
                 Player:SendMessageInfo("§6[Yaver] §aKurdunu besledin! (+50 XP, +10 Can)")
             else
-                -- Cantayi Ac (Eğilmeden tıklanırsa)
                 local Window = GetBackpack(UUID)
                 Player:OpenWindow(Window)
             end
@@ -347,23 +375,19 @@ function OnRightClickingEntity(Player, Entity)
     return false
 end
 
--- ================= Savas ve Hasar Sistemi =================
+-- ================= Savas ve Hasar =================
 function OnTakeDamage(Receiver, TCA)
     local Attacker = TCA.Attacker
     if not Attacker then return false end
-    
-    -- Kurt Vurursa Hasari Levela Gore Artir
     if Attacker:IsMob() and Attacker:GetMobType() == cMonster.mtWolf then
         for uuid, wid in pairs(ActiveWolves) do
             if wid == Attacker:GetUniqueID() then
                 local lvl = GetWolfLevel(uuid)
-                TCA.FinalDamage = TCA.FinalDamage + (lvl * 1.5) -- Level basina 1.5 ekstra hasar
+                TCA.FinalDamage = TCA.FinalDamage + (lvl * 1.5)
                 AddWolfXP(uuid, 5)
             end
         end
     end
-    
-    -- Sahibe Biri Vurursa Kurt Onu Hedef Alir
     if Receiver:IsPlayer() then
         local UUID = Receiver:GetUUID()
         local WolfID = ActiveWolves[UUID]
@@ -378,15 +402,12 @@ end
 
 function OnKilled(Victim, TCA, CustomDeathMessage)
     local Attacker = TCA.Attacker
-    -- Kurt Olurse
     if Victim:IsMob() and Victim:GetMobType() == cMonster.mtWolf then
         for uuid, wid in pairs(ActiveWolves) do
             if wid == Victim:GetUniqueID() then
                 ActiveWolves[uuid] = nil
                 local P = cRoot:Get():GetPlayerByUUID(uuid)
                 if P then P:SendMessageWarning("§cKoruyucu kurdun ağır yaralandı! 30 saniye içinde iyileşip dönecek.") end
-                
-                -- 30 Saniye Sonra Yeniden Dogus
                 Victim:GetWorld():ScheduleTask(20 * 30, function()
                     local Player = cRoot:Get():GetPlayerByUUID(uuid)
                     if Player then
@@ -398,17 +419,13 @@ function OnKilled(Victim, TCA, CustomDeathMessage)
             end
         end
     end
-    
-    -- Sahip Birini Oldururse Kurt XP Kazanir
     if Attacker and Attacker:IsPlayer() then
         local uuid = Attacker:GetUUID()
-        if ActiveWolves[uuid] then
-            AddWolfXP(uuid, 25)
-        end
+        if ActiveWolves[uuid] then AddWolfXP(uuid, 25) end
     end
 end
 
--- ================= Periyodik Kontroller ve Takviyeler =================
+-- ================= Periyodik Kontrol =================
 function PeriodicWolfTask(World)
     World:ForEachPlayer(function(Player)
         local UUID = Player:GetUUID()
@@ -416,18 +433,13 @@ function PeriodicWolfTask(World)
         if WolfID then
             World:DoWithEntityByID(WolfID, function(Ent)
                 local Wolf = tolua.cast(Ent, "cWolf")
-                
-                -- Uzaklasirsa Yanina Isinla
                 local dist = (Wolf:GetPosition() - Player:GetPosition()):Length()
-                if dist > 20 then Wolf:TeleportToEntity(Player) end
+                if dist > 25 then Wolf:TeleportToEntity(Player) end
                 
-                -- Sahibine Levela Gore Takviye (Buff) Ver
                 local lvl = GetWolfLevel(UUID)
                 if lvl >= 5 then Player:AddEntityEffect(cEntityEffect.effSpeed, 20*6, 0) end
                 if lvl >= 10 then Player:AddEntityEffect(cEntityEffect.effStrength, 20*6, 0) end
                 if lvl >= 20 then Player:AddEntityEffect(cEntityEffect.effRegeneration, 20*6, 0) end
-                
-                -- Kurdun Canini Yavasca Doldur
                 if Wolf:GetHealth() < Wolf:GetMaxHealth() then Wolf:Heal(1) end
             end)
         end
@@ -443,7 +455,7 @@ def write_configs(server_dir=SERVER_DIR):
         f"{server_dir}/Plugins/WCSync/main.lua": WCSYNC_MAIN.strip(),
         f"{server_dir}/Plugins/WCHub/Info.lua": 'g_PluginInfo = {Name="WCHub", Version="5"}',
         f"{server_dir}/Plugins/WCHub/main.lua": _make_wchub_lua(HTTP_PORT).strip(),
-        f"{server_dir}/Plugins/yaver/Info.lua": 'g_PluginInfo = {Name="yaver", Version="2"}',
+        f"{server_dir}/Plugins/yaver/Info.lua": 'g_PluginInfo = {Name="yaver", Version="3"}',
         f"{server_dir}/Plugins/yaver/main.lua": YAVER_MAIN.strip(),
     }
     for path, content in files.items():
@@ -676,6 +688,7 @@ class PlayerConn:
                 
                 _active_players.append(self)
                 self.play_state = True
+                log_msg(f"[JOIN] {self.username} -> {self.current_label} sunucusuna girdi.")
                 
                 import aiosqlite
                 async with aiosqlite.connect(DB_FILE) as db:
@@ -695,7 +708,7 @@ async def handle_player(cr, cw):
     await PlayerConn(cr, cw).run()
 
 # ══════════════════════════════════════════════════════════
-#  HTTP API VE JSON PANEL EKLENTİSİ
+#  HTTP API VE JSON PANEL EKLENTİSİ (KONSOL DESTEKLİ)
 # ══════════════════════════════════════════════════════════
 
 class HttpHandler(http.server.BaseHTTPRequestHandler):
@@ -730,7 +743,7 @@ class HttpHandler(http.server.BaseHTTPRequestHandler):
 <title>WC Network Panel</title>
 <style>
   *{{box-sizing:border-box;margin:0;padding:0}}
-  body{{background:#0d1117;color:#e6edf3;font-family:'Segoe UI',sans-serif;min-height:100vh;padding:24px}}
+  body{{background:#0d1117;color:#e6edf3;font-family:'Segoe UI',sans-serif;min-height:100vh;padding:24px; padding-bottom:50px;}}
   h1{{font-size:1.6rem;margin-bottom:4px;color:#58a6ff}}
   .subtitle{{color:#8b949e;font-size:.85rem;margin-bottom:24px}}
   .cards{{display:flex;gap:16px;flex-wrap:wrap;margin-bottom:28px}}
@@ -751,7 +764,13 @@ class HttpHandler(http.server.BaseHTTPRequestHandler):
   .actions{{display:flex;gap:10px;align-items:center;margin-bottom:20px}}
   #toast{{position:fixed;bottom:24px;right:24px;background:#238636;color:#fff;padding:12px 20px;border-radius:8px;font-size:.85rem;display:none;z-index:99;border:1px solid #2ea043}}
   #toast.err{{background:#da3633;border-color:#f85149}}
-  .section-title{{font-size:.8rem;color:#8b949e;text-transform:uppercase;letter-spacing:.06em;margin-bottom:10px}}
+  .section-title{{font-size:.8rem;color:#8b949e;text-transform:uppercase;letter-spacing:.06em;margin-bottom:10px; margin-top:30px;}}
+  
+  /* Konsol Stilleri */
+  .console-box {{background:#000; border:1px solid #30363d; border-radius:8px; height:350px; overflow-y:auto; padding:12px; font-family:monospace; color:#3fb950; font-size:13px; line-height:1.4; margin-bottom:12px;}}
+  .console-input-row {{display:flex; gap:10px;}}
+  .console-input {{flex:1; background:#161b22; border:1px solid #30363d; border-radius:6px; padding:10px; color:#fff; font-family:monospace; outline:none;}}
+  .console-input:focus {{border-color:#58a6ff;}}
 </style></head><body>
 <h1>⛏️ WC Network Panel</h1>
 <p class="subtitle">Minecraft Bungee Network Yönetim Paneli</p>
@@ -761,6 +780,7 @@ class HttpHandler(http.server.BaseHTTPRequestHandler):
   <div class="card"><div class="val">{'🟢' if servers else '🔴'}</div><div class="lbl">Ağ Durumu</div></div>
 </div>
 <div class="addr"><span>Minecraft Bağlantı Adresi</span>{addr}</div>
+
 <div class="section-title">Sunucular</div>
 <div class="actions">
   <button class="btn btn-danger" id="restartAllBtn" onclick="restartAll()">🔄 Tüm Sunucuları Yeniden Başlat</button>
@@ -770,6 +790,14 @@ class HttpHandler(http.server.BaseHTTPRequestHandler):
   <thead><tr><th>Sunucu</th><th>Adres</th><th>Oyuncu</th><th>İşlem</th></tr></thead>
   <tbody id="serverBody">{rows if rows else '<tr><td colspan="4" style="color:#8b949e;text-align:center;padding:28px">Aktif sunucu yok</td></tr>'}</tbody>
 </table>
+
+<div class="section-title">🖥️ Canlı Sistem Konsolu (Yerel)</div>
+<div class="console-box" id="consoleBox">Yükleniyor...</div>
+<div class="console-input-row">
+    <input type="text" class="console-input" id="cmdInput" placeholder="Komut yazın... (Örn: say Merhaba veya time set day)">
+    <button class="btn btn-warn" onclick="sendCommand()">Gönder</button>
+</div>
+
 <div id="toast"></div>
 <script>
 function toast(msg,err=false){{
@@ -796,9 +824,54 @@ async function restartOne(label){{
     toast('✅ '+d.message);
   }}catch(e){{toast('❌ Hata: '+e,true);}}
 }}
-setInterval(()=>location.reload(),15000);
+
+// KONSOL İŞLEMLERİ
+let autoScroll = true;
+const cb = document.getElementById('consoleBox');
+cb.addEventListener('scroll', () => {{
+    if(cb.scrollTop + cb.clientHeight >= cb.scrollHeight - 20) autoScroll = true;
+    else autoScroll = false;
+}});
+
+async function fetchLogs() {{
+    try {{
+        const r = await fetch('/api/logs');
+        const d = await r.json();
+        cb.innerHTML = d.logs.join('<br>') || "Konsol gecmisi bos...";
+        if(autoScroll) cb.scrollTop = cb.scrollHeight;
+    }} catch(e){{}}
+}}
+setInterval(fetchLogs, 1500);
+fetchLogs();
+
+document.getElementById('cmdInput').addEventListener('keypress', function(e) {{
+    if (e.key === 'Enter') sendCommand();
+}});
+
+async function sendCommand() {{
+    const input = document.getElementById('cmdInput');
+    const cmd = input.value.trim();
+    if(!cmd) return;
+    input.value = '';
+    try {{
+        await fetch('/api/command', {{
+            method:'POST', 
+            headers: {{'Content-Type': 'application/json'}},
+            body: JSON.stringify({{command: cmd}})
+        }});
+        toast('✅ Komut gönderildi');
+        fetchLogs();
+    }} catch(e){{toast('❌ Gönderim hatası', true);}}
+}}
 </script></body></html>"""
             self.wfile.write(html.encode('utf-8'))
+            return
+
+        if self.path == "/api/logs":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(json.dumps({"logs": list(SYSTEM_LOGS)}).encode('utf-8'))
             return
 
         if self.path == "/api/status":
@@ -852,6 +925,25 @@ setInterval(()=>location.reload(),15000);
             except Exception: self.send_response(500); self.end_headers()
 
     def do_POST(self):
+        # WEB PANEL ÜZERİNDEN GELEN KOMUT İSTEKLERİ
+        if self.path == "/api/command":
+            length = int(self.headers.get("Content-Length", 0))
+            try:
+                data = json.loads(self.rfile.read(length))
+                cmd = data.get("command", "")
+                if cmd and _cuberite_proc and _cuberite_proc.poll() is None:
+                    _cuberite_proc.stdin.write(cmd + "\n")
+                    _cuberite_proc.stdin.flush()
+                    log_msg(f"[WEB-KOMUT] {cmd}")
+                    self.send_response(200)
+                else:
+                    self.send_response(400)
+            except Exception as e:
+                log_msg(f"[WEB-KOMUT HATA] {e}")
+                self.send_response(500)
+            self.end_headers()
+            return
+
         if self.path == "/api/restart_all":
             count = 0
             try:
@@ -862,6 +954,7 @@ setInterval(()=>location.reload(),15000);
                     count = cur.rowcount
                     conn.commit(); conn.close()
                 _restart_local_cuberite()
+                log_msg(f"[ADMIN] Tüm sunuculara ({count}) yeniden başlatma sinyali gönderildi.")
                 self.send_response(200); self.send_header("Content-Type","application/json"); self.end_headers()
                 self.wfile.write(json.dumps({"ok": True, "message": f"{count} sunucuya yeniden başlatma sinyali gönderildi."}).encode())
             except Exception as e:
@@ -882,6 +975,7 @@ setInterval(()=>location.reload(),15000);
                     conn.commit(); conn.close()
                 if label in ("LOCAL_HUB_01", "GM1") or MODE == "all":
                     _restart_local_cuberite()
+                log_msg(f"[ADMIN] '{label}' sunucusuna yeniden başlatma sinyali gönderildi.")
                 self.send_response(200); self.send_header("Content-Type","application/json"); self.end_headers()
                 self.wfile.write(json.dumps({"ok": True, "message": f"'{label}' sunucusuna sinyal gönderildi."}).encode())
             except Exception as e:
@@ -936,6 +1030,8 @@ setInterval(()=>location.reload(),15000);
                 
                 self.send_response(200); self.send_header("Content-Type","application/json"); self.end_headers()
                 self.wfile.write(json.dumps({"label": label, "restart": restart_needed}).encode())
+                if restart_needed:
+                    log_msg(f"[REG] {label} sunucusuna restart komutu iletildi.")
             except Exception as e:
                 self.send_response(500); self.end_headers()
 
@@ -977,6 +1073,7 @@ def run_bore_for_proxy():
                 m = re.search(r"bore\.pub:(\d+)", line)
                 if m:
                     _proxy_bore_addr = f"bore.pub:{m.group(1)}"
+                    log_msg(f"[BORE] Ana Yönlendirici Tüneli Açıldı! Adres: {_proxy_bore_addr}")
             proc.wait()
         except: pass
         time.sleep(5)
@@ -1019,6 +1116,7 @@ def run_bore_for_gameserver():
                 m = re.search(r"bore\.pub:(\d+)", line)
                 if m:
                     current_gs_bore = f"bore.pub:{m.group(1)}"
+                    log_msg(f"[BORE] Alt Sunucu Tüneli: {current_gs_bore}")
             proc.wait()
         except: pass
         time.sleep(5)
@@ -1036,6 +1134,8 @@ def run_cuberite():
         for raw in stream:
             line = raw.rstrip() if isinstance(raw, str) else raw.decode("utf-8", "replace").rstrip()
             if not line: continue
+            
+            log_msg(f"[CUBERITE] {line}")
             
             if "WCSYNC_JOIN:" in line:
                 def _do_join(ln):
@@ -1087,11 +1187,11 @@ def register_local_cuberite():
 async def run_proxy():
     await init_db()
     server = await asyncio.start_server(handle_player, "0.0.0.0", MC_PORT)
-    print(f"[PROXY] Hub Yönlendirici {MC_PORT} portunda hazir...")
+    log_msg(f"[PROXY] Hub Yönlendirici {MC_PORT} portunda hazir...")
     async with server: await server.serve_forever()
 
 def main():
-    print(f"""
+    log_msg(f"""
 +--------------------------------------------------+
 |  Minecraft Bungee Network & Anti-Dupe Engine     |
 |  Mod: {MODE:<43}|
