@@ -2,7 +2,8 @@
 """
 ⛏️  Minecraft Ultimate Bungee Network & Anti-Dupe Engine
 ═══════════════════════════════════════════════════════════
-  • FIX: 'eMonsterType expected' Hatasi giderildi (StringToMobType eklendi)
+  • FIX: Kurt (/kurt) sistemi icin 'GetWolfType' Tarayicisi eklendi (Hatasiz Obj Modu)
+  • FIX: 'nil' ve 'eMonsterType expected' type-casting hatalari kokunden cözüldü
   • WEB: Canli Konsol (Terminal) aktif.
   • GUI: Saf Sohbet UI & Hub Menüsü devrede.
 """
@@ -201,9 +202,39 @@ local function Split(str, sep)
     return res
 end
 
+-- ================= KURT TİPİ TARAYICISI (HATASIZ OBJ MODU) =================
+local function GetWolfType()
+    local wt = nil
+    -- Deneme 1: StringToMobType (Büyük Harf ile - En saglam yontem)
+    if cMonster and cMonster.StringToMobType then
+        pcall(function() wt = cMonster:StringToMobType("Wolf") end)
+        if wt and wt ~= -1 then return wt end
+        
+        -- Statik fonksiyon cagirimi (Nadir Cuberite surumleri icin)
+        pcall(function() wt = cMonster.StringToMobType("Wolf") end)
+        if wt and wt ~= -1 then return wt end
+    end
+    
+    -- Deneme 2: Standart cMonster Objesi
+    if cMonster and cMonster.mtWolf then return cMonster.mtWolf end
+    
+    -- Deneme 3: Global Obje (Çok eski sürümler)
+    if mtWolf then return mtWolf end
+    
+    -- Deneme 4: Minecraft ID'si (Zorunlu son care)
+    return 95 
+end
+
+local function IsWolf(Entity)
+    if not Entity or not Entity:IsMob() then return false end
+    local t = Entity:GetMobType()
+    local wt = GetWolfType()
+    return (t == wt) or (t == 95)
+end
+
 function Initialize(Plugin)
     Plugin:SetName("yaver")
-    Plugin:SetVersion(7)
+    Plugin:SetVersion(8)
     
     Ini = cIniFile()
     Ini:ReadFile("YaverData.ini")
@@ -217,7 +248,7 @@ function Initialize(Plugin)
     cPluginManager:BindCommand("/kurt", "", HandleKurtCommand, "Koruyucu kurdunu yanina cagirir.")
     
     cRoot:Get():GetDefaultWorld():ScheduleTask(20 * 3, PeriodicWolfTask)
-    LOG("[YAVER] Zirhli Koruyucu Kurt sistemi aktif (eMonsterType Fix)!")
+    LOG("[YAVER] Zirhli Koruyucu Kurt sistemi aktif (GetWolfType devrede)!")
     return true
 end
 
@@ -295,13 +326,12 @@ function SpawnWolfForPlayer(Player)
     
     local WolfID = cEntity.INVALID_ID
     local isSuccess, err = pcall(function()
-        -- Cuberite'in kati eMonsterType kuralina uyum saglamak icin string cevirici kullaniyoruz.
-        local WolfType = cMonster:StringToMobType("wolf")
+        local WolfType = GetWolfType()
         WolfID = World:SpawnMob(Player:GetPosX(), Player:GetPosY() + 1.0, Player:GetPosZ(), WolfType)
     end)
     
     if not isSuccess then
-        error("SpawnMob C++ tarafindan reddedildi: " .. tostring(err))
+        error("SpawnMob C++ tarafindan reddedildi. Cuberite surumunuz 'Wolf' objesini tanimiyor. Hata: " .. tostring(err))
     end
     
     if WolfID ~= cEntity.INVALID_ID then
@@ -327,7 +357,7 @@ function SpawnWolfForPlayer(Player)
             end)
         end)
     else
-        error("SpawnMob calisti ama INVALID_ID dondurdu. (Oyun motoru kurt uretemiyor)")
+        error("SpawnMob calisti ama INVALID_ID dondurdu. Oyun motoru kurt uretemiyor.")
     end
 end
 
@@ -375,7 +405,7 @@ end
 -- ================= Etkilesim =================
 function OnRightClickingEntity(Player, Entity)
     local isSuccess, err = pcall(function()
-        if Entity:IsMob() and (Entity:GetMobType() == 95 or Entity:GetMobType() == cMonster:StringToMobType("wolf")) then
+        if IsWolf(Entity) then
             local UUID = Player:GetUUID()
             if ActiveWolves[UUID] == Entity:GetUniqueID() then
                 if Player:IsCrouched() then
@@ -409,7 +439,7 @@ function OnTakeDamage(Receiver, TCA)
     pcall(function()
         local Attacker = TCA.Attacker
         if not Attacker then return end
-        if Attacker:IsMob() and (Attacker:GetMobType() == 95 or Attacker:GetMobType() == cMonster:StringToMobType("wolf")) then
+        if IsWolf(Attacker) then
             for uuid, wid in pairs(ActiveWolves) do
                 if wid == Attacker:GetUniqueID() then
                     local lvl = GetWolfLevel(uuid)
@@ -436,7 +466,7 @@ end
 function OnKilled(Victim, TCA, CustomDeathMessage)
     pcall(function()
         local Attacker = TCA.Attacker
-        if Victim:IsMob() and (Victim:GetMobType() == 95 or Victim:GetMobType() == cMonster:StringToMobType("wolf")) then
+        if IsWolf(Victim) then
             for uuid, wid in pairs(ActiveWolves) do
                 if wid == Victim:GetUniqueID() then
                     ActiveWolves[uuid] = nil
@@ -491,7 +521,7 @@ def write_configs(server_dir=SERVER_DIR):
         f"{server_dir}/Plugins/WCSync/main.lua": WCSYNC_MAIN.strip(),
         f"{server_dir}/Plugins/WCHub/Info.lua": 'g_PluginInfo = {Name="WCHub", Version="5"}',
         f"{server_dir}/Plugins/WCHub/main.lua": _make_wchub_lua(HTTP_PORT).strip(),
-        f"{server_dir}/Plugins/yaver/Info.lua": 'g_PluginInfo = {Name="yaver", Version="7"}',
+        f"{server_dir}/Plugins/yaver/Info.lua": 'g_PluginInfo = {Name="yaver", Version="8"}',
         f"{server_dir}/Plugins/yaver/main.lua": YAVER_MAIN.strip(),
     }
     for path, content in files.items():
@@ -650,7 +680,7 @@ class PlayerConn:
                 
                 import aiosqlite
                 async with aiosqlite.connect(DB_FILE) as db:
-                    await db.execute("UPDATE SET last_server=? WHERE username=?", (target_label, self.username))
+                    await db.execute("UPDATE players SET last_server=? WHERE username=?", (target_label, self.username))
                     await db.commit()
                 break
             
