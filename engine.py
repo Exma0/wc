@@ -4,25 +4,23 @@
 ═══════════════════════════════════════════════════════════
   • Tam BungeeCord Mimarisi (Hot-Swap / Kesintisiz Gecis)
   • Otomatik Olceklendirme (Auto-Scaling): GM1, GM2, GM3...
-  • MySQL Veritabani: Envanter, Konum, Can ve Sunucu Durumu
+  • SQLite Zero-Config Veritabani (Sifre yok, panel yok, tam otomatik!)
   • Teleport Yuzugu (GUI) & Global Chat
 """
 
 import asyncio, json, os, pathlib, struct, sys
 import threading, zlib, time, http.server, urllib.request, urllib.parse
 import subprocess, glob, uuid as _uuid_mod
-from collections import deque
-import datetime
+import sqlite3
 
 try:
-    import aiomysql
-    import pymysql
+    import aiosqlite
 except ImportError:
-    print("[SISTEM] 'aiomysql' veya 'pymysql' bulunamadi! 'pip install aiomysql pymysql' komutunu calistirin.")
+    print("[SISTEM] 'aiosqlite' bulunamadi! 'pip install aiosqlite' komutunu calistirin.")
     sys.exit(1)
 
 # ══════════════════════════════════════════════════════════
-#  SİSTEM DEĞİŞKENLERİ VE VERİTABANI BAĞLANTISI
+#  SİSTEM DEĞİŞKENLERİ VE OTOMATİK VERİTABANI
 # ══════════════════════════════════════════════════════════
 
 MODE          = os.environ.get("ENGINE_MODE", "gameserver")
@@ -37,48 +35,41 @@ DATA_DIR      = os.environ.get("DATA_DIR", "/data")
 SERVER_DIR    = os.environ.get("SERVER_DIR", "/server")
 BORE_FILE     = "/tmp/bore_address.txt"
 
-DB_HOST = os.environ.get("DB_HOST", "localhost")
-DB_USER = os.environ.get("DB_USER", "root")
-DB_PASS = os.environ.get("DB_PASS", "")
-DB_NAME = os.environ.get("DB_NAME", "minecraft_db")
+# Tamamen Otomatik DB Dosyasi
+DB_FILE       = f"{DATA_DIR}/hub.db"
 
-db_pool = None
 _current_bore_addr = None
 _active_players = []
 
 async def init_db():
-    global db_pool
+    pathlib.Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
     try:
-        db_pool = await aiomysql.create_pool(
-            host=DB_HOST, port=3306, user=DB_USER, password=DB_PASS,
-            db=DB_NAME, autocommit=True, minsize=1, maxsize=15
-        )
-        async with db_pool.acquire() as conn:
-            async with conn.cursor() as cur:
-                await cur.execute("""
-                    CREATE TABLE IF NOT EXISTS servers (
-                        label VARCHAR(20) PRIMARY KEY,
-                        host VARCHAR(100),
-                        port INT,
-                        players INT DEFAULT 0,
-                        last_seen INT
-                    )
-                """)
-                await cur.execute("""
-                    CREATE TABLE IF NOT EXISTS players (
-                        username VARCHAR(50) PRIMARY KEY,
-                        uuid VARCHAR(50),
-                        last_server VARCHAR(20),
-                        inventory TEXT,
-                        pos_x FLOAT DEFAULT 0,
-                        pos_y FLOAT DEFAULT 5,
-                        pos_z FLOAT DEFAULT 0,
-                        health FLOAT DEFAULT 20
-                    )
-                """)
-        print("[DB] MySQL Baglantisi Basarili ve Tablolar Hazir.")
+        async with aiosqlite.connect(DB_FILE) as db:
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS servers (
+                    label TEXT PRIMARY KEY,
+                    host TEXT,
+                    port INTEGER,
+                    players INTEGER DEFAULT 0,
+                    last_seen INTEGER
+                )
+            """)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS players (
+                    username TEXT PRIMARY KEY,
+                    uuid TEXT,
+                    last_server TEXT,
+                    inventory TEXT,
+                    pos_x REAL DEFAULT 0,
+                    pos_y REAL DEFAULT 5,
+                    pos_z REAL DEFAULT 0,
+                    health REAL DEFAULT 20
+                )
+            """)
+            await db.commit()
+        print(f"[DB] SQLite Veritabani Otomatik Olarak Hazirlandi: {DB_FILE}")
     except Exception as e:
-        print(f"[DB] KRITIK HATA: MySQL Baglantisi Kurulamadi -> {e}")
+        print(f"[DB] KRITIK HATA: Veritabani Olusturulamadi -> {e}")
 
 # ══════════════════════════════════════════════════════════
 #  CUBERITE AYARLARI VE LUA EKLENTİSİ (TELEPORT YÜZÜĞÜ)
@@ -113,12 +104,10 @@ Y=5
 Z=0
 """
 
-# LUA Eklentisi: Yuzuk verme, GUI acma, Sunucu Listesi Cekme, Konum Kaydetme
 PLUGIN_MAIN = """
 local ProxyURL = "http://127.0.0.1:8080"
 if os.getenv("PROXY_URL") then ProxyURL = os.getenv("PROXY_URL") end
 
--- Basit Split fonksiyonu (Cuberite'da JSON olmadigi icin ozel format kullaniyoruz)
 local function Split(str, sep)
     local res = {}
     for w in string.gmatch(str, "([^"..sep.."]+)") do table.insert(res, w) end
@@ -184,7 +173,6 @@ end
 function OnRightClick(Player, BlockX, BlockY, BlockZ, BlockFace, CursorX, CursorY, CursorZ)
     local EquippedItem = Player:GetEquippedItem()
     if EquippedItem.m_ItemType == E_ITEM_COMPASS then
-        -- HTTP uzerinden anlik sunucu verisini cekiyoruz. Format: GM1:10;GM2:5;GM3:0
         cNetwork:Get(ProxyURL .. "/api/servers", function(Body, Data)
             if Body and Body ~= "" then
                 Player:SendMessageInfo("Aktif Sunucular Listeleniyor...")
@@ -194,7 +182,6 @@ function OnRightClick(Player, BlockX, BlockY, BlockZ, BlockFace, CursorX, Cursor
                     if #parts == 2 then
                         local label = parts[1]
                         local count = parts[2]
-                        -- Tıklanabilir Text (Cuberite GUI hatalarina karsi en guvenli yontem)
                         Player:SendMessage(cCompositeChat():AddTextPart("§8[§b" .. label .. "§8] §7- Aktif: §e" .. count .. " oyuncu ")
                             :AddRunCommandPart("§a[BAGLAN]", "/wc_transfer " .. label))
                     end
@@ -299,30 +286,29 @@ class PlayerConn:
         self.play_state = False
 
     async def get_target_server(self, requested_label=None):
-        async with db_pool.acquire() as conn:
-            async with conn.cursor(aiomysql.DictCursor) as cur:
-                if requested_label:
-                    await cur.execute("SELECT * FROM servers WHERE label=%s", (requested_label,))
+        async with aiosqlite.connect(DB_FILE) as db:
+            db.row_factory = aiosqlite.Row
+            if requested_label:
+                async with db.execute("SELECT * FROM servers WHERE label=?", (requested_label,)) as cur:
                     return await cur.fetchone()
-                
-                # Load Balancing: Onceki sunucu
-                await cur.execute("SELECT last_server FROM players WHERE username=%s", (self.username,))
+            
+            # Load Balancing: Onceki sunucu
+            async with db.execute("SELECT last_server FROM players WHERE username=?", (self.username,)) as cur:
                 p_row = await cur.fetchone()
                 if p_row and p_row['last_server']:
-                    await cur.execute("SELECT * FROM servers WHERE label=%s", (p_row['last_server'],))
-                    s_row = await cur.fetchone()
-                    if s_row and (int(time.time()) - s_row['last_seen']) < 60:
-                        return s_row
-                
-                # En az oyuncuya sahip aktif sunucu
-                await cur.execute("SELECT * FROM servers WHERE players < 100 AND (UNIX_TIMESTAMP() - last_seen) < 60 ORDER BY players ASC LIMIT 1")
+                    async with db.execute("SELECT * FROM servers WHERE label=?", (p_row['last_server'],)) as scur:
+                        s_row = await scur.fetchone()
+                        if s_row and (int(time.time()) - s_row['last_seen']) < 60:
+                            return s_row
+            
+            # En az oyuncuya sahip aktif sunucu
+            async with db.execute("SELECT * FROM servers WHERE players < 100 AND (CAST(strftime('%s', 'now') AS INTEGER) - last_seen) < 60 ORDER BY players ASC LIMIT 1") as cur:
                 return await cur.fetchone()
 
     async def connect_backend(self, host, port):
         if self.server_w: self.server_w.close()
         self.server_r, self.server_w = await asyncio.open_connection(host, port, limit=2**20)
 
-    # Bungee Tipi Sunucu Degisimi (Dimension Switch Trick)
     async def hot_swap(self, target_label):
         if self.current_label == target_label: return
         srv = await self.get_target_server(target_label)
@@ -335,25 +321,21 @@ class PlayerConn:
         self.play_state = False
         await self.connect_backend(srv['host'], srv['port'])
         
-        # Sahte Handshake ve Login gonderimi (Proxy icinden sunucuya baglanma)
         hs = vi_enc(47) + mc_str_enc(srv['host']) + struct.pack(">H", srv['port']) + vi_enc(2)
         self.server_w.write(pkt_make(0x00, hs, -1))
         self.server_w.write(pkt_make(0x00, mc_str_enc(self.username), -1))
         await self.server_w.drain()
         
-        # Sunucudan yaniti bekle ve istemciyi kandir
         while True:
             pid, payload, raw = await pkt_read(self.server_r, self.comp)
-            if pid == 0x01: # Join Game paketi yakalandi
+            if pid == 0x01:
                 dim = payload[4]
-                # Minecraft istemcisini yenilemek icin "Boyut Degistirme" (Respawn) paketleri atiyoruz
                 respawn_fake = struct.pack(">i", -1 if dim == 0 else 0) + payload[5:8] + mc_str_enc("default")
                 respawn_real = struct.pack(">i", dim) + payload[5:8] + mc_str_enc("default")
                 
                 self.client_w.write(pkt_make(0x07, respawn_fake, self.comp))
                 self.client_w.write(pkt_make(0x07, respawn_real, self.comp))
                 
-                # Konum paketi yollayarak oyun ekranini tazelet
                 pos = struct.pack(">dddff", 0.0, 5.0, 0.0, 0.0, 0.0) + bytes([0])
                 self.client_w.write(pkt_make(0x08, pos, self.comp))
                 await self.client_w.drain()
@@ -361,10 +343,9 @@ class PlayerConn:
                 self.current_label = target_label
                 self.play_state = True
                 
-                # Veritabaninda oyuncunun bulundugu sunucuyu guncelle
-                async with db_pool.acquire() as conn:
-                    async with conn.cursor() as cur:
-                        await cur.execute("UPDATE players SET last_server=%s WHERE username=%s", (target_label, self.username))
+                async with aiosqlite.connect(DB_FILE) as db:
+                    await db.execute("UPDATE players SET last_server=? WHERE username=?", (target_label, self.username))
+                    await db.commit()
                 break
             
     async def pipe_c2s(self):
@@ -372,7 +353,6 @@ class PlayerConn:
             while True:
                 pid, payload, raw = await pkt_read(self.client_r, self.comp)
                 
-                # CHAT VE KOMUT KONTROLÜ (Global Chat ve Yuzuk Tıklaması)
                 if pid == 0x01 and self.play_state: 
                     msg, _ = mc_str_dec(payload)
                     if msg.startswith("/wc_transfer "):
@@ -380,14 +360,13 @@ class PlayerConn:
                         asyncio.ensure_future(self.hot_swap(target))
                         continue
                     elif not msg.startswith("/"):
-                        # Global Chat Broadcast (Tum sunuculardaki oyunculara gider)
                         formatted = json.dumps({"text": f"§8[§b{self.current_label}§8] §7{self.username}§f: {msg}"})
                         b_pkt = pkt_make(0x02, mc_str_enc(formatted) + bytes([0]), self.comp)
                         for c in list(_active_players):
                             if c.play_state:
                                 try: c.client_w.write(b_pkt)
                                 except: pass
-                        continue # Orjinal paketi sunucuya yollama (Boylece chat cift gozukmez)
+                        continue 
 
                 if self.server_w:
                     self.server_w.write(raw)
@@ -412,7 +391,6 @@ class PlayerConn:
             pid, payload, raw = await pkt_read(self.client_r, -1)
             p=0; _,p=vi_dec(payload,p); _,p=mc_str_dec(payload,p); p+=2; next_state,_=vi_dec(payload,p)
             
-            # Sunucu Durum Ekrani (Ping)
             if next_state == 1:
                 status_json = json.dumps({
                     "version": {"name": "1.8.x", "protocol": 47},
@@ -442,9 +420,9 @@ class PlayerConn:
                 self.play_state = True
                 print(f"[PROXY] {self.username} -> {self.current_label} sunucusuna girdi.")
                 
-                async with db_pool.acquire() as conn:
-                    async with conn.cursor() as cur:
-                        await cur.execute("INSERT IGNORE INTO players (username, last_server) VALUES (%s, %s)", (self.username, self.current_label))
+                async with aiosqlite.connect(DB_FILE) as db:
+                    await db.execute("INSERT OR IGNORE INTO players (username, last_server) VALUES (?, ?)", (self.username, self.current_label))
+                    await db.commit()
 
                 await asyncio.gather(self.pipe_s2c(), self.pipe_c2s())
         except Exception as e: pass
@@ -459,21 +437,20 @@ async def handle_player(cr, cw):
     await PlayerConn(cr, cw).run()
 
 # ══════════════════════════════════════════════════════════
-#  HTTP API: SUNUCU KAYDI (AUTO-SCALING) VE DURUM SENKRONU
+#  HTTP API: SUNUCU KAYDI VE DURUM SENKRONU
 # ══════════════════════════════════════════════════════════
 
 class HttpHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
-        # Lua tarafindan yuzuge tiklandiginda cagrilir: "GM1:15;GM2:4" seklinde ozel string doner
         if self.path == "/api/servers":
             try:
-                conn = pymysql.connect(host=DB_HOST, user=DB_USER, password=DB_PASS, db=DB_NAME, autocommit=True)
-                cur = conn.cursor(pymysql.cursors.DictCursor)
-                cur.execute("SELECT label, players FROM servers WHERE (UNIX_TIMESTAMP() - last_seen) < 60")
+                conn = sqlite3.connect(DB_FILE)
+                conn.row_factory = sqlite3.Row
+                cur = conn.cursor()
+                cur.execute("SELECT label, players FROM servers WHERE (CAST(strftime('%s', 'now') AS INTEGER) - last_seen) < 60")
                 rows = cur.fetchall()
                 conn.close()
                 
-                # "GM1:10;GM2:5;" formatına çevirme (Lua parse etsin diye JSON'dan kaçınıldı)
                 resp = ";".join([f"{r['label']}:{r['players']}" for r in rows])
                 
                 self.send_response(200)
@@ -488,15 +465,14 @@ class HttpHandler(http.server.BaseHTTPRequestHandler):
         if length == 0: self.send_response(400); self.end_headers(); return
         data = self.rfile.read(length).decode('utf-8')
 
-        # Oyuncu verisini Cuberite'tan kaydet
         if self.path.startswith("/api/player?name="):
             name = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get('name', [''])[0]
             try:
                 p_data = json.loads(data)
-                conn = pymysql.connect(host=DB_HOST, user=DB_USER, password=DB_PASS, db=DB_NAME, autocommit=True)
-                cur = conn.cursor()
-                cur.execute("UPDATE players SET pos_x=%s, pos_y=%s, pos_z=%s, health=%s WHERE username=%s",
+                conn = sqlite3.connect(DB_FILE)
+                conn.execute("UPDATE players SET pos_x=?, pos_y=?, pos_z=?, health=? WHERE username=?",
                             (p_data.get('x',0), p_data.get('y',5), p_data.get('z',0), p_data.get('hp',20), name))
+                conn.commit()
                 conn.close()
                 self.send_response(200)
                 self.end_headers()
@@ -504,29 +480,29 @@ class HttpHandler(http.server.BaseHTTPRequestHandler):
                 self.send_response(500)
                 self.end_headers()
 
-        # Dinamik Sunucu Kaydi (Auto-Naming: GM1, GM2)
         elif self.path == "/api/register":
             try:
                 s_data = json.loads(data)
                 host, port = s_data['host'], s_data['port']
                 
-                conn = pymysql.connect(host=DB_HOST, user=DB_USER, password=DB_PASS, db=DB_NAME, autocommit=True)
+                conn = sqlite3.connect(DB_FILE)
                 cur = conn.cursor()
                 
-                # Ayni Host/Port daha once kayitli mi?
-                cur.execute("SELECT label FROM servers WHERE host=%s AND port=%s", (host, port))
+                cur.execute("SELECT label FROM servers WHERE host=? AND port=?", (host, port))
                 row = cur.fetchone()
                 
                 if row:
                     label = row[0]
-                    cur.execute("UPDATE servers SET last_seen=UNIX_TIMESTAMP() WHERE label=%s", (label,))
+                    conn.execute("UPDATE servers SET last_seen=CAST(strftime('%s', 'now') AS INTEGER) WHERE label=?", (label,))
                 else:
                     cur.execute("SELECT COUNT(*) FROM servers")
                     count = cur.fetchone()[0]
                     label = f"GM{count+1}"
-                    cur.execute("INSERT INTO servers (label, host, port, last_seen) VALUES (%s, %s, %s, UNIX_TIMESTAMP())", (label, host, port))
+                    conn.execute("INSERT INTO servers (label, host, port, last_seen) VALUES (?, ?, ?, CAST(strftime('%s', 'now') AS INTEGER))", (label, host, port))
                 
+                conn.commit()
                 conn.close()
+                
                 self.send_response(200)
                 self.end_headers()
                 self.wfile.write(json.dumps({"label": label}).encode())
@@ -570,7 +546,7 @@ def run_bore(port=MC_PORT):
         time.sleep(10)
 
 def _register_with_proxy(bore_addr):
-    proxy_url = os.environ.get("PROXY_URL", "http://127.0.0.1:8080")
+    proxy_url = os.environ.get("PROXY_URL", f"http://127.0.0.1:{HTTP_PORT}")
     host, port_str = bore_addr.split(":")
     body = json.dumps({"host": host, "port": int(port_str)}).encode()
     try:
@@ -578,8 +554,8 @@ def _register_with_proxy(bore_addr):
         resp = urllib.request.urlopen(req, timeout=5)
         label = json.loads(resp.read().decode())['label']
         print(f"[REG] Basariyla kayit olundu! Bu sunucunun adi: {label}")
-    except:
-        print("[REG] HATA: Proxy'e kayit olunamadi.")
+    except Exception as e:
+        print(f"[REG] HATA: Proxy'e kayit olunamadi. -> {e}")
 
 def run_cuberite():
     write_configs()
@@ -595,7 +571,7 @@ def run_cuberite():
 async def run_proxy():
     await init_db()
     server = await asyncio.start_server(handle_player, "0.0.0.0", MC_PORT)
-    print(f"[PROXY] Hub Mimarisi {MC_PORT} portunda dinliyor...")
+    print(f"[PROXY] SQLite Hub Mimarisi {MC_PORT} portunda dinliyor...")
     async with server:
         await server.serve_forever()
 
@@ -604,14 +580,14 @@ def main():
 +--------------------------------------------------+
 |  Minecraft BungeeCord Hub Engine                 |
 |  Mod: {MODE:<43}|
-|  DB : {DB_HOST:<43}|
+|  DB : SQLite (Tam Otomatik Zero-Config)          |
 +--------------------------------------------------+""")
 
     if MODE == "proxy":
         threading.Thread(target=run_http, daemon=True).start()
         asyncio.run(run_proxy())
     elif MODE == "gameserver":
-        threading.Thread(target=run_bore, args=(MC_PORT,), daemon=True).start()
+        threading.Thread(target=run_bore, args=(CUBERITE_PORT,), daemon=True).start()
         run_cuberite()
     elif MODE == "all":
         threading.Thread(target=run_http, daemon=True).start()
