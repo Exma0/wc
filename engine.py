@@ -2,8 +2,8 @@
 """
 ⛏️  Minecraft Ultimate Bungee Network & Anti-Dupe Engine
 ═══════════════════════════════════════════════════════════
-  • GUI UPDATE: Gercek Sandik Menusu (Chest GUI) eklendi!
-  • FIX: Pusulayi havaya tiklama, yere atamama ve olunce gitmeme eklendi.
+  • FIX: Dinamik Isimlendirme Kusursuzlastirildi (Sadece GM1, GM2...)
+  • FIX: Alt Sunucu GUI Relay eklendi (Pusula artik aninda aciliyor)
   • WCSync: Merkezi Envanter Senkronizasyonu
   • WCHub: GUI ile Sunucular Arasi Kesintisiz Gecis
 """
@@ -35,7 +35,7 @@ _active_players  = []
 _DB_LOCK         = threading.Lock()
 
 # ══════════════════════════════════════════════════════════
-#  VERİTABANI İŞLEMLERİ (Otomatik Hızlı Temizlik)
+#  VERİTABANI İŞLEMLERİ (Otomatik Hızlı Temizlik ve Benzersiz ID)
 # ══════════════════════════════════════════════════════════
 
 async def init_db():
@@ -49,12 +49,16 @@ async def init_db():
                     players INTEGER DEFAULT 0, last_seen INTEGER
                 )
             """)
+            try:
+                # Tabloya sunuculari sonsuza dek tanimak icin server_id ekle
+                await db.execute("ALTER TABLE servers ADD COLUMN server_id TEXT")
+            except: pass
+            
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS players (
                     username TEXT PRIMARY KEY, last_server TEXT
                 )
             """)
-            # Hayalet sunuculari daha hizli temizle (45 saniye)
             await db.execute("DELETE FROM servers WHERE (? - last_seen) > 45", (int(time.time()),))
             await db.commit()
         print(f"[DB] SQLite Merkez Veritabani Hazir.")
@@ -122,10 +126,8 @@ function HandleConsoleReload(Split)
 end
 """
 
-# GUI VE PUSULA MEKANİKLERİ BURADA YENİDEN YAZILDI
 WCHUB_MAIN = """
 local ProxyURL = "http://127.0.0.1:8080"
-if os.getenv("PROXY_URL") then ProxyURL = os.getenv("PROXY_URL") end
 
 local function Split(str, sep)
     local res = {}
@@ -135,7 +137,7 @@ end
 
 function Initialize(Plugin)
     Plugin:SetName("WCHub")
-    Plugin:SetVersion(4)
+    Plugin:SetVersion(5)
     cPluginManager:AddHook(cPluginManager.HOOK_PLAYER_JOINED, GiveRing)
     cPluginManager:AddHook(cPluginManager.HOOK_PLAYER_SPAWNED, GiveRing)
     cPluginManager:AddHook(cPluginManager.HOOK_PLAYER_RIGHT_CLICK, OnRightClick)
@@ -162,7 +164,7 @@ end
 function OnPlayerTossItem(Player, NumTicks, Item)
     if Item.m_ItemType == E_ITEM_COMPASS then
         Player:SendMessageWarning("§cPusulayi yere atamazsin!")
-        return true -- Yere atmayi engeller
+        return true
     end
     return false
 end
@@ -172,18 +174,18 @@ function OnKilled(Victim, TCA, CustomDeathMessage)
         local inv = Victim:GetInventory()
         for i=0, 35 do
             if inv:GetSlot(i).m_ItemType == E_ITEM_COMPASS then
-                inv:SetSlot(i, cItem(E_ITEM_EMPTY, 0)) -- Olunce pusulayi sil ki yere dusmesin
+                inv:SetSlot(i, cItem(E_ITEM_EMPTY, 0))
             end
         end
     end
     return false
 end
 
-function OnRightClick(Player, BlockX, BlockY, BlockZ, BlockFace, CursorX, CursorY, CursorZ)
+function OnRightClick(Player, ...)
     local item = Player:GetEquippedItem()
     if item.m_ItemType == E_ITEM_COMPASS then
         OpenGUI(Player)
-        return true -- Blok yerlestirmeyi veya diger aksiyonlari iptal et
+        return true
     end
     return false
 end
@@ -191,14 +193,12 @@ end
 function OpenGUI(Player)
     cNetwork:Get(ProxyURL .. "/api/servers", function(Body, Data)
         if Body and Body ~= "" then
-            -- 3 Satirli Sandik Menusu Olustur (GUI)
             local Window = cLuaWindow(cWindow.wtChest, 3, "§8Sunucu Agi")
             local servers = Split(Body, ";")
             
             for i, srv in ipairs(servers) do
                 local parts = Split(srv, ":")
                 if #parts == 2 then
-                    -- Yesil cam pane (Item ID: 160, Damage: 5)
                     local item = cItem(E_ITEM_STAINED_GLASS_PANE, 1, 5)
                     item.m_CustomName = "§a" .. parts[1]
                     item.m_Lore = "§7Aktif Oyuncu: §e" .. parts[2] .. "|§8Tikla ve baglan!"
@@ -206,7 +206,6 @@ function OpenGUI(Player)
                 end
             end
             
-            -- Menude Tiklama Olayi (GUI Click)
             Window:SetOnClicked(function(a_Window, a_Player, a_SlotNum, a_ClickAction, a_ClickedItem)
                 if a_SlotNum >= 0 and a_SlotNum < 27 then
                     if a_ClickedItem.m_ItemType ~= E_ITEM_EMPTY then
@@ -215,14 +214,14 @@ function OpenGUI(Player)
                         a_Player:ExecuteCommand("/wc_transfer " .. target)
                         a_Window:Close(a_Player)
                     end
-                    return true -- Esyayi envantere almayi engeller!
+                    return true
                 end
                 return false
             end)
             
             Player:OpenWindow(Window)
         else
-            Player:SendMessageFailure("§cSunuculara ulasilamadi.")
+            Player:SendMessageFailure("§cSunuculara ulasilamadi. Proxy baglantisi yok.")
         end
     end)
 end
@@ -233,7 +232,7 @@ def write_configs(server_dir=SERVER_DIR):
         f"{server_dir}/settings.ini": SETTINGS_INI.strip(),
         f"{server_dir}/Plugins/WCSync/Info.lua": 'g_PluginInfo = {Name="WCSync", Version="2"}',
         f"{server_dir}/Plugins/WCSync/main.lua": WCSYNC_MAIN.strip(),
-        f"{server_dir}/Plugins/WCHub/Info.lua": 'g_PluginInfo = {Name="WCHub", Version="4"}',
+        f"{server_dir}/Plugins/WCHub/Info.lua": 'g_PluginInfo = {Name="WCHub", Version="5"}',
         f"{server_dir}/Plugins/WCHub/main.lua": WCHUB_MAIN.strip(),
     }
     for path, content in files.items():
@@ -504,7 +503,7 @@ class HttpHandler(http.server.BaseHTTPRequestHandler):
                 conn = sqlite3.connect(DB_FILE)
                 conn.row_factory = sqlite3.Row
                 cur = conn.cursor()
-                cur.execute("SELECT label, players FROM servers WHERE (? - last_seen) < 45", (int(time.time()),))
+                cur.execute("SELECT label, players FROM servers WHERE (? - last_seen) < 45 ORDER BY label ASC", (int(time.time()),))
                 servers = [{"sunucu": r["label"], "oyuncu_sayisi": r["players"]} for r in cur.fetchall()]
                 conn.close()
             except:
@@ -531,6 +530,19 @@ class HttpHandler(http.server.BaseHTTPRequestHandler):
             return
 
         if self.path == "/api/servers":
+            # BUG FIX: Alt Sunucular icin Relay (Kopru) Yonlendirmesi!
+            if MODE == "gameserver":
+                proxy_url = os.environ.get("PROXY_URL", "")
+                if proxy_url:
+                    try:
+                        req = urllib.request.Request(f"{proxy_url}/api/servers")
+                        resp = urllib.request.urlopen(req, timeout=5).read()
+                        self.send_response(200); self.end_headers(); self.wfile.write(resp)
+                    except Exception as e:
+                        print(f"[RELAY] GUI Liste Hatasi: {e}")
+                        self.send_response(500); self.end_headers()
+                return
+
             try:
                 conn = sqlite3.connect(DB_FILE); conn.row_factory = sqlite3.Row; cur = conn.cursor()
                 cur.execute("SELECT label, players FROM servers WHERE (? - last_seen) < 45 ORDER BY label ASC", (int(time.time()),))
@@ -555,34 +567,36 @@ class HttpHandler(http.server.BaseHTTPRequestHandler):
             try:
                 s_data = json.loads(self.rfile.read(length))
                 host, port = s_data['host'], s_data['port']
-                req_label = s_data.get('label')
+                server_id = s_data.get('server_id')
                 now = int(time.time())
                 
                 with _DB_LOCK: 
                     conn = sqlite3.connect(DB_FILE)
                     cur = conn.cursor()
-                    if req_label:
-                        cur.execute("SELECT label FROM servers WHERE label=?", (req_label,))
-                        if cur.fetchone():
-                            conn.execute("UPDATE servers SET host=?, port=?, last_seen=? WHERE label=?", (host, port, now, req_label))
-                            label = req_label
-                        else:
-                            conn.execute("INSERT INTO servers (label, host, port, last_seen) VALUES (?, ?, ?, ?)", (req_label, host, port, now))
-                            label = req_label
-                    else:
-                        cur.execute("SELECT label FROM servers WHERE host=? AND port=?", (host, port))
+                    
+                    if server_id:
+                        cur.execute("SELECT label FROM servers WHERE server_id=?", (server_id,))
                         row = cur.fetchone()
                         if row:
                             label = row[0]
-                            conn.execute("UPDATE servers SET last_seen=? WHERE label=?", (now, label))
+                            conn.execute("UPDATE servers SET host=?, port=?, last_seen=? WHERE label=?", (host, port, now, label))
                         else:
                             cur.execute("SELECT COUNT(*) FROM servers")
                             label = f"GM{cur.fetchone()[0] + 1}"
-                            conn.execute("INSERT INTO servers (label, host, port, last_seen) VALUES (?, ?, ?, ?)", (label, host, port, now))
+                            # Eger PRAGMA ile server_id sutunu eklenmemisse hata vermemesi icin koruma:
+                            try:
+                                conn.execute("INSERT INTO servers (label, server_id, host, port, last_seen) VALUES (?, ?, ?, ?, ?)", (label, server_id, host, port, now))
+                            except:
+                                conn.execute("INSERT INTO servers (label, host, port, last_seen) VALUES (?, ?, ?, ?)", (label, host, port, now))
+                    else:
+                        cur.execute("SELECT COUNT(*) FROM servers")
+                        label = f"GM{cur.fetchone()[0] + 1}"
+                        conn.execute("INSERT INTO servers (label, host, port, last_seen) VALUES (?, ?, ?, ?)", (label, host, port, now))
+                        
                     conn.commit(); conn.close()
                 
                 self.send_response(200); self.end_headers(); self.wfile.write(json.dumps({"label": label}).encode())
-                print(f"[REG] Sunucu Islendi: {label} ({host}:{port})")
+                print(f"[REG] Sunucu Aktif: {label} ({host}:{port})")
             except Exception as e:
                 print(f"[REG] Kayit Hatasi: {e}"); self.send_response(500); self.end_headers()
 
@@ -594,8 +608,12 @@ class HttpHandler(http.server.BaseHTTPRequestHandler):
 
 def run_http():
     http.server.ThreadingHTTPServer.allow_reuse_address = True
-    srv = http.server.ThreadingHTTPServer(("0.0.0.0", HTTP_PORT), HttpHandler)
-    srv.serve_forever()
+    for _ in range(5):
+        try:
+            srv = http.server.ThreadingHTTPServer(("0.0.0.0", HTTP_PORT), HttpHandler)
+            srv.serve_forever()
+            break
+        except OSError: time.sleep(2)
 
 def run_bore_for_proxy():
     global _proxy_bore_addr
@@ -619,7 +637,14 @@ def run_bore_for_gameserver():
     proxy_url = os.environ.get("PROXY_URL", "")
     if not proxy_url: return
     current_gs_bore = None
-    label = os.environ.get("SERVER_LABEL", "AltSunucu")
+    
+    server_id_file = f"{DATA_DIR}/server_id.txt"
+    if os.path.exists(server_id_file):
+        server_id = open(server_id_file).read().strip()
+    else:
+        import uuid; server_id = str(uuid.uuid4())
+        pathlib.Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
+        open(server_id_file, "w").write(server_id)
     
     def heartbeat():
         while True:
@@ -627,7 +652,7 @@ def run_bore_for_gameserver():
             if current_gs_bore:
                 try:
                     host, port_str = current_gs_bore.split(":")
-                    payload = json.dumps({"host": host, "port": int(port_str), "label": label})
+                    payload = json.dumps({"host": host, "port": int(port_str), "server_id": server_id})
                     req = urllib.request.Request(f"{proxy_url}/api/register", data=payload.encode(), headers={"Content-Type": "application/json"})
                     urllib.request.urlopen(req, timeout=5)
                 except Exception: pass
@@ -709,7 +734,7 @@ def register_local_cuberite():
     while True:
         time.sleep(15)
         try:
-            payload = json.dumps({"host": "127.0.0.1", "port": CUBERITE_PORT, "label": "GM1"})
+            payload = json.dumps({"host": "127.0.0.1", "port": CUBERITE_PORT, "server_id": "LOCAL_HUB_01"})
             req = urllib.request.Request(f"http://127.0.0.1:{HTTP_PORT}/api/register", data=payload.encode(), headers={"Content-Type": "application/json"})
             urllib.request.urlopen(req, timeout=5)
         except Exception: pass
@@ -733,6 +758,7 @@ def main():
         asyncio.run(run_proxy())
         
     elif MODE == "gameserver":
+        threading.Thread(target=run_http, daemon=True).start() # GUI koprusu icin local HTTP!
         threading.Thread(target=run_bore_for_gameserver, daemon=True).start()
         run_cuberite()
         
