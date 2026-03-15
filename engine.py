@@ -2,8 +2,9 @@
 """
 ⛏️  Minecraft Ultimate Bungee Network & Anti-Dupe Engine
 ═══════════════════════════════════════════════════════════
-  • FIX: Pusula tamamen kaldirildi (Saf Sohbet UI)
-  • FIX: Oyuna giriste otomatik tiklanabilir liste gonderilir
+  • FIX: Saf Sohbet UI (Chat Menu) Aktif.
+  • YENİ: Yaver (Koruyucu Kurt) Sistemi eklendi! (Level, Çanta, Buff)
+  • YENİ: Hub Menüsü kurda entegre edildi (Shift + Sağ Tık ile açılır)
 """
 
 import asyncio, json, os, pathlib, struct, sys
@@ -31,10 +32,10 @@ DB_FILE       = f"{DATA_DIR}/hub.db"
 _proxy_bore_addr  = None
 _active_players   = []
 _DB_LOCK          = threading.Lock()
-_cuberite_proc    = None   # Yerel Cuberite süreci (restart için)
+_cuberite_proc    = None   
 
 # ══════════════════════════════════════════════════════════
-#  VERİTABANI İŞLEMLERİ (Otomatik Hızlı Temizlik ve Benzersiz ID)
+#  VERİTABANI İŞLEMLERİ
 # ══════════════════════════════════════════════════════════
 
 async def init_db():
@@ -49,11 +50,9 @@ async def init_db():
                     restart_pending INTEGER DEFAULT 0
                 )
             """)
-            try:
-                await db.execute("ALTER TABLE servers ADD COLUMN server_id TEXT")
+            try: await db.execute("ALTER TABLE servers ADD COLUMN server_id TEXT")
             except: pass
-            try:
-                await db.execute("ALTER TABLE servers ADD COLUMN restart_pending INTEGER DEFAULT 0")
+            try: await db.execute("ALTER TABLE servers ADD COLUMN restart_pending INTEGER DEFAULT 0")
             except: pass
             
             await db.execute("""
@@ -63,12 +62,10 @@ async def init_db():
             """)
             await db.execute("DELETE FROM servers WHERE (? - last_seen) > 45", (int(time.time()),))
             await db.commit()
-        print(f"[DB] SQLite Merkez Veritabani Hazir.")
-    except Exception as e:
-        print(f"[DB] HATA: Veritabani Olusturulamadi -> {e}")
+    except Exception as e: pass
 
 # ══════════════════════════════════════════════════════════
-#  LUA EKLENTİLERİ (WCSync, WCHub)
+#  LUA EKLENTİLERİ (WCSync, WCHub, Yaver)
 # ══════════════════════════════════════════════════════════
 
 SETTINGS_INI = f"""
@@ -101,22 +98,15 @@ function Initialize(Plugin)
     LOG("[SYNC] WCSync aktif! Anti-Dupe devrede.")
     return true
 end
-
 function PeriodicSave(World)
-    World:ForEachPlayer(function(Player)
-        Player:SaveToDisk()
-        LOG("WCSYNC_SAVE:" .. Player:GetName() .. ":" .. Player:GetUUID())
-    end)
+    World:ForEachPlayer(function(Player) Player:SaveToDisk() end)
     World:ScheduleTask(200, PeriodicSave)
 end
-
 function OnPlayerJoined(Player) LOG("WCSYNC_JOIN:" .. Player:GetName() .. ":" .. Player:GetUUID()) end
-
 function OnPlayerDestroyed(Player)
     Player:SaveToDisk()
     LOG("WCSYNC_QUIT:" .. Player:GetName() .. ":" .. Player:GetUUID())
 end
-
 function HandleConsoleReload(Split)
     if #Split > 1 then
         cRoot:Get():FindAndDoWithPlayer(Split[2], function(P)
@@ -131,31 +121,22 @@ end
 def _make_wchub_lua(port):
     return ("""
 local ProxyURL = "http://127.0.0.1:{PORT}" """.replace("{PORT}", str(port)) + """
-
 local function Split(str, sep)
     local res = {}
     for w in string.gmatch(str, "([^"..sep.."]+)") do table.insert(res, w) end
     return res
 end
-
 function Initialize(Plugin)
     Plugin:SetName("WCHub")
     Plugin:SetVersion(12)
-
     cPluginManager:AddHook(cPluginManager.HOOK_PLAYER_SPAWNED, OnPlayerSpawned)
     cPluginManager:AddHook(cPluginManager.HOOK_EXECUTE_COMMAND, OnCommand)
-
-    LOG("[HUB] WCHub Saf Sohbet Sistemi Aktif (Pusulalar kaldirildi)!")
+    LOG("[HUB] WCHub Saf Sohbet Sistemi Aktif!")
     return true
 end
-
 function OnPlayerSpawned(Player)
-    -- Oyuna giris yaptiginda 1 saniye (20 tick) sonra menuyu otomatik gonder
-    Player:GetWorld():ScheduleTask(20, function()
-        SendServerList(Player)
-    end)
+    Player:GetWorld():ScheduleTask(20, function() SendServerList(Player) end)
 end
-
 function OnCommand(Player, CommandSplit, EntireCommand)
     local cmd = string.lower(CommandSplit[1] or "")
     if cmd == "/hub" or cmd == "/sunucu" then
@@ -164,36 +145,23 @@ function OnCommand(Player, CommandSplit, EntireCommand)
     end
     return false
 end
-
 function SendServerList(Player)
     local PlayerName = Player:GetName()
     local World = Player:GetWorld()
-
-    if type(cUrlClient) == "nil" then
-        Player:SendMessageFailure("§cSunucu secici modulu sistemde eksik (API Hatasi).")
-        return
-    end
-
+    if type(cUrlClient) == "nil" then return end
     cUrlClient:Get(ProxyURL .. "/api/servers", {
-        OnSuccess = function(Body, DataCallbacks)
+        OnSuccess = function(Body)
             World:ScheduleTask(0, function()
                 local TargetPlayer = nil
                 cRoot:Get():FindAndDoWithPlayer(PlayerName, function(P) TargetPlayer = P end)
-                if not TargetPlayer then return end
+                if not TargetPlayer or not Body or Body == "" then return end
 
-                if not Body or Body == "" then
-                    TargetPlayer:SendMessageFailure("§cBaglanilacak aktif sunucu bulunamadi.")
-                    return
-                end
-
-                -- Baslik ve ust cizgi (Daha kibar ve gorsel bir tasarim)
                 TargetPlayer:SendMessageInfo(" ")
                 TargetPlayer:SendMessageInfo("§8§m                                     ")
                 TargetPlayer:SendMessageInfo("§3§l      ♦ WC NETWORK AĞI ♦      ")
                 TargetPlayer:SendMessageInfo("§7  Hızlı geçiş için hedefe tıklayın:")
                 TargetPlayer:SendMessageInfo(" ")
 
-                -- Sunuculari ayikla ve tiklanabilir mesaj olarak gonder
                 local servers = Split(Body, ";")
                 for i, srv in ipairs(servers) do
                     local parts = Split(srv, ":")
@@ -204,22 +172,269 @@ function SendServerList(Player)
                         TargetPlayer:SendMessage(msg)
                     end
                 end
-                
-                -- Alt cizgi
                 TargetPlayer:SendMessageInfo("§8§m                                     ")
                 TargetPlayer:SendMessageInfo(" ")
             end)
-        end,
-        OnError = function(ErrorMessage)
-            World:ScheduleTask(0, function()
-                cRoot:Get():FindAndDoWithPlayer(PlayerName, function(P)
-                    P:SendMessageFailure("§cSunuculara ulasilamadi: " .. (ErrorMessage or "?"))
-                end)
-            end)
-        end,
+        end
     })
 end
 """)
+
+YAVER_MAIN = """
+local ActiveWolves = {}
+local Ini = nil
+
+local function Split(str, sep)
+    local res = {}
+    for w in string.gmatch(str, "([^"..sep.."]+)") do table.insert(res, w) end
+    return res
+end
+
+function Initialize(Plugin)
+    Plugin:SetName("yaver")
+    Plugin:SetVersion(2)
+    
+    Ini = cIniFile()
+    Ini:ReadFile("YaverData.ini")
+    
+    cPluginManager:AddHook(cPluginManager.HOOK_PLAYER_SPAWNED, OnPlayerSpawned)
+    cPluginManager:AddHook(cPluginManager.HOOK_PLAYER_DESTROYED, OnPlayerDestroyed)
+    cPluginManager:AddHook(cPluginManager.HOOK_PLAYER_RIGHT_CLICKING_ENTITY, OnRightClickingEntity)
+    cPluginManager:AddHook(cPluginManager.HOOK_TAKE_DAMAGE, OnTakeDamage)
+    cPluginManager:AddHook(cPluginManager.HOOK_KILLED, OnKilled)
+    
+    cRoot:Get():GetDefaultWorld():ScheduleTask(20 * 3, PeriodicWolfTask)
+    LOG("[YAVER] Koruyucu Kurt ve Gömülü Hub Menüsü aktif edildi!")
+    return true
+end
+
+-- ================= XP ve Seviye Sistemi =================
+function GetWolfLevel(UUID) return Ini:GetValueI(UUID, "Level", 1) end
+function GetWolfXP(UUID) return Ini:GetValueI(UUID, "XP", 0) end
+
+function AddWolfXP(UUID, Amount)
+    local lvl = GetWolfLevel(UUID)
+    local xp = GetWolfXP(UUID) + Amount
+    local req = lvl * 100
+    
+    if xp >= req then
+        lvl = lvl + 1
+        xp = 0
+        Ini:SetValueI(UUID, "Level", lvl)
+        local Player = cRoot:Get():GetPlayerByUUID(UUID)
+        if Player then
+            Player:SendMessageSuccess("§6[Yaver] §aKoruyucu Kurdun Seviye Atladi! Yeni Seviye: §e" .. lvl)
+            local WolfID = ActiveWolves[UUID]
+            if WolfID then
+                Player:GetWorld():DoWithEntityByID(WolfID, function(Ent)
+                    local Wolf = tolua.cast(Ent, "cWolf")
+                    Wolf:SetCustomName("§b" .. Player:GetName() .. " §7Kurdu §e[Lv " .. lvl .. "] §8| §a(Shift+S.Tık: Menü)")
+                    local maxHp = 20 + (lvl * 2)
+                    Wolf:SetMaxHealth(maxHp)
+                    Wolf:Heal(maxHp)
+                    Player:GetWorld():BroadcastEntityAnimation(Wolf, 18) -- Kalp animasyonu
+                end)
+            end
+        end
+    end
+    Ini:SetValueI(UUID, "XP", xp)
+    Ini:WriteFile("YaverData.ini")
+end
+
+-- ================= Kurt Cantasi (Envanter) =================
+function GetBackpack(UUID)
+    local Window = cLuaWindow(cWindow.wtChest, 3, "§8Yaver Cantasi")
+    local InvIni = cIniFile()
+    InvIni:ReadFile("YaverInv.ini")
+    
+    for i=0, 26 do
+        local str = InvIni:GetValue(UUID, "Slot_"..i, "")
+        if str ~= "" then
+            local parts = Split(str, ";")
+            local Itm = cItem(tonumber(parts[1] or 0), tonumber(parts[2] or 0), tonumber(parts[3] or 0))
+            Window:SetSlot(nil, i, Itm)
+        end
+    end
+    
+    Window:SetOnClosed(function(a_Window, a_Player)
+        local Ini2 = cIniFile()
+        Ini2:ReadFile("YaverInv.ini")
+        for i=0, 26 do
+            local Itm = a_Window:GetSlot(a_Player, i)
+            if not Itm:IsEmpty() then
+                Ini2:SetValue(UUID, "Slot_"..i, Itm.m_ItemType .. ";" .. Itm.m_ItemCount .. ";" .. Itm.m_ItemDamage)
+            else
+                Ini2:SetValue(UUID, "Slot_"..i, "")
+            end
+        end
+        Ini2:WriteFile("YaverInv.ini")
+    end)
+    return Window
+end
+
+-- ================= Kurt Çagirma ve Yonetim =================
+function SpawnWolfForPlayer(Player)
+    local UUID = Player:GetUUID()
+    local World = Player:GetWorld()
+    local WolfID = World:SpawnMob(Player:GetPosX(), Player:GetPosY() + 1, Player:GetPosZ(), cMonster.mtWolf)
+    
+    if WolfID ~= cEntity.INVALID_ID then
+        ActiveWolves[UUID] = WolfID
+        World:DoWithEntityByID(WolfID, function(Ent)
+            local Wolf = tolua.cast(Ent, "cWolf")
+            Wolf:SetOwner(Player:GetName())
+            Wolf:SetIsTame(true)
+            Wolf:SetIsSitting(false)
+            local lvl = GetWolfLevel(UUID)
+            -- KURDUN İSMİNE MENÜ BİLGİSİ EKLENDİ
+            Wolf:SetCustomName("§b" .. Player:GetName() .. " §7Kurdu §e[Lv " .. lvl .. "] §8| §a(Shift+S.Tık: Menü)")
+            Wolf:SetCustomNameAlwaysVisible(true)
+            local maxHp = 20 + (lvl * 2)
+            Wolf:SetMaxHealth(maxHp)
+            Wolf:SetHealth(maxHp)
+        end)
+    end
+end
+
+function OnPlayerSpawned(Player)
+    local UUID = Player:GetUUID()
+    if not ActiveWolves[UUID] then
+        Player:GetWorld():ScheduleTask(20, function() SpawnWolfForPlayer(Player) end)
+    end
+end
+
+function OnPlayerDestroyed(Player)
+    local UUID = Player:GetUUID()
+    local WolfID = ActiveWolves[UUID]
+    if WolfID then
+        Player:GetWorld():DoWithEntityByID(WolfID, function(Ent) Ent:Destroy() end)
+        ActiveWolves[UUID] = nil
+    end
+end
+
+-- ================= Etkilesim (Ağ Menüsü, Besleme & Canta) =================
+function OnRightClickingEntity(Player, Entity)
+    if Entity:IsMob() and Entity:GetMobType() == cMonster.mtWolf then
+        local UUID = Player:GetUUID()
+        if ActiveWolves[UUID] == Entity:GetUniqueID() then
+            
+            -- OYUNCU EĞİLİYORSA (SHIFT BASILIYSA) AĞ MENÜSÜNÜ AÇ
+            if Player:IsCrouched() then
+                Player:ExecuteCommand("/hub")
+                return true
+            end
+
+            local Item = Player:GetEquippedItem()
+            local MeatIDs = { [319]=true, [320]=true, [363]=true, [364]=true, [365]=true, [366]=true, [367]=true, [423]=true, [424]=true, [411]=true, [412]=true }
+            
+            if MeatIDs[Item.m_ItemType] then
+                -- Kurdu Besle
+                Item.m_ItemCount = Item.m_ItemCount - 1
+                if Item.m_ItemCount <= 0 then Item:Empty() end
+                Player:GetInventory():SetEquippedItem(Item)
+                Entity:Heal(10)
+                Player:GetWorld():BroadcastEntityAnimation(Entity, 18)
+                AddWolfXP(UUID, 50)
+                Player:SendMessageInfo("§6[Yaver] §aKurdunu besledin! (+50 XP, +10 Can)")
+            else
+                -- Cantayi Ac (Eğilmeden tıklanırsa)
+                local Window = GetBackpack(UUID)
+                Player:OpenWindow(Window)
+            end
+            return true
+        end
+    end
+    return false
+end
+
+-- ================= Savas ve Hasar Sistemi =================
+function OnTakeDamage(Receiver, TCA)
+    local Attacker = TCA.Attacker
+    if not Attacker then return false end
+    
+    -- Kurt Vurursa Hasari Levela Gore Artir
+    if Attacker:IsMob() and Attacker:GetMobType() == cMonster.mtWolf then
+        for uuid, wid in pairs(ActiveWolves) do
+            if wid == Attacker:GetUniqueID() then
+                local lvl = GetWolfLevel(uuid)
+                TCA.FinalDamage = TCA.FinalDamage + (lvl * 1.5) -- Level basina 1.5 ekstra hasar
+                AddWolfXP(uuid, 5)
+            end
+        end
+    end
+    
+    -- Sahibe Biri Vurursa Kurt Onu Hedef Alir
+    if Receiver:IsPlayer() then
+        local UUID = Receiver:GetUUID()
+        local WolfID = ActiveWolves[UUID]
+        if WolfID and Attacker:GetUniqueID() ~= WolfID then
+            Receiver:GetWorld():DoWithEntityByID(WolfID, function(Ent)
+                local Wolf = tolua.cast(Ent, "cWolf")
+                Wolf:MoveToPosition(Attacker:GetPosition())
+            end)
+        end
+    end
+end
+
+function OnKilled(Victim, TCA, CustomDeathMessage)
+    local Attacker = TCA.Attacker
+    -- Kurt Olurse
+    if Victim:IsMob() and Victim:GetMobType() == cMonster.mtWolf then
+        for uuid, wid in pairs(ActiveWolves) do
+            if wid == Victim:GetUniqueID() then
+                ActiveWolves[uuid] = nil
+                local P = cRoot:Get():GetPlayerByUUID(uuid)
+                if P then P:SendMessageWarning("§cKoruyucu kurdun ağır yaralandı! 30 saniye içinde iyileşip dönecek.") end
+                
+                -- 30 Saniye Sonra Yeniden Dogus
+                Victim:GetWorld():ScheduleTask(20 * 30, function()
+                    local Player = cRoot:Get():GetPlayerByUUID(uuid)
+                    if Player then
+                        SpawnWolfForPlayer(Player)
+                        Player:SendMessageSuccess("§aKoruyucu kurdun iyileşti ve yanına döndü!")
+                    end
+                end)
+                break
+            end
+        end
+    end
+    
+    -- Sahip Birini Oldururse Kurt XP Kazanir
+    if Attacker and Attacker:IsPlayer() then
+        local uuid = Attacker:GetUUID()
+        if ActiveWolves[uuid] then
+            AddWolfXP(uuid, 25)
+        end
+    end
+end
+
+-- ================= Periyodik Kontroller ve Takviyeler =================
+function PeriodicWolfTask(World)
+    World:ForEachPlayer(function(Player)
+        local UUID = Player:GetUUID()
+        local WolfID = ActiveWolves[UUID]
+        if WolfID then
+            World:DoWithEntityByID(WolfID, function(Ent)
+                local Wolf = tolua.cast(Ent, "cWolf")
+                
+                -- Uzaklasirsa Yanina Isinla
+                local dist = (Wolf:GetPosition() - Player:GetPosition()):Length()
+                if dist > 20 then Wolf:TeleportToEntity(Player) end
+                
+                -- Sahibine Levela Gore Takviye (Buff) Ver
+                local lvl = GetWolfLevel(UUID)
+                if lvl >= 5 then Player:AddEntityEffect(cEntityEffect.effSpeed, 20*6, 0) end
+                if lvl >= 10 then Player:AddEntityEffect(cEntityEffect.effStrength, 20*6, 0) end
+                if lvl >= 20 then Player:AddEntityEffect(cEntityEffect.effRegeneration, 20*6, 0) end
+                
+                -- Kurdun Canini Yavasca Doldur
+                if Wolf:GetHealth() < Wolf:GetMaxHealth() then Wolf:Heal(1) end
+            end)
+        end
+    end)
+    World:ScheduleTask(20 * 3, PeriodicWolfTask)
+end
+"""
 
 def write_configs(server_dir=SERVER_DIR):
     files = {
@@ -228,6 +443,8 @@ def write_configs(server_dir=SERVER_DIR):
         f"{server_dir}/Plugins/WCSync/main.lua": WCSYNC_MAIN.strip(),
         f"{server_dir}/Plugins/WCHub/Info.lua": 'g_PluginInfo = {Name="WCHub", Version="5"}',
         f"{server_dir}/Plugins/WCHub/main.lua": _make_wchub_lua(HTTP_PORT).strip(),
+        f"{server_dir}/Plugins/yaver/Info.lua": 'g_PluginInfo = {Name="yaver", Version="2"}',
+        f"{server_dir}/Plugins/yaver/main.lua": YAVER_MAIN.strip(),
     }
     for path, content in files.items():
         try:
@@ -333,7 +550,7 @@ class PlayerConn:
                 
                 async with db.execute("SELECT * FROM servers WHERE players < 100 AND (? - last_seen) < 60 ORDER BY players ASC LIMIT 1", (now,)) as cur:
                     return await cur.fetchone()
-        except Exception as e: print(f"[PROXY] DB Hatasi: {e}"); return None
+        except Exception as e: return None
 
     async def hot_swap(self, target_label):
         if self.current_label == target_label: return
@@ -459,7 +676,6 @@ class PlayerConn:
                 
                 _active_players.append(self)
                 self.play_state = True
-                print(f"[JOIN] {self.username} -> {self.current_label} sunucusuna girdi.")
                 
                 import aiosqlite
                 async with aiosqlite.connect(DB_FILE) as db:
@@ -616,16 +832,14 @@ setInterval(()=>location.reload(),15000);
             return
 
         if self.path == "/api/servers":
-            # BUG FIX: Alt Sunucular icin Relay (Kopru) Yonlendirmesi!
             if MODE == "gameserver":
                 proxy_url = os.environ.get("PROXY_URL", "")
                 if proxy_url:
                     try:
                         req = urllib.request.Request(f"{proxy_url}/api/servers")
-                        resp = urllib.request.urlopen(req, timeout=15).read() # Zaman asimi 15'e cikarildi
+                        resp = urllib.request.urlopen(req, timeout=15).read()
                         self.send_response(200); self.end_headers(); self.wfile.write(resp)
                     except Exception as e:
-                        print(f"[RELAY] GUI Liste Hatasi: {e}")
                         self.send_response(500); self.end_headers()
                 return
 
@@ -638,7 +852,6 @@ setInterval(()=>location.reload(),15000);
             except Exception: self.send_response(500); self.end_headers()
 
     def do_POST(self):
-        # ── Tüm sunucuları yeniden başlat ──────────────────────────────
         if self.path == "/api/restart_all":
             count = 0
             try:
@@ -648,9 +861,7 @@ setInterval(()=>location.reload(),15000);
                     cur.execute("UPDATE servers SET restart_pending=1 WHERE (? - last_seen) < 45", (int(time.time()),))
                     count = cur.rowcount
                     conn.commit(); conn.close()
-                # Yerel Cuberite'i de hemen yeniden başlat (MODE=="all" durumunda)
                 _restart_local_cuberite()
-                print(f"[ADMIN] Tüm sunuculara ({count}) yeniden başlatma sinyali gönderildi.")
                 self.send_response(200); self.send_header("Content-Type","application/json"); self.end_headers()
                 self.wfile.write(json.dumps({"ok": True, "message": f"{count} sunucuya yeniden başlatma sinyali gönderildi."}).encode())
             except Exception as e:
@@ -658,7 +869,6 @@ setInterval(()=>location.reload(),15000);
                 self.wfile.write(json.dumps({"ok": False, "message": str(e)}).encode())
             return
 
-        # ── Tek sunucuyu yeniden başlat ────────────────────────────────
         if self.path.startswith("/api/restart"):
             label = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get('label', [''])[0]
             if not label:
@@ -670,10 +880,8 @@ setInterval(()=>location.reload(),15000);
                     conn = sqlite3.connect(DB_FILE)
                     conn.execute("UPDATE servers SET restart_pending=1 WHERE label=?", (label,))
                     conn.commit(); conn.close()
-                # Yerel hub sunucusuysa hemen başlat
                 if label in ("LOCAL_HUB_01", "GM1") or MODE == "all":
                     _restart_local_cuberite()
-                print(f"[ADMIN] '{label}' sunucusuna yeniden başlatma sinyali gönderildi.")
                 self.send_response(200); self.send_header("Content-Type","application/json"); self.end_headers()
                 self.wfile.write(json.dumps({"ok": True, "message": f"'{label}' sunucusuna sinyal gönderildi."}).encode())
             except Exception as e:
@@ -728,12 +936,8 @@ setInterval(()=>location.reload(),15000);
                 
                 self.send_response(200); self.send_header("Content-Type","application/json"); self.end_headers()
                 self.wfile.write(json.dumps({"label": label, "restart": restart_needed}).encode())
-                if restart_needed:
-                    print(f"[REG] {label} sunucusuna restart komutu iletildi.")
-                else:
-                    print(f"[REG] Sunucu Aktif: {label} ({host}:{port})")
             except Exception as e:
-                print(f"[REG] Kayit Hatasi: {e}"); self.send_response(500); self.end_headers()
+                self.send_response(500); self.end_headers()
 
     def log_message(self, format, *args): pass
 
@@ -742,10 +946,8 @@ setInterval(()=>location.reload(),15000);
 # ══════════════════════════════════════════════════════════
 
 def _restart_local_cuberite():
-    """Yerel Cuberite sürecini güvenli şekilde yeniden başlatır."""
     global _cuberite_proc
     if _cuberite_proc and _cuberite_proc.poll() is None:
-        print("[ADMIN] Yerel Cuberite yeniden başlatılıyor...")
         try:
             _cuberite_proc.terminate()
             _cuberite_proc.wait(timeout=8)
@@ -753,8 +955,6 @@ def _restart_local_cuberite():
             try: _cuberite_proc.kill()
             except: pass
         _cuberite_proc = None
-    else:
-        print("[ADMIN] Yerel Cuberite zaten çalışmıyor, sinyal DB'de bekleniyor.")
 
 def run_http():
     http.server.ThreadingHTTPServer.allow_reuse_address = True
@@ -777,7 +977,6 @@ def run_bore_for_proxy():
                 m = re.search(r"bore\.pub:(\d+)", line)
                 if m:
                     _proxy_bore_addr = f"bore.pub:{m.group(1)}"
-                    print(f"[BORE] Ana Yönlendirici (Proxy) Tüneli Açıldı! Adres: {_proxy_bore_addr}")
             proc.wait()
         except: pass
         time.sleep(5)
@@ -806,10 +1005,7 @@ def run_bore_for_gameserver():
                     req = urllib.request.Request(f"{proxy_url}/api/register", data=payload.encode(), headers={"Content-Type": "application/json"})
                     resp = urllib.request.urlopen(req, timeout=5).read()
                     resp_data = json.loads(resp)
-                    # Hub'dan restart sinyali gelirse Cuberite'i yeniden başlat
-                    if resp_data.get("restart"):
-                        print(f"[HEARTBEAT] Hub'dan restart komutu alındı! Cuberite yeniden başlatılıyor...")
-                        _restart_local_cuberite()
+                    if resp_data.get("restart"): _restart_local_cuberite()
                 except Exception: pass
 
     threading.Thread(target=heartbeat, daemon=True).start()
@@ -823,7 +1019,6 @@ def run_bore_for_gameserver():
                 m = re.search(r"bore\.pub:(\d+)", line)
                 if m:
                     current_gs_bore = f"bore.pub:{m.group(1)}"
-                    print(f"[BORE] Alt Sunucu Tüneli: {current_gs_bore}")
             proc.wait()
         except: pass
         time.sleep(5)
@@ -842,9 +1037,6 @@ def run_cuberite():
             line = raw.rstrip() if isinstance(raw, str) else raw.decode("utf-8", "replace").rstrip()
             if not line: continue
             
-            # --- Cuberite'in tum ciktilarini (Hatalari) konsola yansit! ---
-            print(f"[CUBERITE] {line}")
-            
             if "WCSYNC_JOIN:" in line:
                 def _do_join(ln):
                     try:
@@ -852,16 +1044,12 @@ def run_cuberite():
                         uuid_clean = uuid.replace("-", "")
                         req = urllib.request.Request(f"{proxy_url}/api/player_file?name={name}")
                         data = urllib.request.urlopen(req, timeout=5).read()
-                        
                         paths = [pathlib.Path(f"{persistent_world}/players/{uuid}.json"), pathlib.Path(f"{persistent_world}/players/{uuid_clean}.json")]
                         for p in paths:
                             p.parent.mkdir(parents=True, exist_ok=True); p.write_bytes(data)
-                        
                         time.sleep(1.0)
                         proc.stdin.write(f"wcreload {name}\n"); proc.stdin.flush()
-                        print(f"[SYNC] {name} envanteri indirildi ve oyuna islendi.")
-                    except Exception as e:
-                        if "404" not in str(e): print(f"[SYNC] Hata: {e}")
+                    except Exception as e: pass
                 threading.Thread(target=_do_join, args=(line,), daemon=True).start()
                 
             elif "WCSYNC_QUIT:" in line or "WCSYNC_SAVE:" in line:
@@ -871,16 +1059,13 @@ def run_cuberite():
                         tag = "WCSYNC_QUIT:" if "WCSYNC_QUIT:" in ln else "WCSYNC_SAVE:"
                         name, uuid = ln.split(tag)[1].strip().split(":")
                         uuid_clean = uuid.replace("-", "")
-                        
                         p1 = pathlib.Path(f"{persistent_world}/players/{uuid}.json")
                         p2 = pathlib.Path(f"{persistent_world}/players/{uuid_clean}.json")
                         target_p = p1 if p1.exists() else (p2 if p2.exists() else None)
-                        
                         if target_p:
                             req = urllib.request.Request(f"{proxy_url}/api/player_file?name={name}", data=target_p.read_bytes(), method="POST")
                             urllib.request.urlopen(req, timeout=5)
-                            print(f"[SYNC] {name} envanteri merkeze yuklendi.")
-                    except Exception as e: print(f"[SYNC] Upload Hatasi: {e}")
+                    except Exception as e: pass
                 threading.Thread(target=_do_upload, args=(line,), daemon=True).start()
 
     while True:
@@ -918,7 +1103,7 @@ def main():
         asyncio.run(run_proxy())
         
     elif MODE == "gameserver":
-        threading.Thread(target=run_http, daemon=True).start() # GUI koprusu icin local HTTP!
+        threading.Thread(target=run_http, daemon=True).start()
         threading.Thread(target=run_bore_for_gameserver, daemon=True).start()
         run_cuberite()
         
