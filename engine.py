@@ -3,8 +3,8 @@
 ⛏️  Minecraft Ultimate Bungee Network & Anti-Dupe Engine
 ═══════════════════════════════════════════════════════════
   • FIX: Cuberite Loglari terminalde gorunur
-  • FIX: /hub komutu icin Yetki Engeli kaldirildi (Bos Permission sistemi)
-  • FIX: Lua OpenGUI cökmelerine karsi Hata Yakalayici (pcall) eklendi
+  • FIX: Pusula geri eklendi, artik tiklanabilir chat menusunu aciyor!
+  • FIX: Oyuna giriste menuyu otomatik gosterme eklendi
 """
 
 import asyncio, json, os, pathlib, struct, sys
@@ -141,95 +141,124 @@ end
 
 function Initialize(Plugin)
     Plugin:SetName("WCHub")
-    Plugin:SetVersion(8)
-    
-    -- Bos string ("") yetki (permission) kisitlamasini tamamen kaldirir. Herkes kullanabilir.
-    cPluginManager:BindCommand("/hub", "", HandleHubCommand, "Sunucu secici menusunu acar.")
-    cPluginManager:BindCommand("/sunucu", "", HandleHubCommand, "Sunucu secici menusunu acar.")
-    
-    LOG("[HUB] WCHub komutlari yetkisiz erisime acildi (Bos Perm)!")
+    Plugin:SetVersion(11)
+
+    cPluginManager:AddHook(cPluginManager.HOOK_PLAYER_SPAWNED, OnPlayerSpawned)
+    cPluginManager:AddHook(cPluginManager.HOOK_PLAYER_RIGHT_CLICK, OnRightClick)
+    cPluginManager:AddHook(cPluginManager.HOOK_PLAYER_USING_ITEM, OnRightClick)
+    cPluginManager:AddHook(cPluginManager.HOOK_PLAYER_TOSS_ITEM, OnPlayerTossItem)
+    cPluginManager:AddHook(cPluginManager.HOOK_KILLED, OnKilled)
+    cPluginManager:AddHook(cPluginManager.HOOK_EXECUTE_COMMAND, OnCommand)
+
+    LOG("[HUB] WCHub Chat+Pusula Hibrit Sistemi Aktif!")
     return true
 end
 
-function HandleHubCommand(Split, Player)
-    -- Hata yakalayici: Eger GUI acilirken cokerse, sunucu log atar ama oyuncu 'unknown command' hatasi gormez.
-    local isSuccess, err = pcall(function()
-        OpenGUI(Player)
+function OnPlayerSpawned(Player)
+    GiveRing(Player)
+    -- Oyuna giris yaptiginda 1 saniye (20 tick) sonra menuyu otomatik gonder
+    Player:GetWorld():ScheduleTask(20, function()
+        SendServerList(Player)
     end)
-    
-    if not isSuccess then
-        LOGWARNING("[WCHub] OpenGUI fonksiyonu coktu: " .. tostring(err))
-        Player:SendMessageFailure("§cGUI tetiklenirken ic sistem hatasi olustu. Yoneticiye bildirin.")
-    end
-    
-    return true
 end
 
-function OpenGUI(Player)
+function GiveRing(Player)
+    local inv = Player:GetInventory()
+    local hasRing = false
+    for i=0, 35 do
+        if inv:GetSlot(i).m_ItemType == E_ITEM_COMPASS then hasRing = true break end
+    end
+    if not hasRing then
+        local ring = cItem(E_ITEM_COMPASS, 1)
+        ring.m_CustomName = "§eSunucu Secici §7(Sag Tik)"
+        inv:SetHotbarSlot(8, ring)
+    end
+end
+
+function OnPlayerTossItem(Player, NumTicks, Item)
+    if Item.m_ItemType == E_ITEM_COMPASS then
+        Player:SendMessageWarning("§cPusulayi yere atamazsin!")
+        return true
+    end
+    return false
+end
+
+function OnKilled(Victim, TCA, CustomDeathMessage)
+    if Victim:IsPlayer() then
+        local inv = Victim:GetInventory()
+        for i=0, 35 do
+            if inv:GetSlot(i).m_ItemType == E_ITEM_COMPASS then
+                inv:SetSlot(i, cItem(E_ITEM_EMPTY, 0))
+            end
+        end
+    end
+    return false
+end
+
+function OnRightClick(Player, ...)
+    local item = Player:GetEquippedItem()
+    if item.m_ItemType == E_ITEM_COMPASS then
+        SendServerList(Player)
+        return true
+    end
+    return false
+end
+
+function OnCommand(Player, CommandSplit, EntireCommand)
+    local cmd = string.lower(CommandSplit[1] or "")
+    if cmd == "/hub" or cmd == "/sunucu" then
+        SendServerList(Player)
+        return true
+    end
+    return false
+end
+
+function SendServerList(Player)
     local PlayerName = Player:GetName()
     local World = Player:GetWorld()
-    
-    LOG("[WCHub] " .. PlayerName .. " komutu kullandi. API istegi atiliyor...")
 
     if type(cUrlClient) == "nil" then
-        LOGWARNING("[WCHub] cUrlClient API'si bulunamadi! HTTP destegi yok.")
-        Player:SendMessageFailure("§cSunucu secici modulu sistemde eksik (cUrlClient hatasi).")
+        Player:SendMessageFailure("§cSunucu secici modulu sistemde eksik (API Hatasi).")
         return
     end
 
     cUrlClient:Get(ProxyURL .. "/api/servers", {
         OnSuccess = function(Body, DataCallbacks)
-            LOG("[WCHub] API Yaniti Alindi. Uzunluk: " .. string.len(Body or ""))
             World:ScheduleTask(0, function()
                 local TargetPlayer = nil
                 cRoot:Get():FindAndDoWithPlayer(PlayerName, function(P) TargetPlayer = P end)
                 if not TargetPlayer then return end
 
                 if not Body or Body == "" then
-                    TargetPlayer:SendMessageFailure("§cSunucu listesi su an bos.")
+                    TargetPlayer:SendMessageFailure("§cBaglanilacak aktif sunucu bulunamadi.")
                     return
                 end
 
-                -- GUI olusturma kisminda hata yakalayici (pcall)
-                local isSuccess, Window = pcall(function()
-                    return cLuaWindow(cWindow.wtChest, 3, "§8Sunucu Agi")
-                end)
+                -- Baslik ve ust cizgi (Daha kibar ve gorsel bir tasarim)
+                TargetPlayer:SendMessageInfo(" ")
+                TargetPlayer:SendMessageInfo("§8§m                                     ")
+                TargetPlayer:SendMessageInfo("§3§l      ♦ WC NETWORK AĞI ♦      ")
+                TargetPlayer:SendMessageInfo("§7  Hızlı geçiş için hedefe tıklayın:")
+                TargetPlayer:SendMessageInfo(" ")
 
-                if not isSuccess or not Window then
-                    LOGWARNING("[WCHub] GUI Olusturulamadi: " .. tostring(Window))
-                    TargetPlayer:SendMessageFailure("§cPencere olusturulamadi (Surum uyumsuzlugu).")
-                    return
-                end
-
+                -- Sunuculari ayikla ve tiklanabilir mesaj olarak gonder
                 local servers = Split(Body, ";")
                 for i, srv in ipairs(servers) do
                     local parts = Split(srv, ":")
                     if #parts == 2 then
-                        local item = cItem(E_ITEM_STAINED_GLASS_PANE, 1, 5)
-                        item.m_CustomName = "§a" .. parts[1]
-                        item.m_Lore = "§7Aktif Oyuncu: §e" .. parts[2] .. "|§8Tikla ve baglan!"
-                        Window:SetSlot(TargetPlayer, i - 1, item)
+                        local msg = cCompositeChat()
+                        msg:ParseText("  §8▪ §b" .. parts[1] .. " §7(Aktif: §e" .. parts[2] .. "§7)   ")
+                        msg:AddRunCommandPart("§a§n[BAĞLAN]", "/wc_transfer " .. parts[1])
+                        TargetPlayer:SendMessage(msg)
                     end
                 end
-
-                Window:SetOnClicked(function(a_Window, a_Player, a_SlotNum, a_ClickAction, a_ClickedItem)
-                    if a_SlotNum >= 0 and a_SlotNum < 27 then
-                        if a_ClickedItem.m_ItemType ~= E_ITEM_EMPTY then
-                            local target = string.sub(a_ClickedItem.m_CustomName, 3)
-                            a_Player:SendMessageSuccess("§a" .. target .. " sunucusuna baglaniliyor...")
-                            a_Player:ExecuteCommand("/wc_transfer " .. target)
-                            a_Window:Close(a_Player)
-                        end
-                        return true
-                    end
-                    return false
-                end)
-
-                TargetPlayer:OpenWindow(Window)
+                
+                -- Alt cizgi
+                TargetPlayer:SendMessageInfo("§8§m                                     ")
+                TargetPlayer:SendMessageInfo(" ")
             end)
         end,
         OnError = function(ErrorMessage)
-            LOGWARNING("[WCHub] API Hatasi: " .. tostring(ErrorMessage))
             World:ScheduleTask(0, function()
                 cRoot:Get():FindAndDoWithPlayer(PlayerName, function(P)
                     P:SendMessageFailure("§cSunuculara ulasilamadi: " .. (ErrorMessage or "?"))
