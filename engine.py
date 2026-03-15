@@ -6,6 +6,7 @@
   • FIX: Lua sessiz cokmelerine karsi pcall ve LOG sistemi eklendi
   • FIX: POST istegindeki player_file bloğu hatasi giderildi
   • FIX: Render API zaman asimi 15 saniyeye yukseltildi
+  • DEBUG: Pusula (Sag Tik) algilama testi eklendi
 """
 
 import asyncio, json, os, pathlib, struct, sys
@@ -188,6 +189,10 @@ end
 
 function OnRightClick(Player, ...)
     local item = Player:GetEquippedItem()
+    
+    -- YENİ EKLENEN LOG: Tıklama algılandığında konsola basacak
+    LOG("[WCHub-DEBUG] " .. Player:GetName() .. " sag tikladi. Esya ID: " .. tostring(item.m_ItemType))
+    
     if item.m_ItemType == E_ITEM_COMPASS then
         OpenGUI(Player)
         return true
@@ -730,7 +735,6 @@ setInterval(()=>location.reload(),15000);
                 self.wfile.write(json.dumps({"ok": False, "message": str(e)}).encode())
             return
 
-        # ── EKSİK OLAN IF BLOĞU BURAYA EKLENDİ (ÖNEMLİ) ────────────────────────────────
         elif self.path.startswith("/api/player_file"):
             name = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get('name', [''])[0]
             name = "".join(c for c in name if c.isalnum() or c in "-_")
