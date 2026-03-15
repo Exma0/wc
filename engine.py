@@ -130,8 +130,9 @@ function HandleConsoleReload(Split)
 end
 """
 
-WCHUB_MAIN = """
-local ProxyURL = "http://127.0.0.1:8080"
+def _make_wchub_lua(port):
+    return ("""
+local ProxyURL = "http://127.0.0.1:{PORT}" """.replace("{PORT}", str(port)) + """
 
 local function Split(str, sep)
     local res = {}
@@ -255,7 +256,7 @@ function OpenGUI(Player)
         end,
     })
 end
-"""
+""")
 
 def write_configs(server_dir=SERVER_DIR):
     files = {
@@ -263,7 +264,7 @@ def write_configs(server_dir=SERVER_DIR):
         f"{server_dir}/Plugins/WCSync/Info.lua": 'g_PluginInfo = {Name="WCSync", Version="2"}',
         f"{server_dir}/Plugins/WCSync/main.lua": WCSYNC_MAIN.strip(),
         f"{server_dir}/Plugins/WCHub/Info.lua": 'g_PluginInfo = {Name="WCHub", Version="5"}',
-        f"{server_dir}/Plugins/WCHub/main.lua": WCHUB_MAIN.strip(),
+        f"{server_dir}/Plugins/WCHub/main.lua": _make_wchub_lua(HTTP_PORT).strip(),
     }
     for path, content in files.items():
         try:
