@@ -2,9 +2,8 @@
 """
 ⛏️  Minecraft Ultimate Bungee Network & Anti-Dupe Engine
 ═══════════════════════════════════════════════════════════
-  • FIX: Cuberite Loglari terminalde gorunur (Sorun tespiti icin)
-  • FIX: Pusula kaldirildi, yerine /hub ve /sunucu komutlari eklendi
-  • FIX: POST istegindeki player_file bloğu hatasi giderildi
+  • FIX: Cuberite Loglari terminalde gorunur
+  • FIX: /hub komutu icin Yetki Bypass (HOOK) sistemi eklendi (%100 calisir)
   • FIX: Render API zaman asimi 15 saniyeye yukseltildi
 """
 
@@ -142,26 +141,29 @@ end
 
 function Initialize(Plugin)
     Plugin:SetName("WCHub")
-    Plugin:SetVersion(6)
+    Plugin:SetVersion(7)
     
-    -- Pusula yerine komut sistemi bagliyoruz
-    cPluginManager:BindCommand("/hub", "*", HandleHubCommand, "Sunucu secici menusunu acar.")
-    cPluginManager:BindCommand("/sunucu", "*", HandleHubCommand, "Sunucu secici menusunu acar.")
+    -- BindCommand yerine garanti olan Hook (Kanca) yontemini kullaniyoruz
+    cPluginManager:AddHook(cPluginManager.HOOK_EXECUTE_COMMAND, OnCommand)
     
-    LOG("[HUB] WCHub komut tabanli sisteme gecti! /hub veya /sunucu yazilabilir.")
+    LOG("[HUB] WCHub kanca (hook) moduna gecti! /hub veya /sunucu yazilabilir.")
     return true
 end
 
-function HandleHubCommand(Split, Player)
-    OpenGUI(Player)
-    return true
+function OnCommand(Player, CommandSplit, EntireCommand)
+    local cmd = string.lower(CommandSplit[1] or "")
+    if cmd == "/hub" or cmd == "/sunucu" then
+        OpenGUI(Player)
+        return true -- Sunucuya 'Unknown command' hatasi verdirmeden komutu yutar
+    end
+    return false
 end
 
 function OpenGUI(Player)
     local PlayerName = Player:GetName()
     local World = Player:GetWorld()
     
-    LOG("[WCHub] " .. PlayerName .. " /hub komutunu kullandi. API istegi basliyor...")
+    LOG("[WCHub] " .. PlayerName .. " GUI'yi tetikledi. API istegi atiliyor...")
 
     if type(cUrlClient) == "nil" then
         LOGWARNING("[WCHub] cUrlClient API'si bulunamadi! HTTP destegi yok.")
