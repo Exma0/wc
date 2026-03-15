@@ -5,7 +5,7 @@
   • Tam BungeeCord Mimarisi (Hot-Swap / Kesintisiz Gecis)
   • Otomatik Olceklendirme (Auto-Scaling): GM1, GM2, GM3...
   • SQLite Zero-Config Veritabani (Sifre yok, tam otomatik!)
-  • Canli Web Paneli ve Konsol Eklendi (Render 502 Fix)
+  • Tünel Mantik Hatasi Giderildi (Sonsuz GM Kaydi Fix)
 """
 
 import asyncio, json, os, pathlib, struct, sys
@@ -670,7 +670,7 @@ class HttpHandler(http.server.BaseHTTPRequestHandler):
             rows, s_count, reg_count = _build_rows()
             bore = _current_bore_addr
             if bore:
-                addr_block = (f'<div class="addr-box"><div><div class="addr-lbl">MİNECRAFT ADRESİ (Bu adresi kopyala)</div>'
+                addr_block = (f'<div class="addr-box"><div><div class="addr-lbl">MİNECRAFT ADRESİ (Bu adresi kopyala, Tarayiciya DEGIL)</div>'
                               f'<div class="addr-val">{bore}</div></div>'
                               f'<button class="copy-btn" onclick="navigator.clipboard.writeText(\'{bore}\');'
                               f'this.textContent=\'Kopyalandı\';setTimeout(()=>this.textContent=\'Kopyala\',1500)">Kopyala</button></div>')
@@ -801,7 +801,7 @@ class HttpHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format, *args): pass
 
 # ══════════════════════════════════════════════════════════
-#  BAŞLATICI YÖNTEMLER
+#  BAŞLATICI YÖNTEMLER VE TÜNEL KONTROLÜ
 # ══════════════════════════════════════════════════════════
 
 def run_http():
@@ -813,7 +813,8 @@ def _strip_ansi(text):
     import re
     return re.sub(r'\x1b\[[0-9;]*[mK]|\x1b\[\d*[A-Za-z]|\x1b\(\w', '', text)
 
-def run_bore(port=MC_PORT):
+# is_proxy parametresi eklendi. Hub kendi portunu acarken kendini veritabanina alt sunucu diye kaydetmeyecek!
+def run_bore(port=MC_PORT, is_proxy=False):
     global _current_bore_addr
     import re
     while True:
@@ -825,9 +826,12 @@ def run_bore(port=MC_PORT):
                 if not line: continue
                 m = re.search(r"bore\.pub:(\d+)", line)
                 if m:
-                    _current_bore_addr = f"bore.pub:{m.group(1)}"
-                    if MODE == "gameserver" or MODE == "all":
-                        _register_with_proxy(_current_bore_addr)
+                    bore_addr = f"bore.pub:{m.group(1)}"
+                    if is_proxy:
+                        _current_bore_addr = bore_addr
+                        print(f"[BORE] Ana Hub Adresi Olusturuldu: {bore_addr} (Minecraft uzerinden baglanin)")
+                    elif MODE == "gameserver":
+                        _register_with_proxy(bore_addr)
             proc.wait()
         except Exception: pass
         time.sleep(10)
@@ -872,14 +876,33 @@ def main():
 
     if MODE == "proxy":
         threading.Thread(target=run_http, daemon=True).start()
+        threading.Thread(target=run_bore, args=(MC_PORT, True), daemon=True).start()
         asyncio.run(run_proxy())
+        
     elif MODE == "gameserver":
-        threading.Thread(target=run_bore, args=(CUBERITE_PORT,), daemon=True).start()
+        threading.Thread(target=run_bore, args=(CUBERITE_PORT, False), daemon=True).start()
         run_cuberite()
+        
     elif MODE == "all":
         threading.Thread(target=run_http, daemon=True).start()
-        threading.Thread(target=run_bore, args=(CUBERITE_PORT,), daemon=True).start()
+        
+        # 1. Hub'in Ana Oyun Portunu Disari Ac (Oyuncularin girecegi yer, is_proxy=True)
+        threading.Thread(target=run_bore, args=(MC_PORT, True), daemon=True).start()
+        
+        # 2. Arka planda calisan yerel oyunu baslat
         threading.Thread(target=run_cuberite, daemon=True).start()
+        
+        # 3. Yerel oyunu Hub veritabanina sadece tek seferlik "GM1" olarak kaydet
+        def register_local():
+            time.sleep(4) # Oyunun acilmasini bekle
+            try:
+                body = json.dumps({"host": "127.0.0.1", "port": CUBERITE_PORT}).encode()
+                req = urllib.request.Request(f"http://127.0.0.1:{HTTP_PORT}/api/register", data=body, headers={"Content-Type": "application/json"})
+                urllib.request.urlopen(req)
+            except: pass
+        threading.Thread(target=register_local, daemon=True).start()
+        
+        # 4. Hub / Bungee proxy sistemini baslat
         time.sleep(3)
         asyncio.run(run_proxy())
 
