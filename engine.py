@@ -124,7 +124,7 @@ def write_configs(server_dir=SERVER_DIR):
 
 def update_lua_scripts(server_dir=SERVER_DIR):
     """GitHub reposundan Lua betiklerini çeker ve günceller."""
-    base_url = "https://raw.githubusercontent.com/Exma0/wc/main/lua"
+    base_url = "https://github.com/Exma0/va/tree/main"
     success_count = 0
     scripts = {
         "wcsync.lua": f"{server_dir}/Plugins/WCSync/main.lua",
