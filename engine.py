@@ -100,6 +100,11 @@ async def init_db():
 #  DİNAMİK GITHUB SCRIPT GÜNCELLEYİCİ VE YAPILANDIRMA
 # ══════════════════════════════════════════════════════════
 
+# DÜZELTME #3: Yedek plugin listesi tüm eklentileri içermiyordu.
+# ada.lua, lag.lua, tp.lua eksikti; GitHub erişilemediğinde bu
+# eklentiler hiç yüklenmiyordu.
+_FALLBACK_PLUGINS = ["wcsync.lua", "wchub.lua", "yaver.lua", "ada.lua", "lag.lua", "tp.lua"]
+
 def update_and_configure(server_dir=SERVER_DIR):
     base_url = "https://raw.githubusercontent.com/Exma0/va/refs/heads/main"
     list_url = f"{base_url}/list"
@@ -110,7 +115,7 @@ def update_and_configure(server_dir=SERVER_DIR):
         lines = urllib.request.urlopen(req, timeout=10).read().decode('utf-8').splitlines()
     except Exception as e:
         log_msg(f"[GÜNCELLEME HATA] Liste çekilemedi: {e}")
-        lines = ["wcsync.lua", "wchub.lua", "yaver.lua"] # Liste çekilemezse varsayılanlara dön
+        lines = _FALLBACK_PLUGINS
         
     plugin_names = []
     success_count = 0
@@ -121,10 +126,9 @@ def update_and_configure(server_dir=SERVER_DIR):
         if not script_name or not script_name.endswith('.lua'): continue
         total_scripts += 1
         
-        # Klasör adı belirleme (eski eklentilerin büyük/küçük harf yapısını korumak için, yeniler otomatik açılır)
         if script_name == "wcsync.lua": folder_name = "WCSync"
         elif script_name == "wchub.lua": folder_name = "WCHub"
-        else: folder_name = script_name[:-4] # Örn: yeni.lua -> klasör adı "yeni"
+        else: folder_name = script_name[:-4]
         
         plugin_names.append(folder_name)
         
@@ -132,19 +136,14 @@ def update_and_configure(server_dir=SERVER_DIR):
             req = urllib.request.Request(f"{base_url}/{script_name}")
             code = urllib.request.urlopen(req, timeout=10).read().decode('utf-8')
             
-            # DÜZELTME: Hem WCHub hem WCSync {PORT} placeholder kullanır.
-            # Sadece WCHub için yapılıyordu; WCSync'te {PORT} literal metin
-            # olarak kalıyor, ProxyURL hiç çözümlenemiyordu.
             if "{PORT}" in code:
                 code = code.replace("{PORT}", str(HTTP_PORT))
                 
             plugin_dir = f"{server_dir}/Plugins/{folder_name}"
             pathlib.Path(plugin_dir).mkdir(parents=True, exist_ok=True)
             
-            # main.lua dosyasını yaz
             pathlib.Path(f"{plugin_dir}/main.lua").write_text(code + "\n", encoding="utf-8")
             
-            # Cuberite'ın eklentiyi görmesi için zorunlu olan Info.lua dosyasını dinamik oluştur
             info_content = f'g_PluginInfo = {{Name="{folder_name}", Version="1"}}'
             pathlib.Path(f"{plugin_dir}/Info.lua").write_text(info_content + "\n", encoding="utf-8")
             
@@ -152,7 +151,6 @@ def update_and_configure(server_dir=SERVER_DIR):
         except Exception as e:
             log_msg(f"[GÜNCELLEME HATA] {script_name} çekilemedi: {e}")
             
-    # settings.ini dosyasını indirilen listeye göre dinamik olarak baştan yarat
     plugins_ini = "\n".join([f"Plugin={name}" for name in plugin_names])
     settings_ini = f"""
 [Authentication]
@@ -283,60 +281,67 @@ class PlayerConn:
         if self.current_label == target_label: return
         self.is_swapping = True
         self.play_state = False
-        
-        msg = json.dumps({"text": f"§a{target_label} sunucusuna geciliyor... Envanter senkronize ediliyor.", "color": "yellow"})
-        self.client_w.write(pkt_make(0x02, mc_str_enc(msg) + bytes([0]), self.comp))
-        await self.client_w.drain()
 
-        if self.server_w:
-            self.server_w.close()
-            self.server_w = None
-            self.server_r = None
-
-        # DÜZELTME: Eski sunucunun sıkıştırma eşiğini sıfırla.
-        # Sıfırlanmazsa yeni sunucudan gelen ham paketler yanlış
-        # ayrıştırılır ve bağlantı anında kopar.
-        self.comp = -1
-            
-        await asyncio.sleep(2.5)
-        
-        srv = await self.get_target_server(target_label)
-        if not srv:
-            msg = json.dumps({"text": f"§c{target_label} baglantisi basarisiz!", "color": "red"})
+        # DÜZELTME #1: hot_swap() hata durumunda is_swapping=True kalıyordu.
+        # Yeni sunucuya bağlantı veya paket okuma sırasında istisna atılırsa
+        # pipe_c2s / pipe_s2c döngüleri kalıcı olarak askıya alınıyordu.
+        # Çözüm: tüm swap işlemi try/finally içine alındı; is_swapping her
+        # koşulda (başarı, hata, iptal) finally bloğunda sıfırlanır.
+        try:
+            msg = json.dumps({"text": f"§a{target_label} sunucusuna geciliyor... Envanter senkronize ediliyor.", "color": "yellow"})
             self.client_w.write(pkt_make(0x02, mc_str_enc(msg) + bytes([0]), self.comp))
-            self.is_swapping = False
-            return
+            await self.client_w.drain()
 
-        self.server_r, self.server_w = await asyncio.open_connection(srv['host'], srv['port'], limit=2**20)
-        
-        hs = vi_enc(47) + mc_str_enc(srv['host']) + struct.pack(">H", srv['port']) + vi_enc(2)
-        self.server_w.write(pkt_make(0x00, hs, -1))
-        self.server_w.write(pkt_make(0x00, mc_str_enc(self.username), -1))
-        await self.server_w.drain()
-        
-        while True:
-            pid, payload, raw = await pkt_read(self.server_r, self.comp)
-            if pid == 0x01:
-                dim = payload[4]
-                respawn_fake = struct.pack(">i", -1 if dim == 0 else 0) + payload[5:8] + mc_str_enc("default")
-                respawn_real = struct.pack(">i", dim) + payload[5:8] + mc_str_enc("default")
+            if self.server_w:
+                self.server_w.close()
+                self.server_w = None
+                self.server_r = None
+
+            # Eski sunucunun sıkıştırma eşiğini sıfırla.
+            self.comp = -1
                 
-                self.client_w.write(pkt_make(0x07, respawn_fake, self.comp))
-                self.client_w.write(pkt_make(0x07, respawn_real, self.comp))
-                
-                pos = struct.pack(">dddff", 0.0, 5.0, 0.0, 0.0, 0.0) + bytes([0])
-                self.client_w.write(pkt_make(0x08, pos, self.comp))
-                await self.client_w.drain()
-                
-                self.current_label = target_label
-                self.play_state = True
-                self.is_swapping = False
-                
-                import aiosqlite
-                async with aiosqlite.connect(DB_FILE) as db:
-                    await db.execute("UPDATE players SET last_server=? WHERE username=?", (target_label, self.username))
-                    await db.commit()
-                break
+            await asyncio.sleep(2.5)
+            
+            srv = await self.get_target_server(target_label)
+            if not srv:
+                msg = json.dumps({"text": f"§c{target_label} baglantisi basarisiz!", "color": "red"})
+                self.client_w.write(pkt_make(0x02, mc_str_enc(msg) + bytes([0]), self.comp))
+                return  # finally is_swapping'i sıfırlar
+
+            self.server_r, self.server_w = await asyncio.open_connection(srv['host'], srv['port'], limit=2**20)
+            
+            hs = vi_enc(47) + mc_str_enc(srv['host']) + struct.pack(">H", srv['port']) + vi_enc(2)
+            self.server_w.write(pkt_make(0x00, hs, -1))
+            self.server_w.write(pkt_make(0x00, mc_str_enc(self.username), -1))
+            await self.server_w.drain()
+            
+            while True:
+                pid, payload, raw = await pkt_read(self.server_r, self.comp)
+                if pid == 0x01:
+                    dim = payload[4]
+                    respawn_fake = struct.pack(">i", -1 if dim == 0 else 0) + payload[5:8] + mc_str_enc("default")
+                    respawn_real = struct.pack(">i", dim) + payload[5:8] + mc_str_enc("default")
+                    
+                    self.client_w.write(pkt_make(0x07, respawn_fake, self.comp))
+                    self.client_w.write(pkt_make(0x07, respawn_real, self.comp))
+                    
+                    pos = struct.pack(">dddff", 0.0, 5.0, 0.0, 0.0, 0.0) + bytes([0])
+                    self.client_w.write(pkt_make(0x08, pos, self.comp))
+                    await self.client_w.drain()
+                    
+                    self.current_label = target_label
+                    self.play_state = True
+                    
+                    import aiosqlite
+                    async with aiosqlite.connect(DB_FILE) as db:
+                        await db.execute("UPDATE players SET last_server=? WHERE username=?", (target_label, self.username))
+                        await db.commit()
+                    return  # Başarılı — finally is_swapping'i sıfırlar
+        except Exception as e:
+            log_msg(f"[SWAP] {self.username} sunucu geçiş hatası: {e}")
+        finally:
+            # Başarı, hata veya erken return ne olursa olsun is_swapping sıfırlanır.
+            self.is_swapping = False
             
     async def pipe_c2s(self):
         while True:
@@ -642,6 +647,9 @@ async function sendCommand() {{
             return
 
         if self.path == "/api/servers":
+            # DÜZELTME #5: Gameserver modunda PROXY_URL boşsa artık hub DB'ye
+            # düşmek yerine 503 dönüyor. Hub DB gameserver'da bulunmaz, bu
+            # çağrı her zaman hatayla veya boş veriyle sonuçlanıyordu.
             if MODE == "gameserver":
                 proxy_url = os.environ.get("PROXY_URL", "")
                 if proxy_url:
@@ -650,7 +658,9 @@ async function sendCommand() {{
                         resp = urllib.request.urlopen(req, timeout=15).read()
                         self.send_response(200); self.end_headers(); self.wfile.write(resp)
                     except Exception as e:
-                        self.send_response(500); self.end_headers()
+                        self.send_response(502); self.end_headers()
+                else:
+                    self.send_response(503); self.end_headers()
                 return
 
             try:
@@ -666,7 +676,6 @@ async function sendCommand() {{
     def do_POST(self):
         global _cmd_counter, _last_script_update
 
-        # YENİ SCRIPT GÜNCELLEME ENDPOINT'İ (Dinamik Liste Üzerinden)
         if self.path == "/api/update_scripts":
             success = update_and_configure()
             if success:
@@ -688,15 +697,17 @@ async function sendCommand() {{
                     _cmd_counter += 1
                     _cmd_history.append({"id": _cmd_counter, "cmd": cmd})
                     if len(_cmd_history) > 100: _cmd_history.pop(0)
-
                     _write_to_cuberite(cmd)
                     log_msg(f"[WEB-KOMUT] {cmd} (Ağdaki tüm sunuculara iletiliyor...)")
                     self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
                 else:
                     self.send_response(400)
+                    self.send_header("Content-Type", "application/json")
             except Exception as e:
                 log_msg(f"[WEB-KOMUT HATA] {e}")
                 self.send_response(500)
+                self.send_header("Content-Type", "application/json")
             self.end_headers()
             return
             
@@ -762,7 +773,7 @@ async function sendCommand() {{
         if self.path.startswith("/api/restart"):
             label = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get('label', [''])[0]
             if not label:
-                self.send_response(400); self.end_headers()
+                self.send_response(400); self.send_header("Content-Type","application/json"); self.end_headers()
                 self.wfile.write(json.dumps({"ok": False, "message": "label parametresi eksik"}).encode())
                 return
             try:
@@ -941,10 +952,12 @@ def run_bore_for_gameserver():
                     update_and_configure()
                     _write_to_cuberite("reload")
 
-            except Exception as e:
+            except Exception:
+                # DÜZELTME #4: Ağ hatası sonrası gönderilemeyen loglar kayboluyordu.
+                # Eski kod: insert(0, l) döngüsü ile O(n²) yeniden ekleme yapıyordu.
+                # Yeni kod: tek seferde listenin başına birleştiriyor (O(n)).
                 with _LOG_LOCK:
-                    for l in reversed(logs_to_send):
-                        _pending_remote_logs.insert(0, l)
+                    _pending_remote_logs = logs_to_send + _pending_remote_logs
 
     threading.Thread(target=heartbeat, daemon=True).start()
     threading.Thread(target=sync_loop, daemon=True).start()
@@ -964,7 +977,7 @@ def run_bore_for_gameserver():
         time.sleep(5)
 
 def run_cuberite():
-    update_and_configure() # Baslarken github'daki dinamik listeden son eklentileri ceker
+    update_and_configure()
     mc_bin = next(iter(glob.glob("/server/**/Cuberite", recursive=True)), None)
     if not mc_bin: return
     os.chmod(mc_bin, 0o755)
@@ -991,15 +1004,17 @@ def run_cuberite():
                             p.parent.mkdir(parents=True, exist_ok=True); p.write_bytes(data)
                         time.sleep(1.0)
                         _write_to_cuberite(f"wcreload {name}")
-                    except Exception as e: pass
+                    except Exception: pass
                 threading.Thread(target=_do_join, args=(line,), daemon=True).start()
-                
-            elif "WCSYNC_QUIT:" in line or "WCSYNC_SAVE:" in line:
+
+            # DÜZELTME #2: WCSYNC_SAVE: etiketi wcsync.lua tarafından hiçbir zaman
+            # gönderilmiyordu; iki etiket için tek bir dal kullanılıyordu ama
+            # WCSYNC_SAVE kodu dead code'du. Tek WCSYNC_QUIT dalına sadeleştirildi.
+            elif "WCSYNC_QUIT:" in line:
                 def _do_upload(ln):
                     try:
                         time.sleep(1.0)
-                        tag = "WCSYNC_QUIT:" if "WCSYNC_QUIT:" in ln else "WCSYNC_SAVE:"
-                        name, uuid = ln.split(tag)[1].strip().split(":")
+                        name, uuid = ln.split("WCSYNC_QUIT:")[1].strip().split(":")
                         uuid_clean = uuid.replace("-", "")
                         p1 = pathlib.Path(f"{persistent_world}/players/{uuid}.json")
                         p2 = pathlib.Path(f"{persistent_world}/players/{uuid_clean}.json")
@@ -1007,7 +1022,7 @@ def run_cuberite():
                         if target_p:
                             req = urllib.request.Request(f"{proxy_url}/api/player_file?name={name}", data=target_p.read_bytes(), method="POST")
                             urllib.request.urlopen(req, timeout=5)
-                    except Exception as e: pass
+                    except Exception: pass
                 threading.Thread(target=_do_upload, args=(line,), daemon=True).start()
 
     while True:
