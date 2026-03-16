@@ -5,7 +5,7 @@
   • FIX: MySQL iptal edildi, Tam Otomatik SQLite (Tak-Çalıştır) geri döndü!
   • FIX: Kurt (/kurt) sistemi icin 'GetWolfType' Tarayicisi devrede.
   • WEB: Canli Konsol (Terminal) aktif.
-  • GUI: Saf Sohbet UI & Hub Menüsü devrede.
+  • GITHUB: Lua betikleri artik dinamik olarak GitHub'dan cekiliyor.
 """
 
 import asyncio, json, os, pathlib, struct, sys
@@ -77,7 +77,7 @@ async def init_db():
         log_msg(f"[DB] HATA: Veritabani Olusturulamadi -> {e}")
 
 # ══════════════════════════════════════════════════════════
-#  LUA EKLENTİLERİ (WCSync, WCHub, Yaver)
+#  YAPILANDIRMA VE GITHUB SCRIPT GÜNCELLEYİCİ
 # ══════════════════════════════════════════════════════════
 
 SETTINGS_INI = f"""
@@ -99,436 +99,49 @@ Ports={CUBERITE_PORT}
 NetworkCompressionThreshold=-1
 """
 
-WCSYNC_MAIN = """
-function Initialize(Plugin)
-    Plugin:SetName("WCSync")
-    Plugin:SetVersion(3)
-    cPluginManager:AddHook(cPluginManager.HOOK_PLAYER_JOINED, OnPlayerJoined)
-    cPluginManager:AddHook(cPluginManager.HOOK_PLAYER_DESTROYED, OnPlayerDestroyed)
-    cPluginManager:BindConsoleCommand("wcreload", HandleConsoleReload, "Python tetikleyici")
-    cRoot:Get():GetDefaultWorld():ScheduleTask(200, PeriodicSave)
-    LOG("[SYNC] WCSync aktif! Anti-Dupe devrede.")
-    return true
-end
-function PeriodicSave(World)
-    World:ForEachPlayer(function(Player)
-        LOG("WCSYNC_SAVE:" .. Player:GetName() .. ":" .. Player:GetUUID())
-    end)
-    World:ScheduleTask(200, PeriodicSave)
-end
-function OnPlayerJoined(Player) LOG("WCSYNC_JOIN:" .. Player:GetName() .. ":" .. Player:GetUUID()) end
-function OnPlayerDestroyed(Player)
-    LOG("WCSYNC_QUIT:" .. Player:GetName() .. ":" .. Player:GetUUID())
-end
-function HandleConsoleReload(Split)
-    if #Split > 1 then
-        cRoot:Get():FindAndDoWithPlayer(Split[2], function(P)
-            P:SendMessageSuccess("Envanteriniz merkezden esitlendi!")
-        end)
-    end
-    return true
-end
-"""
-
-def _make_wchub_lua(port):
-    return ("""
-local ProxyURL = "http://127.0.0.1:{PORT}" """.replace("{PORT}", str(port)) + """
-local function Split(str, sep)
-    local res = {}
-    for w in string.gmatch(str, "([^"..sep.."]+)") do table.insert(res, w) end
-    return res
-end
-function Initialize(Plugin)
-    Plugin:SetName("WCHub")
-    Plugin:SetVersion(12)
-    cPluginManager:AddHook(cPluginManager.HOOK_PLAYER_SPAWNED, OnPlayerSpawned)
-    cPluginManager:AddHook(cPluginManager.HOOK_EXECUTE_COMMAND, OnCommand)
-    LOG("[HUB] WCHub Saf Sohbet Sistemi Aktif!")
-    return true
-end
-function OnPlayerSpawned(Player)
-    Player:GetWorld():ScheduleTask(20, function() SendServerList(Player) end)
-end
-function OnCommand(Player, CommandSplit, EntireCommand)
-    local cmd = string.lower(CommandSplit[1] or "")
-    if cmd == "/hub" or cmd == "/sunucu" then
-        SendServerList(Player)
-        return true
-    end
-    return false
-end
-function SendServerList(Player)
-    local PlayerName = Player:GetName()
-    local World = Player:GetWorld()
-    if type(cUrlClient) == "nil" then return end
-    cUrlClient:Get(ProxyURL .. "/api/servers", {
-        OnSuccess = function(Body)
-            World:ScheduleTask(0, function()
-                local TargetPlayer = nil
-                cRoot:Get():FindAndDoWithPlayer(PlayerName, function(P) TargetPlayer = P end)
-                if not TargetPlayer or not Body or Body == "" then return end
-
-                TargetPlayer:SendMessageInfo(" ")
-                TargetPlayer:SendMessageInfo("§8§m                                     ")
-                TargetPlayer:SendMessageInfo("§3§l      ♦ WC NETWORK AĞI ♦      ")
-                TargetPlayer:SendMessageInfo("§7  Hızlı geçiş için hedefe tıklayın:")
-                TargetPlayer:SendMessageInfo(" ")
-
-                local servers = Split(Body, ";")
-                for i, srv in ipairs(servers) do
-                    local parts = Split(srv, ":")
-                    if #parts == 2 then
-                        local msg = cCompositeChat()
-                        msg:ParseText("  §8▪ §b" .. parts[1] .. " §7(Aktif: §e" .. parts[2] .. "§7)   ")
-                        msg:AddRunCommandPart("§a§n[BAĞLAN]", "/wc_transfer " .. parts[1])
-                        TargetPlayer:SendMessage(msg)
-                    end
-                end
-                TargetPlayer:SendMessageInfo("§8§m                                     ")
-                TargetPlayer:SendMessageInfo(" ")
-            end)
-        end
-    })
-end
-""")
-
-YAVER_MAIN = """
-local ActiveWolves = {}
-local Ini = nil
-
-local function Split(str, sep)
-    local res = {}
-    for w in string.gmatch(str, "([^"..sep.."]+)") do table.insert(res, w) end
-    return res
-end
-
-local function DoWithPlayer(UUID, Callback)
-    cRoot:Get():ForEachPlayer(function(P)
-        if P:GetUUID() == UUID then Callback(P) end
-    end)
-end
-
-local function GetWolfType()
-    if cMonster and cMonster.mtWolf then return cMonster.mtWolf end
-    local wt = nil
-    if cMonster and cMonster.StringToMobType then
-        pcall(function() wt = cMonster.StringToMobType("wolf") end)
-        if wt and wt ~= -1 then return wt end
-        pcall(function() wt = cMonster.StringToMobType("Wolf") end)
-        if wt and wt ~= -1 then return wt end
-    end
-    if mtWolf then return mtWolf end
-    return 95 
-end
-
-local function IsWolf(Entity)
-    if not Entity or not Entity:IsMob() then return false end
-    local t = Entity:GetMobType()
-    local wt = GetWolfType()
-    return (t == wt) or (t == 95)
-end
-
-function Initialize(Plugin)
-    Plugin:SetName("yaver")
-    Plugin:SetVersion(11)
-    
-    Ini = cIniFile()
-    Ini:ReadFile("YaverData.ini")
-    
-    cPluginManager:AddHook(cPluginManager.HOOK_PLAYER_SPAWNED, OnPlayerSpawned)
-    cPluginManager:AddHook(cPluginManager.HOOK_PLAYER_DESTROYED, OnPlayerDestroyed)
-    cPluginManager:AddHook(cPluginManager.HOOK_PLAYER_RIGHT_CLICKING_ENTITY, OnRightClickingEntity)
-    cPluginManager:AddHook(cPluginManager.HOOK_TAKE_DAMAGE, OnTakeDamage)
-    cPluginManager:AddHook(cPluginManager.HOOK_KILLED, OnKilled)
-    
-    cPluginManager:BindCommand("/kurt", "", HandleKurtCommand, "Koruyucu kurdunu yanina cagirir.")
-    
-    cRoot:Get():GetDefaultWorld():ScheduleTask(20 * 2, PeriodicWolfTask)
-    LOG("[YAVER] Saf Obje Modu, Anti-Disconnect ve NIL Fix Sistemi Aktif!")
-    return true
-end
-
--- ================= XP ve Seviye Sistemi =================
-function GetWolfLevel(UUID) return Ini:GetValueI(UUID, "Level", 1) end
-function GetWolfXP(UUID) return Ini:GetValueI(UUID, "XP", 0) end
-
-function AddWolfXP(UUID, Amount)
-    local lvl = GetWolfLevel(UUID)
-    local xp = GetWolfXP(UUID) + Amount
-    local req = lvl * 100
-    
-    if xp >= req then
-        lvl = lvl + 1
-        xp = 0
-        Ini:SetValueI(UUID, "Level", lvl)
-        
-        DoWithPlayer(UUID, function(Player)
-            Player:SendMessageSuccess("§6[Yaver] §aKoruyucu Kurdun Seviye Atladi! Yeni Seviye: §e" .. lvl)
-            local WolfID = ActiveWolves[UUID]
-            if WolfID then
-                Player:GetWorld():DoWithEntityByID(WolfID, function(Ent)
-                    Ent:SetCustomName("§b" .. Player:GetName() .. " §7Kurdu §e[Lv " .. lvl .. "] §8| §a(Shift+Tık)")
-                    local Monster = tolua.cast(Ent, "cMonster")
-                    if Monster then
-                        local maxHp = 20 + (lvl * 2)
-                        Monster:SetMaxHealth(maxHp)
-                        Monster:Heal(maxHp)
-                    end
-                    pcall(function() Player:GetWorld():BroadcastEntityAnimation(Ent, 18) end)
-                end)
-            end
-        end)
-    end
-    Ini:SetValueI(UUID, "XP", xp)
-    Ini:WriteFile("YaverData.ini")
-end
-
--- ================= Kurt Cantasi (Envanter) =================
-function GetBackpack(UUID)
-    local Window = cLuaWindow(cWindow.wtChest, 3, "§8Yaver Cantasi")
-    local InvIni = cIniFile()
-    InvIni:ReadFile("YaverInv.ini")
-    for i=0, 26 do
-        local str = InvIni:GetValue(UUID, "Slot_"..i, "")
-        if str ~= "" then
-            local parts = Split(str, ";")
-            local Itm = cItem(tonumber(parts[1] or 0), tonumber(parts[2] or 0), tonumber(parts[3] or 0))
-            Window:SetSlot(nil, i, Itm)
-        end
-    end
-    Window:SetOnClosed(function(a_Window, a_Player)
-        local Ini2 = cIniFile()
-        Ini2:ReadFile("YaverInv.ini")
-        for i=0, 26 do
-            local Itm = a_Window:GetSlot(a_Player, i)
-            if not Itm:IsEmpty() then
-                Ini2:SetValue(UUID, "Slot_"..i, Itm.m_ItemType .. ";" .. Itm.m_ItemCount .. ";" .. Itm.m_ItemDamage)
-            else
-                Ini2:SetValue(UUID, "Slot_"..i, "")
-            end
-        end
-        Ini2:WriteFile("YaverInv.ini")
-    end)
-    return Window
-end
-
--- ================= Kurt Çagirma =================
-function SpawnWolfForPlayer(Player)
-    local UUID = Player:GetUUID()
-    local World = Player:GetWorld()
-    
-    if ActiveWolves[UUID] then
-        World:DoWithEntityByID(ActiveWolves[UUID], function(Ent) Ent:Destroy() end)
-        ActiveWolves[UUID] = nil
-    end
-    
-    local WolfType = GetWolfType()
-    local WolfID = World:SpawnMob(Player:GetPosX(), Player:GetPosY() + 1.0, Player:GetPosZ(), WolfType)
-    
-    if WolfID and WolfID ~= cEntity.INVALID_ID then
-        ActiveWolves[UUID] = WolfID
-        
-        World:DoWithEntityByID(WolfID, function(Ent)
-            local lvl = GetWolfLevel(UUID)
-            Ent:SetCustomName("§b" .. Player:GetName() .. " §7Kurdu §e[Lv " .. lvl .. "] §8| §a(Shift+Tık)")
-            Ent:SetCustomNameAlwaysVisible(true)
-            
-            local Monster = tolua.cast(Ent, "cMonster")
-            if Monster then
-                local maxHp = 20 + (lvl * 2)
-                Monster:SetMaxHealth(maxHp)
-                Monster:SetHealth(maxHp)
-            end
-        end)
-    else
-        Player:SendMessageFailure("§cOyun motoru kurt uretemedi.")
-    end
-end
-
--- MANUEL KURT CAGIRMA KOMUTU
-function HandleKurtCommand(Split, Player)
-    local UUID = Player:GetUUID()
-    if ActiveWolves[UUID] then
-        Player:SendMessageWarning("§eKurdun zaten aktif! Yanina isinlaniyor...")
-        Player:GetWorld():DoWithEntityByID(ActiveWolves[UUID], function(Ent)
-            Ent:TeleportToEntity(Player)
-        end)
-    else
-        SpawnWolfForPlayer(Player)
-        Player:SendMessageSuccess("§aSadik kurdun yanina cagirildi!")
-    end
-    return true
-end
-
-function OnPlayerSpawned(Player)
-    local UUID = Player:GetUUID()
-    if not ActiveWolves[UUID] then
-        Player:GetWorld():ScheduleTask(40, function()
-            DoWithPlayer(UUID, function(P) SpawnWolfForPlayer(P) end)
-        end)
-    end
-end
-
-function OnPlayerDestroyed(Player)
-    local UUID = Player:GetUUID()
-    local WolfID = ActiveWolves[UUID]
-    if WolfID then
-        Player:GetWorld():DoWithEntityByID(WolfID, function(Ent) Ent:Destroy() end)
-        ActiveWolves[UUID] = nil
-    end
-end
-
--- ================= Etkilesim =================
-function OnRightClickingEntity(Player, Entity)
-    if IsWolf(Entity) then
-        local UUID = Player:GetUUID()
-        if ActiveWolves[UUID] == Entity:GetUniqueID() then
-            
-            if Player:IsCrouched() then
-                Player:ExecuteCommand("/hub")
-                return true
-            end
-            
-            local Item = Player:GetEquippedItem()
-            local MeatIDs = { [319]=true, [320]=true, [363]=true, [364]=true, [365]=true, [366]=true, [367]=true, [423]=true, [424]=true, [411]=true, [412]=true }
-            
-            if MeatIDs[Item.m_ItemType] then
-                Item.m_ItemCount = Item.m_ItemCount - 1
-                if Item.m_ItemCount <= 0 then Item:Empty() end
-                Player:GetInventory():SetEquippedItem(Item)
-                
-                local Monster = tolua.cast(Entity, "cMonster")
-                if Monster then Monster:Heal(10) end
-                
-                pcall(function() Player:GetWorld():BroadcastEntityAnimation(Entity, 18) end)
-                AddWolfXP(UUID, 50)
-                Player:SendMessageInfo("§6[Yaver] §aKurdunu besledin! (+50 XP, +10 Can)")
-            else
-                local Window = GetBackpack(UUID)
-                Player:OpenWindow(Window)
-            end
-            return true
-        end
-    end
-    return false
-end
-
--- ================= Savas ve Hasar (Özel AI ve Dost Ateşi Koruması) =================
-function OnTakeDamage(Receiver, TCA)
-    local Attacker = TCA.Attacker
-    if not Attacker then return false end
-    
-    if IsWolf(Receiver) and Attacker:IsPlayer() then
-        for uuid, wid in pairs(ActiveWolves) do
-            if wid == Receiver:GetUniqueID() and uuid == Attacker:GetUUID() then
-                return true 
-            end
-        end
-    end
-    
-    if Receiver:IsPlayer() and IsWolf(Attacker) then
-        for uuid, wid in pairs(ActiveWolves) do
-            if wid == Attacker:GetUniqueID() and uuid == Receiver:GetUUID() then
-                return true 
-            end
-        end
-    end
-    
-    if IsWolf(Attacker) then
-        for uuid, wid in pairs(ActiveWolves) do
-            if wid == Attacker:GetUniqueID() then
-                local lvl = GetWolfLevel(uuid)
-                TCA.FinalDamage = TCA.FinalDamage + (lvl * 1.5)
-                AddWolfXP(uuid, 5)
-            end
-        end
-    end
-    
-    if Receiver:IsPlayer() then
-        local UUID = Receiver:GetUUID()
-        local WolfID = ActiveWolves[UUID]
-        if WolfID and Attacker:GetUniqueID() ~= WolfID then
-            Receiver:GetWorld():DoWithEntityByID(WolfID, function(Ent)
-                local Wolf = tolua.cast(Ent, "cMonster")
-                if Wolf then Wolf:MoveToPosition(Attacker:GetPosition()) end
-            end)
-        end
-    end
-end
-
-function OnKilled(Victim, TCA, CustomDeathMessage)
-    local Attacker = TCA.Attacker
-    
-    if IsWolf(Victim) then
-        for uuid, wid in pairs(ActiveWolves) do
-            if wid == Victim:GetUniqueID() then
-                ActiveWolves[uuid] = nil
-                DoWithPlayer(uuid, function(P)
-                    P:SendMessageWarning("§cKoruyucu kurdun ağır yaralandı! 30 saniye içinde iyileşip dönecek.")
-                end)
-                
-                Victim:GetWorld():ScheduleTask(20 * 30, function()
-                    DoWithPlayer(uuid, function(Player)
-                        SpawnWolfForPlayer(Player)
-                        Player:SendMessageSuccess("§aKoruyucu kurdun iyileşti ve yanına döndü!")
-                    end)
-                end)
-                break
-            end
-        end
-    end
-    
-    if Attacker and Attacker:IsPlayer() then
-        local uuid = Attacker:GetUUID()
-        if ActiveWolves[uuid] then AddWolfXP(uuid, 25) end
-    end
-end
-
--- ================= Periyodik Kontrol (AI & Işınlanma) =================
-function PeriodicWolfTask(World)
-    World:ForEachPlayer(function(Player)
-        local UUID = Player:GetUUID()
-        local WolfID = ActiveWolves[UUID]
-        if WolfID then
-            World:DoWithEntityByID(WolfID, function(Ent)
-                local dist = (Ent:GetPosition() - Player:GetPosition()):Length()
-                
-                if dist > 15 then 
-                    Ent:TeleportToEntity(Player) 
-                elseif dist > 4 then
-                    local Wolf = tolua.cast(Ent, "cMonster")
-                    if Wolf then Wolf:MoveToPosition(Player:GetPosition()) end
-                end
-                
-                local lvl = GetWolfLevel(UUID)
-                if lvl >= 5 then Player:AddEntityEffect(cEntityEffect.effSpeed, 20*4, 0) end
-                if lvl >= 10 then Player:AddEntityEffect(cEntityEffect.effStrength, 20*4, 0) end
-                if lvl >= 20 then Player:AddEntityEffect(cEntityEffect.effRegeneration, 20*4, 0) end
-                
-                local Monster = tolua.cast(Ent, "cMonster")
-                if Monster and Monster:GetHealth() < Monster:GetMaxHealth() then Monster:Heal(1) end
-            end)
-        end
-    end)
-    World:ScheduleTask(20 * 2, PeriodicWolfTask)
-end
-"""
-
 def write_configs(server_dir=SERVER_DIR):
     files = {
         f"{server_dir}/settings.ini": SETTINGS_INI.strip(),
         f"{server_dir}/Plugins/WCSync/Info.lua": 'g_PluginInfo = {Name="WCSync", Version="3"}',
-        f"{server_dir}/Plugins/WCSync/main.lua": WCSYNC_MAIN.strip(),
         f"{server_dir}/Plugins/WCHub/Info.lua": 'g_PluginInfo = {Name="WCHub", Version="12"}',
-        f"{server_dir}/Plugins/WCHub/main.lua": _make_wchub_lua(HTTP_PORT).strip(),
         f"{server_dir}/Plugins/yaver/Info.lua": 'g_PluginInfo = {Name="yaver", Version="11"}',
-        f"{server_dir}/Plugins/yaver/main.lua": YAVER_MAIN.strip(),
     }
     for path, content in files.items():
         try:
             pathlib.Path(path).parent.mkdir(parents=True, exist_ok=True)
             pathlib.Path(path).write_text(content + "\n", encoding="utf-8")
         except Exception: pass
+
+def update_lua_scripts(server_dir=SERVER_DIR):
+    """GitHub reposundan Lua betiklerini çeker ve günceller."""
+    base_url = "https://raw.githubusercontent.com/Exma0/wc/main/lua"
+    success_count = 0
+    scripts = {
+        "wcsync.lua": f"{server_dir}/Plugins/WCSync/main.lua",
+        "wchub.lua": f"{server_dir}/Plugins/WCHub/main.lua",
+        "yaver.lua": f"{server_dir}/Plugins/yaver/main.lua"
+    }
+    
+    log_msg("[GÜNCELLEME] GitHub'dan Lua betikleri kontrol ediliyor...")
+    for repo_file, local_path in scripts.items():
+        try:
+            req = urllib.request.Request(f"{base_url}/{repo_file}")
+            code = urllib.request.urlopen(req, timeout=10).read().decode('utf-8')
+            
+            # WCHub içerisindeki proxy portunu dinamik olarak enjekte et
+            if repo_file == "wchub.lua":
+                code = code.replace("{PORT}", str(HTTP_PORT))
+                
+            pathlib.Path(local_path).parent.mkdir(parents=True, exist_ok=True)
+            pathlib.Path(local_path).write_text(code + "\n", encoding="utf-8")
+            success_count += 1
+        except Exception as e:
+            log_msg(f"[GÜNCELLEME HATA] {repo_file} çekilemedi: {e}")
+            
+    if success_count == len(scripts):
+        log_msg("[GÜNCELLEME] Tüm Lua betikleri başarıyla güncellendi.")
+        return True
+    return False
 
 # ══════════════════════════════════════════════════════════
 #  PROTOKOL
@@ -774,7 +387,7 @@ async def handle_player(cr, cw):
     await PlayerConn(cr, cw).run()
 
 # ══════════════════════════════════════════════════════════
-#  HTTP API VE JSON PANEL EKLENTİSİ (SQLite UYARLI)
+#  HTTP API VE JSON PANEL EKLENTİSİ
 # ══════════════════════════════════════════════════════════
 
 class HttpHandler(http.server.BaseHTTPRequestHandler):
@@ -829,7 +442,8 @@ class HttpHandler(http.server.BaseHTTPRequestHandler):
   .btn{{border:none;border-radius:6px;padding:6px 14px;cursor:pointer;font-size:.8rem;font-weight:600;transition:.15s}}
   .btn-danger{{background:#da3633;color:#fff}} .btn-danger:hover{{background:#f85149}}
   .btn-warn{{background:#9e6a03;color:#fff}} .btn-warn:hover{{background:#d29922}}
-  .btn-warn:disabled,.btn-danger:disabled{{opacity:.4;cursor:not-allowed}}
+  .btn-success{{background:#238636;color:#fff}} .btn-success:hover{{background:#2ea043}}
+  .btn-warn:disabled,.btn-danger:disabled,.btn-success:disabled{{opacity:.4;cursor:not-allowed}}
   .actions{{display:flex;gap:10px;align-items:center;margin-bottom:20px}}
   #toast{{position:fixed;bottom:24px;right:24px;background:#238636;color:#fff;padding:12px 20px;border-radius:8px;font-size:.85rem;display:none;z-index:99;border:1px solid #2ea043}}
   #toast.err{{background:#da3633;border-color:#f85149}}
@@ -852,6 +466,7 @@ class HttpHandler(http.server.BaseHTTPRequestHandler):
 <div class="section-title">Sunucular</div>
 <div class="actions">
   <button class="btn btn-danger" id="restartAllBtn" onclick="restartAll()">🔄 Tüm Sunucuları Yeniden Başlat</button>
+  <button class="btn btn-success" id="updateScriptsBtn" onclick="updateScripts()">📥 Script Güncelle (GitHub)</button>
   <span id="statusMsg" style="color:#8b949e;font-size:.82rem"></span>
 </div>
 <table>
@@ -891,6 +506,18 @@ async function restartOne(label){{
     const d=await r.json();
     toast('✅ '+d.message);
   }}catch(e){{toast('❌ Hata: '+e,true);}}
+}}
+
+async function updateScripts(){{
+  const btn=document.getElementById('updateScriptsBtn');
+  btn.disabled=true; toast('GitHub dan scriptler çekiliyor...');
+  try{{
+    const r=await fetch('/api/update_scripts',{{method:'POST'}});
+    const d=await r.json();
+    if(d.ok) toast('✅ '+d.message);
+    else toast('❌ '+d.message, true);
+  }}catch(e){{toast('❌ Hata: '+e,true);}}
+  setTimeout(()=>{{btn.disabled=false;}},4000);
 }}
 
 let autoScroll = true;
@@ -996,6 +623,21 @@ async function sendCommand() {{
             except Exception: self.send_response(500); self.end_headers()
 
     def do_POST(self):
+        # YENI SCRIPT GUNCELLEME ENDPOINT'I
+        if self.path == "/api/update_scripts":
+            success = update_lua_scripts()
+            if success:
+                # Scriptler yenilendi, sunucuya aninda algilamasi icin reload at
+                if _cuberite_proc and _cuberite_proc.poll() is None:
+                    _cuberite_proc.stdin.write("reload\n")
+                    _cuberite_proc.stdin.flush()
+                self.send_response(200); self.send_header("Content-Type","application/json"); self.end_headers()
+                self.wfile.write(json.dumps({"ok": True, "message": "Scriptler GitHub'dan başarıyla güncellendi ve aktif edildi!"}).encode())
+            else:
+                self.send_response(500); self.send_header("Content-Type","application/json"); self.end_headers()
+                self.wfile.write(json.dumps({"ok": False, "message": "Scriptleri çekerken bir sorun yaşandı. Konsolu kontrol et."}).encode())
+            return
+            
         if self.path == "/api/command":
             length = int(self.headers.get("Content-Length", 0))
             try:
@@ -1193,6 +835,7 @@ def run_bore_for_gameserver():
 
 def run_cuberite():
     write_configs()
+    update_lua_scripts() # Baslarken github'dan son versionlari ceker
     mc_bin = next(iter(glob.glob("/server/**/Cuberite", recursive=True)), None)
     if not mc_bin: return
     os.chmod(mc_bin, 0o755)
