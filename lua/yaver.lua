@@ -1,4 +1,5 @@
 local ActiveWolves = {}
+local OpenBackpacks = {} -- YENİ: Menülerin ekranda kalmasını sağlayacak hafıza tablosu
 local Ini = nil
 
 local function Split(str, sep)
@@ -49,7 +50,7 @@ function Initialize(Plugin)
     cPluginManager:BindCommand("/kurt", "", HandleKurtCommand, "Koruyucu kurdunu yanina cagirir.")
     
     cRoot:Get():GetDefaultWorld():ScheduleTask(20 * 2, PeriodicWolfTask)
-    LOG("[YAVER] Saf Obje Modu, Anti-Disconnect ve NIL Fix Sistemi Aktif!")
+    LOG("[YAVER] Saf Obje Modu, Anti-Disconnect, NIL Fix ve Canta GC Sistemi Aktif!")
     return true
 end
 
@@ -93,6 +94,7 @@ function GetBackpack(UUID)
     local Window = cLuaWindow(cWindow.wtChest, 9, 3, "§8Yaver Cantasi")
     local InvIni = cIniFile()
     InvIni:ReadFile("YaverInv.ini")
+    
     for i=0, 26 do
         local str = InvIni:GetValue(UUID, "Slot_"..i, "")
         if str ~= "" then
@@ -101,19 +103,25 @@ function GetBackpack(UUID)
             Window:SetSlot(nil, i, Itm)
         end
     end
+    
     Window:SetOnClosed(function(a_Window, a_Player)
+        local P_UUID = a_Player:GetUUID()
         local Ini2 = cIniFile()
         Ini2:ReadFile("YaverInv.ini")
         for i=0, 26 do
             local Itm = a_Window:GetSlot(a_Player, i)
             if not Itm:IsEmpty() then
-                Ini2:SetValue(UUID, "Slot_"..i, Itm.m_ItemType .. ";" .. Itm.m_ItemCount .. ";" .. Itm.m_ItemDamage)
+                Ini2:SetValue(P_UUID, "Slot_"..i, Itm.m_ItemType .. ";" .. Itm.m_ItemCount .. ";" .. Itm.m_ItemDamage)
             else
-                Ini2:SetValue(UUID, "Slot_"..i, "")
+                Ini2:SetValue(P_UUID, "Slot_"..i, "")
             end
         end
         Ini2:WriteFile("YaverInv.ini")
+        
+        -- Oyuncu menüyü kapattığında hafızadan serbest bırak
+        OpenBackpacks[P_UUID] = nil
     end)
+    
     return Window
 end
 
@@ -210,6 +218,7 @@ function OnRightClickingEntity(Player, Entity)
                 Player:SendMessageInfo("§6[Yaver] §aKurdunu besledin! (+50 XP, +10 Can)")
             else
                 local Window = GetBackpack(UUID)
+                OpenBackpacks[UUID] = Window -- YENİ: Pencereyi hafızada tut, GC'nin silmesini engelle
                 Player:OpenWindow(Window)
             end
             return true
