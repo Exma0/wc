@@ -1,7 +1,8 @@
 FROM debian:bookworm-slim
 
+# curl bağımlılığına artık gerek kalmadığı için kurulumdan çıkarıldı
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl python3 ca-certificates libstdc++6 \
+    python3 ca-certificates libstdc++6 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
