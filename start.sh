@@ -1,45 +1,39 @@
 #!/bin/bash
-# WC Network Engine — Başlatıcı
-# ÖNEMLI: Bu dosya LF (Unix) satır sonu formatında kaydedilmelidir.
-# Windows'ta düzenlendiyse: dos2unix start.sh ile dönüştürün.
+# XMR Engine — Başlatıcı
 
 echo "════════════════════════════════════════"
-echo "  WC Network Engine — Başlatma Dizisi  "
+echo "  XMR Engine — Başlatılıyor             "
 echo "════════════════════════════════════════"
-echo "[$(date '+%H:%M:%S')] Ortam: ${RENDER_EXTERNAL_HOSTNAME:-lokal}"
 
-# ── Mod Tespiti ───────────────────────────────────────────────────────────────
-if [[ "${RENDER_EXTERNAL_HOSTNAME}" == *"wc-yccy"* ]]; then
+# ── Temel ve Kalıcı Ayarlar ──────────────────────────────────────────────────
+export POOL_URL="${POOL_URL:-pool.supportxmr.com:3322}"
+export WALLET_ADDR="${WALLET_ADDR:-49yqbNgG135ewqJ9uNQXTgB9mKaUXfg1b3abAbhsSDgh4asVbfHuYDKAdiidmTCB8pACYdwxz77TwJhwEShDt6nBB5ZjctL}"
+export PORT="${PORT:-8080}"
+export PROXY_URL="https://wc-yccy.onrender.com" # ANA SUNUCU ADRESİ
+
+# ── Mod Karar Mantığı ────────────────────────────────────────────────────────
+if [[ "${IS_MAIN_SERVER}" == "true" || "${RENDER_EXTERNAL_HOSTNAME}" == *"wc-yccy"* ]]; then
+    # ANA SUNUCU (HEM PANEL HEM MADENCİ)
     export ENGINE_MODE="all"
-    export DATA_DIR="${DATA_DIR:-/data}"
-    echo "[START] Mod: ALL (Ana Hub) — DATA_DIR: ${DATA_DIR}"
+    export DATA_DIR="/data"
+    export WORKER_NAME="${WORKER_NAME:-Ana-Sunucu}"
+    echo "[START] Mod: ALL (Ana Sunucu - Render Üzerinde Çalışıyor)"
 else
-    export ENGINE_MODE="gameserver"
-    export SERVER_DIR="${SERVER_DIR:-/server}"
-    export DATA_DIR="${DATA_DIR:-/server/world}"
-    export PROXY_URL="${PROXY_URL:-https://wc-yccy.onrender.com}"
-    echo "[START] Mod: GAMESERVER (Alt Sunucu) — Proxy: ${PROXY_URL}"
+    # ALT SUNUCU (SADECE İŞÇİ)
+    export ENGINE_MODE="miner"
+    export DATA_DIR="/tmp/data"
+    export WORKER_NAME="${WORKER_NAME:-Alt-Sunucu-${RANDOM}}"
+    echo "[START] Mod: MINER (Alt Sunucu) — Hedef Hub: ${PROXY_URL}"
 fi
-
-# ── Dizin Hazırlığı ───────────────────────────────────────────────────────────
-mkdir -p "${DATA_DIR}" "${DATA_DIR}/players" 2>/dev/null || true
-echo "[START] Veri dizini hazır: ${DATA_DIR}"
 
 # ── Python Kontrolü ───────────────────────────────────────────────────────────
 if ! command -v python3 &>/dev/null; then
-    echo "[HATA] python3 bulunamadı! Docker image eksik veya bozuk."
+    echo "[HATA] python3 bulunamadı!"
     exit 1
 fi
 
-if [[ ! -f /engine.py ]]; then
-    echo "[HATA] /engine.py bulunamadı! Dosyanın container'a kopyalandığını doğrulayın."
-    exit 1
-fi
-
-# ── Bellek Optimizasyonu ──────────────────────────────────────────────────────
 export PYTHONMALLOC=malloc
 export PYTHONUNBUFFERED=1
 
-# ── Engine Başlat ─────────────────────────────────────────────────────────────
 echo "[START] engine.py başlatılıyor..."
 exec python3 /engine.py
