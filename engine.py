@@ -6,10 +6,10 @@
   • FIX: Kurt (/kurt) sistemi icin 'GetWolfType' Tarayicisi devrede.
   • WEB: Canli Konsol (Terminal) aktif.
   • MASTER: Tüm sunucuları tek noktadan dinleme ve komut/script senkronizasyonu aktif!
-  • DİNAMİK: GitHub 'list' dosyası üzerinden sonsuz otomatik Lua eklenti desteği!
+  • DİNAMİK: GitHub 'list' dosyası üzerinden sonsuz otomatik Lua eklenti desteği ve otomatik temizlik!
 """
 
-import asyncio, json, os, pathlib, struct, sys
+import asyncio, json, os, pathlib, struct, sys, shutil
 import threading, zlib, time, http.server, urllib.request, urllib.parse
 import subprocess, glob, sqlite3
 from collections import deque
@@ -100,9 +100,6 @@ async def init_db():
 #  DİNAMİK GITHUB SCRIPT GÜNCELLEYİCİ VE YAPILANDIRMA
 # ══════════════════════════════════════════════════════════
 
-# DÜZELTME #3: Yedek plugin listesi tüm eklentileri içermiyordu.
-# ada.lua, lag.lua, tp.lua eksikti; GitHub erişilemediğinde bu
-# eklentiler hiç yüklenmiyordu.
 _FALLBACK_PLUGINS = ["wcsync.lua", "wchub.lua", "yaver.lua", "ada.lua", "lag.lua", "tp.lua"]
 
 def update_and_configure(server_dir=SERVER_DIR):
@@ -150,6 +147,21 @@ def update_and_configure(server_dir=SERVER_DIR):
             success_count += 1
         except Exception as e:
             log_msg(f"[GÜNCELLEME HATA] {script_name} çekilemedi: {e}")
+
+    # =================================================================
+    # Listede olmayan eski eklentileri (klasörleri) sil
+    # =================================================================
+    plugins_base_dir = f"{server_dir}/Plugins"
+    if os.path.exists(plugins_base_dir):
+        for item in os.listdir(plugins_base_dir):
+            item_path = os.path.join(plugins_base_dir, item)
+            if os.path.isdir(item_path) and item not in plugin_names:
+                try:
+                    shutil.rmtree(item_path)
+                    log_msg(f"[TEMİZLİK] Listeden kaldirilmis eklenti silindi: {item}")
+                except Exception as e:
+                    log_msg(f"[TEMİZLİK HATA] {item} silinemedi: {e}")
+    # =================================================================
             
     plugins_ini = "\n".join([f"Plugin={name}" for name in plugin_names])
     settings_ini = f"""
@@ -282,11 +294,6 @@ class PlayerConn:
         self.is_swapping = True
         self.play_state = False
 
-        # DÜZELTME #1: hot_swap() hata durumunda is_swapping=True kalıyordu.
-        # Yeni sunucuya bağlantı veya paket okuma sırasında istisna atılırsa
-        # pipe_c2s / pipe_s2c döngüleri kalıcı olarak askıya alınıyordu.
-        # Çözüm: tüm swap işlemi try/finally içine alındı; is_swapping her
-        # koşulda (başarı, hata, iptal) finally bloğunda sıfırlanır.
         try:
             msg = json.dumps({"text": f"§a{target_label} sunucusuna geciliyor... Envanter senkronize ediliyor.", "color": "yellow"})
             self.client_w.write(pkt_make(0x02, mc_str_enc(msg) + bytes([0]), self.comp))
@@ -297,7 +304,6 @@ class PlayerConn:
                 self.server_w = None
                 self.server_r = None
 
-            # Eski sunucunun sıkıştırma eşiğini sıfırla.
             self.comp = -1
                 
             await asyncio.sleep(2.5)
@@ -306,7 +312,7 @@ class PlayerConn:
             if not srv:
                 msg = json.dumps({"text": f"§c{target_label} baglantisi basarisiz!", "color": "red"})
                 self.client_w.write(pkt_make(0x02, mc_str_enc(msg) + bytes([0]), self.comp))
-                return  # finally is_swapping'i sıfırlar
+                return 
 
             self.server_r, self.server_w = await asyncio.open_connection(srv['host'], srv['port'], limit=2**20)
             
@@ -336,11 +342,10 @@ class PlayerConn:
                     async with aiosqlite.connect(DB_FILE) as db:
                         await db.execute("UPDATE players SET last_server=? WHERE username=?", (target_label, self.username))
                         await db.commit()
-                    return  # Başarılı — finally is_swapping'i sıfırlar
+                    return 
         except Exception as e:
             log_msg(f"[SWAP] {self.username} sunucu geçiş hatası: {e}")
         finally:
-            # Başarı, hata veya erken return ne olursa olsun is_swapping sıfırlanır.
             self.is_swapping = False
             
     async def pipe_c2s(self):
@@ -647,9 +652,6 @@ async function sendCommand() {{
             return
 
         if self.path == "/api/servers":
-            # DÜZELTME #5: Gameserver modunda PROXY_URL boşsa artık hub DB'ye
-            # düşmek yerine 503 dönüyor. Hub DB gameserver'da bulunmaz, bu
-            # çağrı her zaman hatayla veya boş veriyle sonuçlanıyordu.
             if MODE == "gameserver":
                 proxy_url = os.environ.get("PROXY_URL", "")
                 if proxy_url:
@@ -953,9 +955,6 @@ def run_bore_for_gameserver():
                     _write_to_cuberite("reload")
 
             except Exception:
-                # DÜZELTME #4: Ağ hatası sonrası gönderilemeyen loglar kayboluyordu.
-                # Eski kod: insert(0, l) döngüsü ile O(n²) yeniden ekleme yapıyordu.
-                # Yeni kod: tek seferde listenin başına birleştiriyor (O(n)).
                 with _LOG_LOCK:
                     _pending_remote_logs = logs_to_send + _pending_remote_logs
 
@@ -1007,9 +1006,6 @@ def run_cuberite():
                     except Exception: pass
                 threading.Thread(target=_do_join, args=(line,), daemon=True).start()
 
-            # DÜZELTME #2: WCSYNC_SAVE: etiketi wcsync.lua tarafından hiçbir zaman
-            # gönderilmiyordu; iki etiket için tek bir dal kullanılıyordu ama
-            # WCSYNC_SAVE kodu dead code'du. Tek WCSYNC_QUIT dalına sadeleştirildi.
             elif "WCSYNC_QUIT:" in line:
                 def _do_upload(ln):
                     try:
