@@ -48,8 +48,6 @@ SERVER_DIR    = os.environ.get("SERVER_DIR", "/server")
 DB_FILE       = os.path.join(DATA_DIR, "hub.db")
 
 # BUG FIX #1 — _active_players artık lock ile korunuyor.
-# Önceden: HTTP handler thread'leri ile asyncio coroutine'leri aynı listeye
-# eş zamanlı erişiyordu (race condition → crash / yanlış oyuncu sayısı).
 _active_players  = []
 _PLAYERS_LOCK    = threading.Lock()
 
@@ -58,13 +56,11 @@ _cuberite_proc   = None
 _STDIN_LOCK      = threading.Lock()
 
 # BUG FIX #2 — _cmd_counter / _cmd_history artık kendi lock'u ile korunuyor.
-# Önceden: birden fazla HTTP thread aynı anda _cmd_counter'ı arttırabiliyordu.
 _cmd_counter  = 0
 _cmd_history  = []
 _CMD_LOCK     = threading.Lock()
 
 # BUG FIX #3 — _last_script_update için lock eklendi.
-# Önceden: POST handler'da yazılıyor, sync_loop'ta okunuyordu (unsynchronized).
 _last_script_update = time.time()
 _SCRIPT_TS_LOCK     = threading.Lock()
 
@@ -134,6 +130,24 @@ def _sync_db_connect():
     pathlib.Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_FILE, timeout=10)
     conn.row_factory = sqlite3.Row
+    
+    # BUG FIX: Tabloların her modda (gameserver dahil) ve HTTP isteklerinden 
+    # önce var olduğundan emin ol.
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS servers (
+            label           TEXT PRIMARY KEY,
+            host            TEXT,
+            port            INTEGER,
+            players         INTEGER DEFAULT 0,
+            last_seen       INTEGER,
+            restart_pending INTEGER DEFAULT 0,
+            server_id       TEXT
+        );
+        CREATE TABLE IF NOT EXISTS players (
+            username    TEXT PRIMARY KEY,
+            last_server TEXT
+        );
+    """)
     return conn
 
 
@@ -237,8 +251,6 @@ NetworkCompressionThreshold=-1
 # ══════════════════════════════════════════════════════════
 
 # BUG FIX #4 — VarInt fonksiyonlarına maksimum 5 byte limiti eklendi.
-# Önceden: sonsuz while döngüsü → bozuk/kötü amaçlı paket → sonsuz CPU tüketimi.
-
 _VARINT_MAX_BYTES = 5
 
 
@@ -279,7 +291,6 @@ async def vi_rd(reader) -> int:
 
 
 # BUG FIX #5 — pkt_read'e timeout parametresi eklendi.
-# Önceden: yavaş / kötü amaçlı istemci bağlantıyı sonsuza dek bloke edebiliyordu.
 _PACKET_READ_TIMEOUT = 120  # saniye
 
 
@@ -530,10 +541,6 @@ class PlayerConn:
             pid, payload, raw = await pkt_read(self.client_r, -1, timeout=30)
 
             # ── Handshake paketi parse ────────────────────────────────────────
-            # Render.com health check'leri, port tarayıcıları ve diğer HTTP
-            # istemciler bu porta HTTP/TCP isteği gönderir. Minecraft protokolü
-            # dışındaki her şey burada IndexError / ValueError üretir.
-            # Bu hataları sessizce bırakıyoruz — log kirliliği önlenir.
             try:
                 p = 0
                 _, p = vi_dec(payload, p)          # protocol version
@@ -543,7 +550,6 @@ class PlayerConn:
                 p += 2                             # server port (unsigned short)
                 next_state, _ = vi_dec(payload, p) # next state (1=status, 2=login)
             except (IndexError, ValueError):
-                # Minecraft protokolü dışı bağlantı — sessizce kapat
                 return
 
             if next_state == 1:
