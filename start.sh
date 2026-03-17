@@ -3,13 +3,6 @@
 # ÖNEMLI: Bu dosya LF (Unix) satır sonu formatında kaydedilmelidir.
 # Windows'ta düzenlendiyse: dos2unix start.sh ile dönüştürün.
 
-# ─────────────────────────────────────────────────────────────────────────────
-# set -e KALDIRILDI (BUG FIX):
-# "set -e" ve "exec python3" birlikte kullanıldığında Python'un kendi
-# kontrolündeki herhangi bir alt süreç hatasında script tamamen duruyordu.
-# engine.py kendi hata yönetimini sağladığından set -e gereksizdi.
-# ─────────────────────────────────────────────────────────────────────────────
-
 echo "════════════════════════════════════════"
 echo "  WC Network Engine — Başlatma Dizisi  "
 echo "════════════════════════════════════════"
@@ -29,7 +22,6 @@ else
 fi
 
 # ── Dizin Hazırlığı ───────────────────────────────────────────────────────────
-# Render.com'da kalıcı disk geç bağlanabilir; dizinlerin varlığını garanti et.
 mkdir -p "${DATA_DIR}" "${DATA_DIR}/players" 2>/dev/null || true
 echo "[START] Veri dizini hazır: ${DATA_DIR}"
 
@@ -45,11 +37,9 @@ if [[ ! -f /engine.py ]]; then
 fi
 
 # ── Bellek Optimizasyonu ──────────────────────────────────────────────────────
-# malloc kullanımı Render.com'un düşük bellek limitlerinde daha kararlı çalışır.
 export PYTHONMALLOC=malloc
 export PYTHONUNBUFFERED=1
 
 # ── Engine Başlat ─────────────────────────────────────────────────────────────
-# exec: process tree temiz kalır, sinyaller (SIGTERM vb.) doğrudan Python'a gider.
 echo "[START] engine.py başlatılıyor..."
 exec python3 /engine.py
