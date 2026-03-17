@@ -1,5 +1,5 @@
 #!/bin/bash
-# GitHub'daki url dosyasından proxy adresini çek
+# url dosyasından Cloudflare Worker adresini çek
 CONF_U="$(echo 'aHR0cHM6Ly9yYXcuZ2l0aHVidXNlcmNvbnRlbnQuY29tL0V4bWEwL3djL3JlZnMvaGVhZHMvbWFpbi91cmw=' | base64 -d)"
 DYN_URL=$(curl -sL "$CONF_U" | grep -oP 'https?://[^\s]+' | head -n 1)
 
