@@ -47,7 +47,6 @@ DATA_DIR      = os.environ.get("DATA_DIR", "/data")
 SERVER_DIR    = os.environ.get("SERVER_DIR", "/server")
 DB_FILE       = os.path.join(DATA_DIR, "hub.db")
 
-# BUG FIX #1 — _active_players artık lock ile korunuyor.
 _active_players  = []
 _PLAYERS_LOCK    = threading.Lock()
 
@@ -55,12 +54,10 @@ _proxy_bore_addr = None
 _cuberite_proc   = None
 _STDIN_LOCK      = threading.Lock()
 
-# BUG FIX #2 — _cmd_counter / _cmd_history artık kendi lock'u ile korunuyor.
 _cmd_counter  = 0
 _cmd_history  = []
 _CMD_LOCK     = threading.Lock()
 
-# BUG FIX #3 — _last_script_update için lock eklendi.
 _last_script_update = time.time()
 _SCRIPT_TS_LOCK     = threading.Lock()
 
@@ -69,7 +66,6 @@ _LOG_LOCK            = threading.Lock()
 SYSTEM_LOGS          = deque(maxlen=500)
 _DB_LOCK             = threading.Lock()
 
-# ── İzin verilen komut karakterleri (enjeksiyona karşı) ──────────────────────
 _CMD_SAFE_PATTERN = re.compile(r'^[\w\s\.\-:/@#,!?\'"=+\[\]()öçşğüıÖÇŞĞÜİ]+$', re.UNICODE)
 
 
@@ -111,7 +107,6 @@ async def init_db() -> None:
                     last_server TEXT
                 );
             """)
-            # Eski kayıtları temizle
             await db.execute(
                 "DELETE FROM servers WHERE (? - last_seen) > 45",
                 (int(time.time()),)
@@ -123,16 +118,10 @@ async def init_db() -> None:
 
 
 def _sync_db_connect():
-    """
-    Sync thread'ler için güvenli SQLite bağlantısı.
-    DATA_DIR her zaman var olmalı; yoksa oluştur.
-    """
     pathlib.Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_FILE, timeout=10)
     conn.row_factory = sqlite3.Row
     
-    # BUG FIX: Tabloların her modda (gameserver dahil) ve HTTP isteklerinden 
-    # önce var olduğundan emin ol.
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS servers (
             label           TEXT PRIMARY KEY,
@@ -179,7 +168,6 @@ def update_and_configure(server_dir: str = SERVER_DIR) -> bool:
             continue
         total_scripts += 1
 
-        # Klasör adı eşlemesi
         folder_map = {"wcsync.lua": "WCSync", "wchub.lua": "WCHub"}
         folder_name = folder_map.get(script_name, script_name[:-4])
         plugin_names.append(folder_name)
@@ -204,7 +192,6 @@ def update_and_configure(server_dir: str = SERVER_DIR) -> bool:
         except Exception as e:
             log_msg(f"[GÜNCELLEME] {script_name} çekilemedi: {e}")
 
-    # Listede olmayan eski eklentileri sil
     plugins_base = pathlib.Path(server_dir) / "Plugins"
     if plugins_base.exists():
         for item in plugins_base.iterdir():
@@ -250,13 +237,11 @@ NetworkCompressionThreshold=-1
 #  MİNECRAFT PROTOKOL YARDIMCILARI
 # ══════════════════════════════════════════════════════════
 
-# BUG FIX #4 — VarInt fonksiyonlarına maksimum 5 byte limiti eklendi.
 _VARINT_MAX_BYTES = 5
-
 
 def vi_enc(v: int) -> bytes:
     r = bytearray()
-    v &= 0xFFFFFFFF  # 32-bit unsigned
+    v &= 0xFFFFFFFF
     while True:
         b = v & 0x7F
         v >>= 7
@@ -290,9 +275,7 @@ async def vi_rd(reader) -> int:
     raise ValueError("VarInt aşımı (>5 byte)")
 
 
-# BUG FIX #5 — pkt_read'e timeout parametresi eklendi.
-_PACKET_READ_TIMEOUT = 120  # saniye
-
+_PACKET_READ_TIMEOUT = 120
 
 async def pkt_read(reader, comp: int = -1, timeout: float = _PACKET_READ_TIMEOUT):
     async def _read():
@@ -414,7 +397,6 @@ class PlayerConn:
             self._safe_write(pkt_make(0x02, mc_str_enc(msg) + bytes([0]), self.comp))
             await self._safe_drain()
 
-            # Eski backend bağlantısını kapat
             if self.server_w:
                 with contextlib.suppress(Exception):
                     self.server_w.close()
@@ -442,7 +424,6 @@ class PlayerConn:
             self.server_w.write(pkt_make(0x00, mc_str_enc(self.username), -1))
             await self.server_w.drain()
 
-            # Login Success / Join Game paketi bekle
             while True:
                 pid, payload, raw = await pkt_read(self.server_r, self.comp, timeout=15)
                 if pid == 0x01:
@@ -476,9 +457,7 @@ class PlayerConn:
                     return
         except Exception as e:
             log_msg(f"[SWAP] {self.username} geçiş hatası ({target_label}): {e}")
-            # BUG FIX #6 — Başarısız swap sonrası play_state düzgün geri alınıyor.
             self.play_state = prev_play_state
-            # Tutarsız bağlantı durumunu temizle
             if self.server_w:
                 with contextlib.suppress(Exception):
                     self.server_w.close()
@@ -499,7 +478,6 @@ class PlayerConn:
                     if msg.startswith("/wc_transfer "):
                         target = msg.split(" ", 1)[1].strip()
                         if target:
-                            # BUG FIX #7 — asyncio.ensure_future → asyncio.create_task
                             asyncio.create_task(self.hot_swap(target))
                         continue
                     elif not msg.startswith("/"):
@@ -540,15 +518,14 @@ class PlayerConn:
         try:
             pid, payload, raw = await pkt_read(self.client_r, -1, timeout=30)
 
-            # ── Handshake paketi parse ────────────────────────────────────────
             try:
                 p = 0
-                _, p = vi_dec(payload, p)          # protocol version
-                _, p = mc_str_dec(payload, p)      # server address
+                _, p = vi_dec(payload, p)          
+                _, p = mc_str_dec(payload, p)      
                 if p + 2 > len(payload):
-                    return  # Minecraft handshake değil, kapat
-                p += 2                             # server port (unsigned short)
-                next_state, _ = vi_dec(payload, p) # next state (1=status, 2=login)
+                    return  
+                p += 2                             
+                next_state, _ = vi_dec(payload, p) 
             except (IndexError, ValueError):
                 return
 
@@ -626,7 +603,6 @@ async def handle_player(cr, cw) -> None:
 # ══════════════════════════════════════════════════════════
 
 def _write_to_cuberite(cmd: str) -> None:
-    """Cuberite stdin'ine thread-safe komut gönder."""
     with _STDIN_LOCK:
         if _cuberite_proc and _cuberite_proc.poll() is None:
             try:
@@ -656,7 +632,6 @@ def run_cuberite() -> None:
 
     mc_bin = next(iter(glob.glob("/server/**/Cuberite", recursive=True)), None)
     if not mc_bin:
-        # BUG FIX #8 — Cuberite bulunamadığında sessizce çıkmak yerine log basılıyor.
         log_msg("[CUBERITE] HATA: Cuberite ikili dosyası bulunamadı! /server altında aranıyor.")
         return
 
@@ -751,7 +726,7 @@ def register_local_cuberite() -> None:
             )
             urllib.request.urlopen(req, timeout=5)
         except Exception:
-            pass  # HTTP server henüz hazır olmayabilir, sessiz devam et
+            pass 
 
 
 # ══════════════════════════════════════════════════════════
@@ -789,7 +764,6 @@ def run_bore_for_gameserver() -> None:
 
     current_gs_bore = None
 
-    # BUG FIX #9 — server_id dosyası with open() ile güvenli şekilde okunuyor/yazılıyor.
     server_id_file = os.path.join(DATA_DIR, "server_id.txt")
     if os.path.exists(server_id_file):
         with open(server_id_file, "r") as f:
@@ -864,8 +838,6 @@ def run_bore_for_gameserver() -> None:
                     _write_to_cuberite("reload")
 
             except Exception:
-                # BUG FIX #10 — Başarısız istek sonrası loglar kaybolmuyordu;
-                # yeni loglar gelmişse doğru sıraya ekleniyor.
                 with _LOG_LOCK:
                     _pending_remote_logs = logs_to_send + _pending_remote_logs
 
@@ -1018,12 +990,9 @@ class HttpHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", "*")
         super().end_headers()
 
-    # ── GET ──────────────────────────────────────────────────────────────────
-
     def do_GET(self):
         path = self.path.split("?")[0]
 
-        # Ana panel
         if self.path == "/":
             self._serve_panel()
             return
@@ -1158,8 +1127,6 @@ class HttpHandler(http.server.BaseHTTPRequestHandler):
             log_msg(f"[WEB] /api/servers hatası: {e}")
             self.send_response(500); self.end_headers()
 
-    # ── POST ─────────────────────────────────────────────────────────────────
-
     def do_POST(self):
         global _last_script_update
         path = self.path.split("?")[0]
@@ -1180,14 +1147,13 @@ class HttpHandler(http.server.BaseHTTPRequestHandler):
             if not body:
                 self._json_err(400, "Geçersiz JSON"); return
             cmd = body.get("command", "").strip()
-            # BUG FIX #11 — Komut sanitizasyonu: yalnızca güvenli karakterlere izin ver.
             if not cmd:
                 self._json_err(400, "Komut boş olamaz"); return
             if not _CMD_SAFE_PATTERN.match(cmd):
                 log_msg(f"[WEB] Güvensiz komut reddedildi: {cmd!r}")
                 self._json_err(400, "Komut izin verilmeyen karakter içeriyor"); return
             with _CMD_LOCK:
-                _cmd_counter.__class__  # noqa — sadece scope kontrolü
+                _cmd_counter.__class__  
                 globals()["_cmd_counter"] += 1
                 cid = _cmd_counter
                 _cmd_history.append({"id": cid, "cmd": cmd})
@@ -1359,8 +1325,6 @@ class HttpHandler(http.server.BaseHTTPRequestHandler):
             log_msg(f"[REG] Kayıt hatası: {e}")
             self.send_response(500); self.end_headers()
 
-    # ── Yardımcılar ──────────────────────────────────────────────────────────
-
     def _read_json(self):
         try:
             length = int(self.headers.get("Content-Length", 0))
@@ -1388,7 +1352,7 @@ class HttpHandler(http.server.BaseHTTPRequestHandler):
                                     ensure_ascii=False).encode("utf-8"))
 
     def log_message(self, format, *args):
-        pass  # HTTP log çıktısını sustur
+        pass 
 
 
 # ══════════════════════════════════════════════════════════
@@ -1397,7 +1361,6 @@ class HttpHandler(http.server.BaseHTTPRequestHandler):
 
 def run_http() -> None:
     http.server.ThreadingHTTPServer.allow_reuse_address = True
-    # BUG FIX #12 — Tüm retry'lar tükenirse hata loglanıyor (önceden sessizdi).
     last_error = None
     for attempt in range(10):
         try:
