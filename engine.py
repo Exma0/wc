@@ -528,11 +528,23 @@ class PlayerConn:
     async def run(self) -> None:
         try:
             pid, payload, raw = await pkt_read(self.client_r, -1, timeout=30)
-            p = 0
-            _, p = vi_dec(payload, p)
-            _, p = mc_str_dec(payload, p)
-            p += 2
-            next_state, _ = vi_dec(payload, p)
+
+            # ── Handshake paketi parse ────────────────────────────────────────
+            # Render.com health check'leri, port tarayıcıları ve diğer HTTP
+            # istemciler bu porta HTTP/TCP isteği gönderir. Minecraft protokolü
+            # dışındaki her şey burada IndexError / ValueError üretir.
+            # Bu hataları sessizce bırakıyoruz — log kirliliği önlenir.
+            try:
+                p = 0
+                _, p = vi_dec(payload, p)          # protocol version
+                _, p = mc_str_dec(payload, p)      # server address
+                if p + 2 > len(payload):
+                    return  # Minecraft handshake değil, kapat
+                p += 2                             # server port (unsigned short)
+                next_state, _ = vi_dec(payload, p) # next state (1=status, 2=login)
+            except (IndexError, ValueError):
+                # Minecraft protokolü dışı bağlantı — sessizce kapat
+                return
 
             if next_state == 1:
                 with _PLAYERS_LOCK:
@@ -585,12 +597,14 @@ class PlayerConn:
 
                 await asyncio.gather(self.pipe_s2c(), self.pipe_c2s())
         except Exception as e:
-            log_msg(f"[PROXY] {self.username} bağlantı hatası: {e}")
+            if self.username != "?":
+                log_msg(f"[PROXY] {self.username} bağlantı hatası: {e}")
         finally:
             with _PLAYERS_LOCK:
                 if self in _active_players:
                     _active_players.remove(self)
-            log_msg(f"[QUIT] {self.username} bağlantısı kesildi.")
+            if self.username != "?":
+                log_msg(f"[QUIT] {self.username} bağlantısı kesildi.")
             for w in (self.client_w, self.server_w):
                 if w:
                     with contextlib.suppress(Exception):
